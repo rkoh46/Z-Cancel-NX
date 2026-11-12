@@ -1,0 +1,12 @@
+# From power-on to the VS character select screen (Super Smash Bros., USA).
+# Scene byte 800A4AD0: 01 title (frame 4313), 07 mode select, 09 VS menu, 10 VS character select.
+4400 1 10000000
+4406 1 00000000
+4520 1 80000000   # A at the title -> mode select
+4526 1 00000000
+4640 1 04000000   # d-pad down -> VS Mode
+4646 1 00000000
+4700 1 80000000   # A -> VS menu
+4706 1 00000000
+4820 1 80000000   # A on VS Start -> character select
+4826 1 00000000

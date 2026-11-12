@@ -74,3 +74,31 @@ Paths are relative to the RMG-K tree.
 5. Cross-play against RMG-K on a PC.
 6. ROM picker and on-device patching (vanilla ROM in; Remix and Remix +Extra built from their xdelta
    patches and cached). Nothing from a game is ever committed or uploaded.
+
+## Results so far
+
+### Mac harness (`builder/build-mac.sh arm64|x86_64`, `bench/znx-bench.c`), 2026-11-12
+
+RMG-K's core and RSP HLE, a null video plugin that only raises the DP interrupt, RMG-K's forced netplay
+settings, frames driven with `M64CMD_ROLLBACK_EXECUTE`. Vanilla US ROM, no input (logo, intro, title at
+frame 4313, CPU demo fight from 4983). Apple M5, so only the ratios carry over to the Switch.
+
+- new_dynarec arm64 runs natively on macOS with two patches (`patches/`): Mach-O assembly syntax; x18 is
+  not preserved on Darwin, so it is no longer allocated; the code cache is an anonymous RW mapping with an
+  RX view from `mach_vm_remap` (RWX is refused and the shm double mapping dies with SIGBUS).
+- Speed without a picture: about 0.16 ms of emulation per frame in the intro; a rollback state is
+  8,438,120 bytes, saved in about 0.15 ms, loaded in about 6.5 ms; re-simulating 60 frames inside the demo
+  fight costs about 0.27 ms per frame. The load cost is the number to watch on the Switch.
+- Rollback is exact on each architecture: save at A, run to B, load, re-run gives identical RDRAM hashes
+  for every frame (intro, demo fight, scripted menu input).
+- ARM64 against x86-64 (Rosetta): RDRAM is not bit-identical. The first differing frame is 266; about 14%
+  of the first 10,897 frames differ by 1 to 6 words and the state reconverges each time; the scene
+  sequence is identical. Every difference seen sits in two small areas (0x80040D04-DC4, 0x80040560) laid
+  out like a saved libultra thread context, in caller-saved register slots (at, v0, a0, a1, t6, t8, t9)
+  with the saved PC equal. Likely cause, not proven: the two backends leave different stale values in
+  registers the recompiler treats as dead when an interrupt saves the thread. If so it never reaches game
+  logic, and RMG-K does not compare checksums (its checksum is always 0), so it would not break a session;
+  a raw RDRAM hash cannot be the desync check, though. Next: prove or disprove it, and compare a real VS
+  match with inputs, not only the demo.
+- The interpreters differ from the recompiler from frame 1 at the RDRAM level, so the Switch must run
+  new_dynarec, as the PCs do.

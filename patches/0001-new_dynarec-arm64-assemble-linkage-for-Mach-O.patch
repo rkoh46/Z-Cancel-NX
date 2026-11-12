@@ -1,0 +1,120 @@
+new_dynarec arm64: assemble linkage_arm64.S for Mach-O
+
+The core's Makefile sets NO_ASM on Apple Silicon ("assembly compilation not yet
+supported"), which leaves macOS arm64 without a recompiler. The file only needs the
+Mach-O spellings: a leading underscore on C symbols, .private_extern instead of
+.hidden/.type, and @PAGE/@PAGEOFF instead of :lo12:. ELF output is unchanged.
+
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/arm64/linkage_arm64.S
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/arm64/linkage_arm64.S
+@@ -18,6 +18,76 @@
+  *   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.          *
+  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++#if defined(__APPLE__)
++/* Mach-O: C symbols carry a leading underscore, there is no .type/.hidden,
++   and page-relative addressing is spelled @PAGE/@PAGEOFF. */
++#define breakpoint _breakpoint
++#define cc_interrupt _cc_interrupt
++#define do_interrupt _do_interrupt
++#define dyna_linker _dyna_linker
++#define dyna_linker_ds _dyna_linker_ds
++#define fp_exception _fp_exception
++#define jump_eret _jump_eret
++#define jump_syscall _jump_syscall
++#define jump_vaddr _jump_vaddr
++#define jump_vaddr_x0 _jump_vaddr_x0
++#define jump_vaddr_x1 _jump_vaddr_x1
++#define jump_vaddr_x10 _jump_vaddr_x10
++#define jump_vaddr_x11 _jump_vaddr_x11
++#define jump_vaddr_x12 _jump_vaddr_x12
++#define jump_vaddr_x13 _jump_vaddr_x13
++#define jump_vaddr_x14 _jump_vaddr_x14
++#define jump_vaddr_x15 _jump_vaddr_x15
++#define jump_vaddr_x16 _jump_vaddr_x16
++#define jump_vaddr_x17 _jump_vaddr_x17
++#define jump_vaddr_x19 _jump_vaddr_x19
++#define jump_vaddr_x2 _jump_vaddr_x2
++#define jump_vaddr_x21 _jump_vaddr_x21
++#define jump_vaddr_x22 _jump_vaddr_x22
++#define jump_vaddr_x23 _jump_vaddr_x23
++#define jump_vaddr_x24 _jump_vaddr_x24
++#define jump_vaddr_x25 _jump_vaddr_x25
++#define jump_vaddr_x26 _jump_vaddr_x26
++#define jump_vaddr_x27 _jump_vaddr_x27
++#define jump_vaddr_x28 _jump_vaddr_x28
++#define jump_vaddr_x3 _jump_vaddr_x3
++#define jump_vaddr_x4 _jump_vaddr_x4
++#define jump_vaddr_x5 _jump_vaddr_x5
++#define jump_vaddr_x6 _jump_vaddr_x6
++#define jump_vaddr_x7 _jump_vaddr_x7
++#define jump_vaddr_x8 _jump_vaddr_x8
++#define jump_vaddr_x9 _jump_vaddr_x9
++#define new_dyna_resume _new_dyna_resume
++#define new_dyna_start _new_dyna_start
++#define new_dyna_stop _new_dyna_stop
++#define verify_code _verify_code
++#define get_addr_ht _get_addr_ht
++#define verify_dirty _verify_dirty
++#define get_addr _get_addr
++#define dynarec_gen_interrupt _dynarec_gen_interrupt
++#define cop1_unusable _cop1_unusable
++#define SYSCALL_new _SYSCALL_new
++#define ERET_new _ERET_new
++#define dynamic_linker _dynamic_linker
++#define dynamic_linker_ds _dynamic_linker_ds
++#define new_recompile_block _new_recompile_block
++#define g_dev _g_dev
++#define base_addr_rx _base_addr_rx
++
++#define GLOBAL_FUNCTION(name)  \
++    .globl name %% .private_extern name %% .p2align 2 %% name
++
++#define LOCAL_FUNCTION(name)  \
++    .p2align 2 %% name
++
++#define ADDR_OF(reg, sym)  \
++    adrp   reg, sym@PAGE %% add    reg, reg, sym@PAGEOFF
++
++#else
++#define ADDR_OF(reg, sym)  \
++    adrp   reg, sym;       \
++    add    reg, reg, :lo12:sym
++
+ #define GLOBAL_FUNCTION(name)  \
+     .globl name;               \
+     .hidden name;              \
+@@ -35,6 +105,8 @@
+     .type   name, %object;           \
+     .size   name, size_
+ 
++#endif
++
+ .macro movl Wn, imm
+     movz    \Wn, (\imm >> 16) & 0xFFFF, lsl 16
+     movk    \Wn,  \imm & 0xFFFF
+@@ -243,12 +315,10 @@
+     br     x0
+ 
+ GLOBAL_FUNCTION(new_dyna_start):
+-    adrp   x16, g_dev
+-    add    x16, x16, :lo12:g_dev
++    ADDR_OF(x16, g_dev)
+     movl   x1, (device_r4300_new_dynarec_hot_state_dynarec_local + saved_context)
+     add    x16, x16, x1
+-    adrp   x1, base_addr_rx
+-    add    x1, x1, :lo12:base_addr_rx
++    ADDR_OF(x1, base_addr_rx)
+     mov    w0, #0xa4000000
+     stp    x19,x20,[x16,#0]
+     stp    x21,x22,[x16,#16]
+@@ -264,8 +334,7 @@
+     br     x19
+ 
+ GLOBAL_FUNCTION(new_dyna_resume):
+-    adrp   x16, g_dev
+-    add    x16, x16, :lo12:g_dev
++    ADDR_OF(x16, g_dev)
+     movl   x1, (device_r4300_new_dynarec_hot_state_dynarec_local + saved_context)
+     add    x16, x16, x1
+     stp    x19,x20,[x16,#0]
