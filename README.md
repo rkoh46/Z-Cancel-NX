@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" width="128" alt="Z-Cancel NX"></p>
+
 # Z-Cancel NX
 
 Super Smash Bros. (N64) and Smash Remix with rollback netplay on a Nintendo Switch, built to play
