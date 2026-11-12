@@ -1,0 +1,15 @@
+# Reference trees (cloned by builder/fetch-deps.sh), build output and anything from a game.
+/ref/
+/build/
+/dist/
+*.z64
+*.n64
+*.v64
+*.rom
+*.xdelta
+*.nro
+*.elf
+*.nacp
+*.st
+*.krec
+.DS_Store
