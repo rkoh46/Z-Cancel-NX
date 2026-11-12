@@ -102,3 +102,22 @@ frame 4313, CPU demo fight from 4983). Apple M5, so only the ratios carry over t
   match with inputs, not only the demo.
 - The interpreters differ from the recompiler from frame 1 at the RDRAM level, so the Switch must run
   new_dynarec, as the PCs do.
+
+### Switch harness (`builder/build-switch.sh`, `switch/`), 2026-11-12: builds, not yet run on a console
+
+The same measurement (`bench/bench_core.c`, shared with the Mac harness) as `build/switch/znx-bench.nro`.
+Put the ROM at `sdmc:/switch/z-cancel-nx/rom.z64`; output goes to nxlink or the screen and to
+`sdmc:/switch/z-cancel-nx/bench.log`; optional `bench.ini` (`frames=`, `hash_every=`, `rollback_test=A,B`,
+`inputs=`, `cpu_mhz=`, `verbose=`). Defaults: 7200 frames, hash every 600, rollback test 5400..5460.
+
+- One program: core, RSP HLE and the null video plugin are linked in (`ld -r`, `objcopy --localize-hidden`,
+  plugin exports renamed `znxp_<plugin>_*`) and found through generated name tables (`switch/dynlib_static.c`).
+- Code cache: 32 MB of the program's `.text` (`switch/jit_memory.S`), written through a second view from
+  `svcMapProcessMemory` (`switch/jit_switch.c`, `patches/0003`), as mupen64plus-libretro-nx does. x18 stays in
+  use (Horizon keeps it; Darwin does not).
+- `builder/build-switch.sh --selftest ROM` builds the same recipe for the container's Linux (ARM64) and runs it,
+  with libnx replaced by `switch/selftest/linux_main.c`. It gives the Mac build's RDRAM hashes at every 600th
+  frame up to 7200 (`hash 3600 1499ebb25c8606c4`, `hash 7200 873c9f0585a22f37`) in both memory layouts, and the
+  rollback test passes: the console should print the same hashes.
+- Known cost to watch: loading a state invalidates the whole 32 MB code cache (`invalidate_all_pages`), a data
+  and instruction cache flush of all of it on every rollback.

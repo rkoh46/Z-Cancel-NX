@@ -1,0 +1,124 @@
+new_dynarec arm64: run on the Nintendo Switch (Horizon, libnx)
+
+All changes are under __SWITCH__ (set by builder/build-switch.sh); other builds are
+unchanged. The mechanism is the one mupen64plus-libretro-nx uses (its HAVE_LIBNX
+blocks), on top of the DOUBLE_CACHE_ADDR mode the core already has.
+
+1. Code cache. Horizon never maps a page writable and executable at once and has
+   no mmap. The executable view (base_addr_rx) is the 32 MB znx_jit_memory array
+   that switch/jit_memory.S places in the program's .text; the writable view
+   (base_addr) is a second mapping of the same pages made with svcMapProcessMemory
+   (znx_jit_map in switch/jit_switch.c). Because the cache is part of the image,
+   generated code reaches the C helpers with direct branches and the device state
+   with adrp wherever the NRO is loaded, as it does with extra_memory elsewhere.
+   extra_memory itself is no longer needed and shrinks to one page.
+
+2. Instruction cache. cache_flush uses libnx's armDCacheFlush on the writable view
+   and armICacheInvalidate on the executable view: the same "dc civac"/"ic ivau"
+   loops, with the thread's cache-maintenance flag set around them as the Horizon
+   kernel expects.
+
+Deliberately not changed:
+- x18. It stays allocatable and stays the trampoline register (EXCLUDE_REG 29,
+  TRAMPOLINE_REG 18, as on Linux). Unlike Darwin, Horizon keeps x18 across
+  context switches and nothing reserves it: devkitA64's GCC allocates it as an
+  ordinary caller-saved register (libnx.a itself uses it in several hundred
+  instructions), and mupen64plus-libretro-nx runs this recompiler with x18 in use.
+- stop_after_jal. libretro-nx sets it to 0 on the Switch; RMG-K's value (1) is
+  kept, so blocks are cut exactly where the PC and Mac builds cut them.
+
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/arm64/assem_arm64.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/arm64/assem_arm64.c
+@@ -83,6 +83,11 @@
+ #if defined(__APPLE__)
+ #include <libkern/OSCacheControl.h>
+ #endif
++#if defined(__SWITCH__)
++/* libnx (switch/arm/cache.h), declared here so the core does not need the libnx headers. */
++void armDCacheFlush(void* addr, size_t size);
++void armICacheInvalidate(void* addr, size_t size);
++#endif
+ 
+ static uintptr_t literals[1024][2];
+ static unsigned int needs_clear_cache[1<<(TARGET_SIZE_2-17)];
+@@ -269,6 +274,15 @@
+ {
+ #if defined(__APPLE__)
+     sys_icache_invalidate(start, (size_t)(end - start));
++#elif defined(__SWITCH__)
++    // Callers pass addresses in the executable view. The code was written through the
++    // writable view: push those lines out of the data cache there, then drop the stale
++    // instructions at the address they are executed from. libnx's routines are the same
++    // "dc civac"/"ic ivau" loops as below, and also raise the thread's cache-maintenance
++    // flag that the Horizon kernel expects around them.
++    size_t size = (size_t)(end - start);
++    armDCacheFlush(start - (char*)base_addr_rx + (char*)base_addr, size);
++    armICacheInvalidate(start, size);
+ #elif !defined(WIN32)
+     // Don't rely on GCC's __clear_cache implementation, as it caches
+     // icache/dcache cache line sizes, that can vary between cores on
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
+@@ -44,9 +44,16 @@
+ #include "device/rcp/mi/mi_controller.h"
+ #include "device/rcp/rsp/rsp_core.h"
+ 
+-#if !defined(WIN32)
++#if !defined(WIN32) && !defined(__SWITCH__)
+ #include <sys/mman.h>
+ #endif
++#if defined(__SWITCH__)
++/* Horizon has no mmap and never maps a page writable and executable at once. The code
++   cache is a 32 MB array inside the program's own .text; switch/jit_switch.c maps a
++   second, writable view of it (Z-Cancel NX). */
++int znx_jit_map(size_t size, void **rw, void **rx);
++void znx_jit_unmap(void *rw, void *rx, size_t size);
++#endif
+ #if defined(__APPLE__) && defined(__aarch64__)
+ #include <mach/mach.h>
+ #include <mach/mach_vm.h>
+@@ -8741,12 +8748,22 @@
+     }
+     base_addr_rx = (void*)(uintptr_t)rx;
+   }
++#elif defined(__SWITCH__)
++// Nintendo Switch (Horizon): the executable view is the jit_memory array in .text, so the
++// generated code sits inside the program image like extra_memory does elsewhere (direct
++// branches to the C helpers, adrp to the device state, wherever the NRO was loaded); the
++// writable view is a second mapping of the same pages (svcMapProcessMemory).
++#define CACHE_ADDR DOUBLE_CACHE_ADDR
++  if(!znx_jit_map(1<<TARGET_SIZE_2, &base_addr, &base_addr_rx)) {
++    DebugMessage(M64MSG_ERROR, "new dynarec: could not map the code cache writable");
++    abort();
++  }
+ #else
+ // Default to fixed cache address
+ #define CACHE_ADDR FIXED_CACHE_ADDR
+ #endif
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(__SWITCH__)
+ #elif CACHE_ADDR==DOUBLE_CACHE_ADDR
+   #include <unistd.h>
+   #include <sys/types.h>
+@@ -8857,6 +8874,8 @@
+     if (mmap (base_addr_rx, 1<<TARGET_SIZE_2, PROT_READ | PROT_WRITE,
+               MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == (void*)-1) {DebugMessage(M64MSG_ERROR, "mmap() failed");}
+     if (munmap (base_addr, 1<<TARGET_SIZE_2) < 0) {DebugMessage(M64MSG_ERROR, "munmap() failed");}
++    #elif defined(__SWITCH__)
++    znx_jit_unmap(base_addr, base_addr_rx, 1<<TARGET_SIZE_2);
+     #else
+     if (munmap (base_addr_rx, 1<<TARGET_SIZE_2) < 0) {DebugMessage(M64MSG_ERROR, "munmap() failed");}
+     #endif
+--- a/mupen64plus-core/src/device/r4300/r4300_core.h
++++ b/mupen64plus-core/src/device/r4300/r4300_core.h
+@@ -184,6 +184,9 @@
+ #if defined(__APPLE__) && defined(__aarch64__)
+     /* One spare 16 KB page: the code cache is mapped over the page-aligned part. */
+     ALIGN(4096, char extra_memory[33554432 + 16384]);
++#elif defined(__SWITCH__)
++    /* Unused: the code cache is the jit_memory array in .text (switch/jit_memory.S). */
++    ALIGN(4096, char extra_memory[4096]);
+ #else
+     ALIGN(4096, char extra_memory[33554432]);
+ #endif

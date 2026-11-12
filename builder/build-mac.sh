@@ -4,7 +4,7 @@
 #   build/mac-<arch>/libmupen64plus.dylib        RMG-K's core (patches/ applied), new_dynarec
 #   build/mac-<arch>/mupen64plus-rsp-hle.dylib   RSP HLE plugin
 #   build/mac-<arch>/znx-video-null.dylib        video plugin that only completes display lists (bench/)
-#   build/mac-<arch>/znx-bench                   the harness (bench/)
+#   build/mac-<arch>/znx-bench                   the harness (bench/znx-bench.c + bench/bench_core.c)
 # Usage: builder/build-mac.sh [arm64|x86_64]     (x86_64 runs under Rosetta and needs nasm)
 set -euo pipefail
 ARCH="${1:-arm64}"
@@ -132,7 +132,7 @@ echo "  LD znx-video-null.dylib"
 clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -fvisibility=hidden -dynamiclib -I"$CORE/src/api" \
     bench/video-null.c -o "$OUT/znx-video-null.dylib"
 echo "  CC znx-bench"
-clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -I"$CORE/src/api" bench/znx-bench.c -o "$OUT/znx-bench"
+clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -I"$CORE/src/api" bench/znx-bench.c bench/bench_core.c -o "$OUT/znx-bench"
 # The core's ROM database and cheat list (settings per game), read from <program dir>/data.
 mkdir -p "$OUT/data"
 cp "$CORE"/data/mupen64plus.ini "$CORE"/data/mupencheat.txt "$OUT/data/"

@@ -98,12 +98,19 @@ SDL_Thread* SDL_CreateThreadRuntime(SDL_ThreadFunction fn, const char* name, voi
                                     SDL_FunctionPointer begin, SDL_FunctionPointer end)
 {
     SDL_Thread* thread = calloc(1, sizeof(*thread));
+    pthread_attr_t attr;
+    int result;
     (void)name; (void)begin; (void)end;
     if (thread == NULL)
         return NULL;
     thread->fn = fn;
     thread->data = data;
-    if (pthread_create(&thread->t, NULL, thread_entry, thread) != 0) {
+    /* An explicit stack: libnx's default for a pthread is far smaller than a desktop's. */
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024);
+    result = pthread_create(&thread->t, &attr, thread_entry, thread);
+    pthread_attr_destroy(&attr);
+    if (result != 0) {
         free(thread);
         return NULL;
     }
