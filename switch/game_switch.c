@@ -47,6 +47,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -668,10 +669,10 @@ int main(int argc, char** argv)
                 p999 = l_mx.ms100[(uint64_t)l_mx.count * 999 / 1000];
             }
             { uint64_t gap = 0; l_mx.late = znx_vidext_take_late(&gap); l_mx.worst_wall = gap; }
-            znx_log("matrix\t%s\t0x%02x\t%s\t%s\texit %d\tframes %u\tavg %.2f\tp50 %.2f\tp99 %.2f\tp99.9 %.2f\tworst %.2f at %d\tover16.7 %u\tover33 %u\tshown late %u\tlongest gap %.2f",
+            znx_log("matrix\t%s\t0x%02x\t%s\t%s\texit %d\tframes %u\tavg %.2f\tp50 %.2f\tp99 %.2f\tp99.9 %.2f\tworst %.2f at %d\tover16.7 %u\tover33 %u\tshown late %u\tlongest gap %.2f\theap %.1f MB in use, %.1f MB arena",
                     rom_name, stage, fighters, label, code, l_mx.count,
                     l_mx.count ? l_mx.sum_ns / 1e6 / l_mx.count : 0.0, p50 / 100.0, p99 / 100.0, p999 / 100.0,
-                    l_mx.worst_ns / 1e6, l_mx.worst_frame, l_mx.over16, l_mx.over33, l_mx.late, l_mx.worst_wall / 1e6);
+                    l_mx.worst_ns / 1e6, l_mx.worst_frame, l_mx.over16, l_mx.over33, l_mx.late, l_mx.worst_wall / 1e6, mallinfo().uordblks / 1048576.0, mallinfo().arena / 1048576.0);
             cases++;
         }
         if (file != NULL)

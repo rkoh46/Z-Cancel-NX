@@ -810,3 +810,15 @@ every re-run frame identical:
 About 110 of 2,048 RDRAM pages are copied per save. What is left is re-simulation itself (on the Mac:
 about 65 % recompiled game code, 20 % RSP HLE audio, 8 % the recompiler's linker): a frame carrying a full
 7-frame rollback still lands at 15-18 ms; rollbacks of up to 5 frames fit.
+
+### Late frames and the closed app, 2026-11-13
+
+- Late frames (vsync on, a frame shown 9-13 ms after its turn): the same frame numbers are late in every
+  run of a stage (for example 839-842 in many stages, 1011/1107/2279 on Mini Yoshi's Island), with the
+  compile-ahead at 12 ms or at 8 ms with oversized blocks off, so they come from the game, not from the
+  recompiler. The emulation thread's CPU time on those frames stays under 13 ms while 16-22 ms pass before
+  the swap and the swap then waits 6-13 ms: the thread is blocked in the GL driver (a texture or buffer
+  stall is the likely cause). Never two frames. Next step: time GLideN64's GL calls on those frames.
+- The app closing during Remix stage 0xD7: that stage passes on its own (twice). It was the 145th emulator
+  start in one session; 40 starts in one session keep the heap at 17.3-17.5 MB (about 5 KB per start), so
+  it is not a memory leak in malloc. Not reproduced; a longer run (more than 145 starts) would be needed.
