@@ -140,6 +140,9 @@ int main(int argc, char** argv)
         else if (!strncmp(argv[i], "warm_flags=", 11)) options.warm_flags = atoi(value);
         else if (!strncmp(argv[i], "hash_every=", 11)) options.hash_every = atoi(value);
         else if (!strncmp(argv[i], "stress=", 7)) sscanf(value, "%d,%d", &options.stress_every, &options.stress_depth);
+        else if (!strncmp(argv[i], "rollback_verify=", 16)) options.rollback_verify = atoi(value) != 0;
+        else if (!strncmp(argv[i], "inputs=", 7)) options.inputs_path = value;
+        else if (!strncmp(argv[i], "input_players=", 14)) options.input_players = atoi(value);
         else if (!strncmp(argv[i], "vs=", 3)) {
             const char* list = strchr(value, ':');
             options.vs_stage = (int)strtol(value, NULL, 0);

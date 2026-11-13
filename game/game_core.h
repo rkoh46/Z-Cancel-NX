@@ -37,6 +37,9 @@ void znx_game_begin(const struct znx_game_settings* settings, const struct znx_g
 /* znx_host.video_config: writes the "Video-General" and "Video-GLideN64" sections and
  * prints the settings that matter for RDRAM. */
 int znx_game_video_config(const struct znx_config* config);
+/* znx_host.video_rdram_free: 1 when the settings above keep GLideN64 from writing RDRAM (frame buffer
+ * emulation off), so rollback saves copy only the RDRAM pages written since a slot was saved. */
+int znx_game_video_rdram_free(void);
 
 /* znx_host.frame_done: accumulates the times and prints the report. Returns nothing; the
  * platform may wrap it to add its own per-frame work (pacing a frame that did not swap). */

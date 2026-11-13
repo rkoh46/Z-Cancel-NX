@@ -26,7 +26,10 @@ struct znx_options {
     int check_every;           /* "check" line every K frames: fast checksums of RDRAM, whole and without */
     long check_skip_lo, check_skip_hi;   /* the RDRAM range [lo, hi) (multiples of 32), for comparing builds */
     int stress_every;          /* rollback stress: every K frames rewind the last D and re-run them */
-    int stress_depth;          /*   (0 = off); each re-run is compared frame by frame with the first pass */
+    int stress_depth;          /*   (0 = off); each re-run is compared frame by frame with the first pass. The state
+                                *   after every frame, re-run ones too, is saved into a ring of slots, as the session does */
+    int rollback_verify;       /* the core checks every rollback save and load against a whole one, and that no RDRAM
+                                * page changed without being noticed (patches/0014; slow) */
     long watch;                /* RDRAM offset of a byte to report, or -1 */
     int dump_frame;            /* write RDRAM to dump_path after this many frames, or -1 */
     const char* dump_path;
@@ -106,6 +109,11 @@ struct znx_host {
      * save data, to put the match's cheats and save data into the core (a lobby match's pre-match
      * manifest, net/lobby_play.h). Non-zero stops the run. NULL: blank saves, no cheats. */
     int (*session_prepare)(void* core);
+
+    /* Non-zero when the attached video plugin never writes RDRAM (GLideN64 with frame buffer emulation off,
+     * game/game_core.c). Then a rollback save copies only the RDRAM pages written since the slot's last save;
+     * otherwise each display list counts as having written all of it. NULL: as 0. */
+    int (*video_rdram_free)(void);
 };
 
 /* The core's configuration, for znx_host.video_config. Each returns 0 on success. */

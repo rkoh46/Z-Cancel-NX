@@ -112,6 +112,13 @@ int znx_game_video_config(const struct znx_config* config)
     return 0;
 }
 
+/* With frame buffer emulation off GLideN64 never writes RDRAM (see above). With it on it clears buffers in
+ * RDRAM itself, so the core takes each display list as having written all of RDRAM. */
+int znx_game_video_rdram_free(void)
+{
+    return l_settings.scale <= 0;
+}
+
 int znx_game_last_frame_swaps(void) { return l_last_swaps; }
 uint64_t znx_game_last_frame_work_ns(void) { return l_last_cpu_ns; }
 

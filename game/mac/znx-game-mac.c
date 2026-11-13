@@ -50,10 +50,13 @@ static void usage(void)
 {
     fprintf(stderr,
         "usage: znx-game --rom FILE --frames N [--inputs FILE] [--hash-every K] [--scale S]\n"
-        "                [--shot FRAME FILE.png]... [--repeat R] [--verbose]\n"
+        "                [--shot FRAME FILE.png]... [--repeat R] [--verbose] [--vs STAGE F1,F2,F3,F4]\n"
+        "                [--rollback-stress K D [--rollback-verify]]\n"
         "       znx-game --menu-shot FILE.png [--menu-keys K,K,...] [--menu-base DIR] (the start screen; see menu_mac.c)\n"
         "  --hash-every K   \"hash <frame> <fnv1a64 of RDRAM>\" every K frames (default 600), as znx-bench prints\n"
         "  --scale S        0 (default): no frame buffer emulation; 1, 2: on, at that multiple of the N64's resolution\n"
+        "  --rollback-stress K D  every K frames rewind D and re-run them hidden, as znx-bench; --rollback-verify\n"
+        "                   also checks the core's rollback states and that the picture wrote no RDRAM unnoticed\n"
         "  --shot FRAME F   save the picture shown after FRAME frames as a PNG. It is the game's\n"
         "                   picture: keep the file out of the repository\n");
     exit(2);
@@ -86,6 +89,8 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--shot") && i + 2 < argc) { int frame = atoi(argv[++i]); znx_cgl_shot(frame, argv[++i]); }
         else if (!strcmp(a, "--repeat") && i + 1 < argc) repeat = atoi(argv[++i]);
         else if (!strcmp(a, "--verbose")) o.verbose = 1;
+        else if (!strcmp(a, "--rollback-stress") && i + 2 < argc) { o.stress_every = atoi(argv[++i]); o.stress_depth = atoi(argv[++i]); }
+        else if (!strcmp(a, "--rollback-verify")) o.rollback_verify = 1;
         else if (!strcmp(a, "--vs") && i + 2 < argc) {   /* --vs STAGE F1,F2[,F3,F4]: a forced VS match of level 9 CPUs */
             char* list = argv[i + 2];
             o.vs_stage = (int)strtol(argv[i + 1], NULL, 0);
@@ -125,6 +130,7 @@ int main(int argc, char** argv)
     host.user_dir = user_dir;
     host.vidext = znx_cgl_functions();
     host.video_config = znx_game_video_config;
+    host.video_rdram_free = znx_game_video_rdram_free;
     host.frame_done = znx_game_frame_done;
 
     znx_cgl_begin(print_line);

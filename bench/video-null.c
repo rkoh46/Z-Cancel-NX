@@ -12,6 +12,9 @@
  * copies back into RDRAM are absent. */
 
 #include <stddef.h>
+#ifndef __SWITCH__
+#include <dlfcn.h>
+#endif
 
 #define M64P_PLUGIN_PROTOTYPES 1
 #include "m64p_types.h"
@@ -21,10 +24,21 @@
 #define MI_INTR_DP 0x20
 
 static GFX_INFO l_gfx;
+/* The core's ZnxRdramWriterReports (patches/0014), if it has it: this plugin never writes RDRAM. */
+static void (*l_writer_reports)(int writer, int reports);
+
+#ifdef __SWITCH__
+void* osal_dynlib_getproc(void* lib, const char* name);   /* switch/dynlib_static.c */
+#endif
 
 EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle core, void* context, void (*debug)(void*, int, const char*))
 {
-    (void)core; (void)context; (void)debug;
+    (void)context; (void)debug;
+#ifdef __SWITCH__
+    l_writer_reports = (void (*)(int, int))osal_dynlib_getproc(core, "ZnxRdramWriterReports");
+#else
+    l_writer_reports = (void (*)(int, int))dlsym(core, "ZnxRdramWriterReports");
+#endif
     return M64ERR_SUCCESS;
 }
 
@@ -47,6 +61,8 @@ EXPORT m64p_error CALL PluginGetVersion(m64p_plugin_type* type, int* version, in
 EXPORT int CALL InitiateGFX(GFX_INFO info)
 {
     l_gfx = info;
+    if (l_writer_reports != NULL)
+        l_writer_reports(1, 1);   /* the video plugin writes no RDRAM */
     return 1;
 }
 

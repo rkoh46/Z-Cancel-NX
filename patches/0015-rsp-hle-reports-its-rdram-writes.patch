@@ -1,0 +1,209 @@
+RSP HLE: report every RDRAM write to the core
+
+The core copies only the RDRAM pages written since a rollback save (patches/0014), and the RSP
+plugin writes RDRAM through its own pointer: audio lists save their state (ADPCM, envelope,
+resampler, filters) and their output there every frame. Without being told where, the core would
+have to take every RSP task as having written all of RDRAM.
+
+The plugin now finds the core's ZnxRdramWritten and ZnxRdramWriterReports at PluginStartup and, in
+InitiateRSP, hands the first to every task (struct hle_t, dram_written) and tells the core it
+reports. Every write to DRAM is reported:
+- dram_store_u8/u16/u32 report the bytes they store;
+- dram_u8/u16/u32, which return a pointer into DRAM that callers read or write through, report the
+  element (a read reported as a write only costs a page copy);
+- the places that write through hle->dram directly report the range first: alist_save (DMA out),
+  the state saves of alist_envmix_exp/_ge/_lin, alist_filter's two coefficient tables and its
+  state, mp3's output, cicx105's DMA.
+A task handed to the fallback RSP plugin reports all of RDRAM. Without a core that has these
+functions nothing changes.
+
+--- a/mupen64plus-rsp-hle/src/alist.c
++++ b/mupen64plus-rsp-hle/src/alist.c
+@@ -167,6 +167,7 @@
+     dmem    &= ~3;
+     address &= ~7;
+     count = align(count, 8);
++    dram_written(hle, address, count);
+     memcpy(hle->dram + address, hle->alist_buffer + dmem, count);
+ }
+ 
+@@ -354,6 +355,7 @@
+     *(int32_t *)(save_buffer + 14) = exp_seq[1];        /* 14-15 */
+     *(int32_t *)(save_buffer + 16) = (int32_t)ramps[0].value;    /* 12-13 */
+     *(int32_t *)(save_buffer + 18) = (int32_t)ramps[1].value;    /* 14-15 */
++    dram_written(hle, address, sizeof(save_buffer));
+     memcpy(hle->dram + address, (uint8_t *)save_buffer, sizeof(save_buffer));
+ }
+ 
+@@ -433,6 +435,7 @@
+     /**(int32_t *)(save_buffer + 14);*/                 /* 14-15 */
+     *(int32_t *)(save_buffer + 16) = (int32_t)ramps[0].value;    /* 12-13 */
+     *(int32_t *)(save_buffer + 18) = (int32_t)ramps[1].value;    /* 14-15 */
++    dram_written(hle, address, 80);
+     memcpy(hle->dram + address, (uint8_t *)save_buffer, 80);
+ }
+ 
+@@ -506,6 +509,7 @@
+     *(int32_t *)(save_buffer + 10) = (int32_t)ramps[1].step;  /* 10-11 */
+     *(int32_t *)(save_buffer + 16) = (int32_t)ramps[0].value; /* 16-17 */
+     *(int32_t *)(save_buffer + 18) = (int32_t)ramps[1].value; /* 18-19 */
++    dram_written(hle, address, 80);
+     memcpy(hle->dram + address, (uint8_t *)save_buffer, 80);
+ }
+ 
+@@ -804,6 +808,8 @@
+ 
+     int16_t* const lutt6 = (int16_t*)(hle->dram + lut_address[0]);
+     int16_t* const lutt5 = (int16_t*)(hle->dram + lut_address[1]);
++    dram_written(hle, lut_address[0], 8 * sizeof(int16_t));   /* both are written below */
++    dram_written(hle, lut_address[1], 8 * sizeof(int16_t));
+ 
+     int16_t* in1 = (int16_t*)(hle->dram + address);
+     int16_t* in2 = (int16_t*)(hle->alist_buffer + dmem);
+@@ -902,6 +908,7 @@
+         outp += 8;
+     }
+ 
++    dram_written(hle, address, 16);
+     memcpy(hle->dram + address, in2 - 8, 16);
+     memcpy(hle->alist_buffer + dmem, outbuff, count);
+ }
+--- a/mupen64plus-rsp-hle/src/cicx105.c
++++ b/mupen64plus-rsp-hle/src/cicx105.c
+@@ -24,6 +24,7 @@
+ #include <string.h>
+ 
+ #include "hle_internal.h"
++#include "memory.h"
+ 
+ /**
+  * During IPL3 stage of CIC x105 games, the RSP performs some checks and transactions
+@@ -40,6 +41,8 @@
+     unsigned char *dst = hle->dram + 0x2fb1f0;
+     unsigned char *src = hle->imem + 0x120;
+ 
++    dram_written(hle, 0x2fb1f0, 24 * 0xff0);   /* the dma_write below: 24 rows of 8 bytes, 0xff0 apart */
++
+     /* dma_read(0x1120, 0x1e8, 0x1e8) */
+     memcpy(hle->imem + 0x120, hle->dram + 0x1e8, 0x1f0);
+ 
+--- a/mupen64plus-rsp-hle/src/hle_internal.h
++++ b/mupen64plus-rsp-hle/src/hle_internal.h
+@@ -57,6 +57,10 @@
+     /* for user convenience, this will be passed to "external" functions */
+     void* user_defined;
+ 
++    /* Z-Cancel NX: the core's ZnxRdramWritten, or NULL: told about every RDRAM byte range a task writes
++     * (memory.h, dram_written), so that a rollback save copies only the pages written since */
++    void (*dram_written)(unsigned int offset, unsigned int length);
++
+     int hle_gfx;
+     int hle_aud;
+ 
+--- a/mupen64plus-rsp-hle/src/memory.h
++++ b/mupen64plus-rsp-hle/src/memory.h
+@@ -135,19 +135,31 @@
+     store_u32(hle->dmem, address & 0xfff, src, count);
+ }
+ 
++/* Z-Cancel NX: every write to DRAM is reported to the core (struct hle_t, dram_written). The functions
++ * below that return a pointer into DRAM report the element they point to, whether it is then read or
++ * written; code that writes DRAM through hle->dram directly reports the range itself. */
++static inline void dram_written(struct hle_t* hle, uint32_t address, size_t length)
++{
++    if (hle->dram_written != NULL)
++        hle->dram_written(address & 0xffffff, (unsigned int)length);
++}
++
+ /* convenient functions DRAM access */
+ static inline uint8_t* dram_u8(struct hle_t* hle, uint32_t address)
+ {
++    dram_written(hle, address, 1);
+     return u8(hle->dram, address & 0xffffff);
+ }
+ 
+ static inline uint16_t* dram_u16(struct hle_t* hle, uint32_t address)
+ {
++    dram_written(hle, address, 2);
+     return u16(hle->dram, address & 0xffffff);
+ }
+ 
+ static inline uint32_t* dram_u32(struct hle_t* hle, uint32_t address)
+ {
++    dram_written(hle, address, 4);
+     return u32(hle->dram, address & 0xffffff);
+ }
+ 
+@@ -168,16 +180,19 @@
+ 
+ static inline void dram_store_u8(struct hle_t* hle, const uint8_t* src, uint32_t address, size_t count)
+ {
++    dram_written(hle, address, count);
+     store_u8(hle->dram, address & 0xffffff, src, count);
+ }
+ 
+ static inline void dram_store_u16(struct hle_t* hle, const uint16_t* src, uint32_t address, size_t count)
+ {
++    dram_written(hle, address, count * 2);
+     store_u16(hle->dram, address & 0xffffff, src, count);
+ }
+ 
+ static inline void dram_store_u32(struct hle_t* hle, const uint32_t* src, uint32_t address, size_t count)
+ {
++    dram_written(hle, address, count * 4);
+     store_u32(hle->dram, address & 0xffffff, src, count);
+ }
+ 
+--- a/mupen64plus-rsp-hle/src/mp3.c
++++ b/mupen64plus-rsp-hle/src/mp3.c
+@@ -247,6 +247,7 @@
+             outPtr += 0x40;
+         }
+ /* --------------- Inner Loop End -------------------- */
++        dram_written(hle, writePtr, 0x180);
+         memcpy(hle->dram + writePtr, hle->mp3_buffer + 0xe70, 0x180);
+         writePtr += 0x180;
+         readPtr  += 0x180;
+--- a/mupen64plus-rsp-hle/src/plugin.c
++++ b/mupen64plus-rsp-hle/src/plugin.c
+@@ -74,6 +74,9 @@
+ static m64p_handle l_ConfigRspHle;
+ static m64p_dynlib_handle l_RspFallback;
+ static ptr_InitiateRSP l_InitiateRSP = NULL;
++/* Z-Cancel NX: the core's record of written RDRAM (main/savestates.c), when it has one */
++static void (*l_CoreRdramWritten)(unsigned int offset, unsigned int length) = NULL;
++static void (*l_CoreRdramWriterReports)(int writer, int reports) = NULL;
+ static ptr_DoRspCycles l_DoRspCycles = NULL;
+ static ptr_RomClosed l_RomClosed = NULL;
+ static ptr_PluginShutdown l_PluginShutdown = NULL;
+@@ -279,6 +282,8 @@
+         return -1;
+ 
+     (*l_DoRspCycles)(-1);
++    if (l_CoreRdramWritten != NULL)
++        l_CoreRdramWritten(0, 0xffffffffu);   /* the fallback RSP may have written anywhere */
+     return 0;
+ }
+ 
+@@ -316,6 +321,8 @@
+ 
+     /* Get the core config function pointers from the library handle */
+     ConfigOpenSection = (ptr_ConfigOpenSection) osal_dynlib_getproc(CoreLibHandle, "ConfigOpenSection");
++    l_CoreRdramWritten = (void (*)(unsigned int, unsigned int)) osal_dynlib_getproc(CoreLibHandle, "ZnxRdramWritten");
++    l_CoreRdramWriterReports = (void (*)(int, int)) osal_dynlib_getproc(CoreLibHandle, "ZnxRdramWriterReports");
+     ConfigDeleteSection = (ptr_ConfigDeleteSection) osal_dynlib_getproc(CoreLibHandle, "ConfigDeleteSection");
+     ConfigSetParameter = (ptr_ConfigSetParameter) osal_dynlib_getproc(CoreLibHandle, "ConfigSetParameter");
+     ConfigGetParameter = (ptr_ConfigGetParameter) osal_dynlib_getproc(CoreLibHandle, "ConfigGetParameter");
+@@ -464,6 +471,12 @@
+     g_hle.hle_gfx = ConfigGetParamBool(l_ConfigRspHle, RSP_HLE_CONFIG_HLE_GFX);
+     g_hle.hle_aud = ConfigGetParamBool(l_ConfigRspHle, RSP_HLE_CONFIG_HLE_AUD);
+ 
++    /* Z-Cancel NX: every RDRAM write of a task is reported to the core (memory.h), so the core need not
++     * take each task as having written all of RDRAM */
++    g_hle.dram_written = l_CoreRdramWritten;
++    if (l_CoreRdramWritten != NULL && l_CoreRdramWriterReports != NULL)
++        l_CoreRdramWriterReports(0, 1);
++
+     /* notify fallback plugin */
+     if (l_InitiateRSP) {
+         l_InitiateRSP(Rsp_Info, CycleCount);

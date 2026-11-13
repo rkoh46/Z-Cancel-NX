@@ -52,7 +52,11 @@ static void usage(void)
         "  --rollback-test A B  save at frame A, run to B, load, re-run A..B and compare every frame\n"
         "  --check-every K      print \"check <frame> <whole> <rest>\": fast RDRAM checksums, whole and without --check-skip\n"
         "  --check-skip LO HI   the RDRAM range left out of <rest> (hex addresses)\n"
-        "  --rollback-stress K D  every K frames rewind the last D frames and re-run them, comparing every frame\n"
+        "  --rollback-stress K D  every K frames rewind the last D frames and re-run them, comparing every frame;\n"
+        "                       the state after every frame (re-run ones too) is saved into a ring of slots, as\n"
+        "                       RMG-K's session does with GekkoNet\n"
+        "  --rollback-verify    the core checks every rollback save and load against a whole one and that no RDRAM\n"
+        "                       page changed without being noticed (slow)\n"
         "  --cpu MODE           2 dynamic recompiler in a rollback session, what RMG-K runs (default);\n"
         "                       0 pure or 1 cached interpreter, run without the rollback session\n"
         "  --dump-ram FRAME FILE  write the 8 MB RDRAM after FRAME frames (host word order). It holds\n"
@@ -100,6 +104,7 @@ int main(int argc, char** argv)
             }
         }
         else if (!strcmp(a, "--rollback-stress") && i + 2 < argc) { o.stress_every = atoi(argv[++i]); o.stress_depth = atoi(argv[++i]); }
+        else if (!strcmp(a, "--rollback-verify")) o.rollback_verify = 1;
         else if (!strcmp(a, "--watch") && i + 1 < argc) o.watch = strtol(argv[++i], NULL, 16) & 0x7fffff;
         else if (!strcmp(a, "--dump-ram") && i + 2 < argc) { o.dump_frame = atoi(argv[++i]); o.dump_path = argv[++i]; }
         else if (!strcmp(a, "--input-players") && i + 1 < argc) o.input_players = atoi(argv[++i]);

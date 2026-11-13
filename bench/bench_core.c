@@ -74,7 +74,25 @@ static int l_rb_done;
 static m64p_rollback_state l_rb_state;
 /* Rollback stress totals. */
 static int l_st_count, l_st_failed, l_st_first_bad = -1;
-static uint64_t l_st_save_ns, l_st_load_ns, l_st_replay_ns, l_st_save_worst, l_st_load_worst, l_st_total_worst;
+static uint64_t l_st_load_ns, l_st_replay_ns, l_st_load_worst, l_st_total_worst;
+/* The stress test does what RMG-K's session (rmgk_gekko.cpp with GekkoNet) does: the state after every
+ * frame is saved into a ring of preallocated slots (GekkoNet: prediction window + 2 of them, each a
+ * buffer of the slot size), and a rollback loads one of them and re-runs the frames after it, saving
+ * the state after each re-run frame into its slot again. */
+#define ST_SLOT_CAPACITY (10u << 20)   /* the Switch build's slot size (patches/0007) */
+static unsigned char** l_st_slots;
+static int* l_st_slot_frame;           /* the frame count whose state the slot holds, -1 = none */
+static int l_st_slot_count;
+static uint64_t* l_st_hash;            /* first-pass RDRAM checksum after n frames, at n % l_st_slot_count */
+static uint64_t l_st_fsave_ns, l_st_fsave_worst, l_st_rsave_ns, l_st_rsave_worst, l_st_rb_ns, l_st_rb_worst;
+static long l_st_fsaves, l_st_rsaves;
+static int l_st_rb_worst_frame;
+static int l_vs_frame = -1;            /* frames completed when the forced match was poked in */
+/* The core's rollback bookkeeping (patches/0014), when it has it. */
+static void (*l_rb_verify)(int);
+static int (*l_rb_stats)(unsigned long long*, int);
+static void (*l_rdram_written)(unsigned int, unsigned int);
+static void (*l_rdram_writer_reports)(int, int);
 
 static uint32_t* l_frame_us10; /* time of every frame in units of 0.1 us */
 /* Per frame, when the core exports DebugDynarecStats: blocks compiled and time compiling (0.1 us). */
@@ -450,13 +468,15 @@ static void poke(uint32_t address, const uint8_t* bytes, int count)
     uint8_t* ram = (uint8_t*)l_rdram;   /* host-order words: N64 byte A is at (A & 0x7FFFFF) ^ 3 */
     for (int i = 0; i < count; ++i)
         ram[((address + (uint32_t)i) & 0x7fffff) ^ 3] = bytes[i];
+    if (l_rdram_written != NULL)   /* the core keeps track of the RDRAM pages written since a rollback save */
+        l_rdram_written(address & 0x7fffff, (unsigned int)count);
 }
 
-static void vs_start_if_due(void)
+enum { SCENE = 0x800A4AD0, SCENE_GKIND = 0x800A4ADF, TRANSFER = 0x800A4D08, PLAYER0 = 0x800A4D28, PLAYER_SIZE = 0x74 };
+
+/* Writes the battle setup; returns the number of CPUs. */
+static int vs_poke(void)
 {
-    enum { SCENE = 0x800A4AD0, SCENE_GKIND = 0x800A4ADF, TRANSFER = 0x800A4D08, PLAYER0 = 0x800A4D28, PLAYER_SIZE = 0x74 };
-    if (l_opt.vs_stage < 0 || l_vs_done || l_rdram == NULL || l_rdram[(SCENE & 0x7fffff) ^ 3] != 0x07)
-        return;
     const uint8_t level = (uint8_t)(l_opt.vs_level >= 1 && l_opt.vs_level <= 9 ? l_opt.vs_level : 9);
     int cpus = 0, seen[256] = { 0 };
     for (int port = 0; port < 4; ++port) {
@@ -476,7 +496,17 @@ static void vs_start_if_due(void)
     poke(TRANSFER + 1, header, 7);
     poke(SCENE_GKIND, &stage, 1);
     poke(SCENE, &battle, 1);
+    return cpus;
+}
+
+static void vs_start_if_due(void)
+{
+    if (l_opt.vs_stage < 0 || l_vs_done || l_rdram == NULL || l_rdram[(SCENE & 0x7fffff) ^ 3] != 0x07)
+        return;
+    const uint8_t level = (uint8_t)(l_opt.vs_level >= 1 && l_opt.vs_level <= 9 ? l_opt.vs_level : 9);
+    const int cpus = vs_poke();
     l_vs_done = 1;
+    l_vs_frame = l_frame;
     out("vs: stage 0x%02x with %d level %d CPUs set up at frame %d", l_opt.vs_stage, cpus, level, l_frame);
 }
 
@@ -508,8 +538,8 @@ static int input_callback(void* values, int size, int players)
     return 1;
 }
 
-/* Saves at frame A, and at frame B rewinds to A and runs A..B again as hidden frames
- * (M64CMD_ROLLBACK_RUN_FRAME without output, what a real rollback does), comparing RDRAM
+/* --rollback-test: saves at frame A, and at frame B rewinds to A and runs A..B again as hidden
+ * frames (M64CMD_ROLLBACK_RUN_FRAME without output, what a real rollback does), comparing RDRAM
  * after every frame with the first pass. */
 static void rollback_save(void)
 {
@@ -524,10 +554,6 @@ static void rollback_save(void)
         l_rb_done = 1;
         return;
     }
-    if (l_opt.stress_every > 0) {
-        l_st_save_ns += elapsed;
-        if (elapsed > l_st_save_worst) l_st_save_worst = elapsed;
-    } else
     out("rollback save frame %d: %llu us, %d bytes", l_frame,
         (unsigned long long)(elapsed / 1000), l_rb_state.len);
     l_rb_hashes = calloc((size_t)(l_opt.rb_b - l_opt.rb_a + 1), sizeof(uint64_t));
@@ -549,7 +575,6 @@ static void rollback_replay(void)
         l_rb_done = 1;
         return;
     }
-    if (l_opt.stress_every <= 0)
     out("rollback load frame %d -> %d: %llu us", b, a, (unsigned long long)(load_ns / 1000));
 
     l_frame = a;
@@ -575,26 +600,6 @@ static void rollback_replay(void)
     }
     uint64_t replay_ns = (znx_now_ns() - replay_begin) - (l_hash_ns - hash_before);
     int replayed = b - a;
-    if (l_opt.stress_every > 0) {
-        uint64_t total = load_ns + replay_ns;
-        l_st_count++;
-        l_st_load_ns += load_ns;
-        l_st_replay_ns += replay_ns;
-        if (load_ns > l_st_load_worst) l_st_load_worst = load_ns;
-        if (total > l_st_total_worst) l_st_total_worst = total;
-        if (mismatches != 0 || l_failed) {
-            l_st_failed++;
-            if (l_st_first_bad < 0) l_st_first_bad = first_bad;
-            if (l_st_failed <= 5)
-                out("rollback stress: re-run of %d..%d differs (%d of %d hashes, first at frame %d)",
-                    a, b, mismatches, replayed + 1, first_bad);
-        }
-        CoreDoCommand(M64CMD_ROLLBACK_FREE_STATE, 0, l_rb_state.buffer);
-        l_rb_state.buffer = NULL;
-        free(l_rb_hashes);
-        l_rb_hashes = NULL;
-        return;
-    }
     out("rollback replay %d frames: %llu us (%.0f us/frame)", replayed,
         (unsigned long long)(replay_ns / 1000), replayed ? replay_ns / 1000.0 / replayed : 0.0);
     if (mismatches == 0 && !l_failed) {
@@ -607,6 +612,112 @@ static void rollback_replay(void)
     CoreDoCommand(M64CMD_ROLLBACK_FREE_STATE, 0, l_rb_state.buffer);
     l_rb_state.buffer = NULL;
     l_rb_done = 1;
+}
+
+/* ---- the rollback stress test: what the session does ---- */
+
+static int stress_save(int frames, uint64_t* elapsed)
+{
+    const int slot = frames % l_st_slot_count;
+    m64p_rollback_state state;
+    memset(&state, 0, sizeof(state));
+    state.buffer = l_st_slots[slot];
+    state.len = (int)ST_SLOT_CAPACITY;
+    state.frame = frames;
+    const uint64_t begin = znx_now_ns();
+    m64p_error error = CoreDoCommand(M64CMD_ROLLBACK_SAVE_STATE, 0, &state);
+    *elapsed = znx_now_ns() - begin;
+    if (error != M64ERR_SUCCESS || state.buffer != l_st_slots[slot]) {
+        out("rollback save FAILED at frame %d: %s", frames, CoreErrorMessage(error));
+        l_failed = 1;
+        return 0;
+    }
+    l_st_slot_frame[slot] = frames;
+    return 1;
+}
+
+/* Called before frame n = l_frame runs: saves the state after n frames (the session saves the state
+ * after each frame once the frame is done), and every K frames rolls back D: loads the state after
+ * n - D frames and re-runs D frames, saving after each, as GekkoNet's events ask (Load, then Advance
+ * and Save per frame). Each re-run frame's RDRAM is compared with the first pass. */
+static void stress_frame(void)
+{
+    const int n = l_frame, d = l_opt.stress_depth;
+    uint64_t elapsed;
+    if (n < 1)
+        return;
+    if (!stress_save(n, &elapsed))
+        return;
+    l_st_fsave_ns += elapsed;
+    l_st_fsaves++;
+    if (elapsed > l_st_fsave_worst) l_st_fsave_worst = elapsed;
+    if (n % l_opt.stress_every != 0 || n - d < 1 || n + 1 > l_opt.frames)
+        return;
+    const int from = n - d, slot = from % l_st_slot_count;
+    if (l_st_slot_frame[slot] != from)
+        return;
+
+    int mismatches = 0, first_bad = -1;
+    m64p_rollback_state state;
+    memset(&state, 0, sizeof(state));
+    state.buffer = l_st_slots[slot];
+    state.len = (int)ST_SLOT_CAPACITY;   /* GekkoNet hands the slot's state_len back: the length the save set */
+    state.frame = from;
+    l_alive_ns = znx_now_ns();
+    uint64_t begin = znx_now_ns();
+    m64p_error error = CoreDoCommand(M64CMD_ROLLBACK_LOAD_STATE, 0, &state);
+    const uint64_t load_ns = znx_now_ns() - begin;
+    if (error != M64ERR_SUCCESS) {
+        out("rollback load FAILED at frame %d: %s", n, CoreErrorMessage(error));
+        l_failed = 1;
+        return;
+    }
+    l_frame = from;
+    if (check_rdram() != l_st_hash[from % l_st_slot_count]) {
+        mismatches++;
+        first_bad = from;
+    }
+    uint64_t replay_ns = 0, rsave_ns = 0;
+    while (l_frame < n) {
+        l_alive_ns = znx_now_ns();
+        begin = znx_now_ns();
+        error = CoreDoCommand(M64CMD_ROLLBACK_RUN_FRAME, M64FRAME_OUTPUT_NONE, NULL);
+        replay_ns += znx_now_ns() - begin;
+        if (error != M64ERR_SUCCESS) {
+            out("rollback replay FAILED at frame %d: %s", l_frame, CoreErrorMessage(error));
+            l_failed = 1;
+            return;
+        }
+        l_frame++;
+        if (l_frame == l_vs_frame)
+            vs_poke();   /* the first pass wrote the battle setup after this frame */
+        if (check_rdram() != l_st_hash[l_frame % l_st_slot_count]) {
+            mismatches++;
+            if (first_bad < 0)
+                first_bad = l_frame;
+        }
+        if (!stress_save(l_frame, &elapsed))
+            return;
+        rsave_ns += elapsed;
+        l_st_rsaves++;
+        if (elapsed > l_st_rsave_worst) l_st_rsave_worst = elapsed;
+    }
+    const uint64_t total = load_ns + replay_ns + rsave_ns;
+    l_st_count++;
+    l_st_load_ns += load_ns;
+    l_st_replay_ns += replay_ns;
+    l_st_rsave_ns += rsave_ns;
+    l_st_rb_ns += total;
+    if (load_ns > l_st_load_worst) l_st_load_worst = load_ns;
+    if (load_ns + replay_ns > l_st_total_worst) l_st_total_worst = load_ns + replay_ns;
+    if (total > l_st_rb_worst) { l_st_rb_worst = total; l_st_rb_worst_frame = n; }
+    if (mismatches != 0) {
+        l_st_failed++;
+        if (l_st_first_bad < 0) l_st_first_bad = first_bad;
+        if (l_st_failed <= 5)
+            out("rollback stress: re-run of %d..%d differs (%d of %d checksums, first at frame %d)",
+                from, n, mismatches, d + 1, first_bad);
+    }
 }
 
 static void first_frame_setup(void)
@@ -659,16 +770,7 @@ static int begin_frame(void* user)
     (void)user;
     first_frame_setup();
     if (l_opt.stress_every > 0 && !l_failed) {
-        /* Every K frames: D frames before the boundary save, at the boundary rewind and re-run. */
-        const int k = l_opt.stress_every, d = l_opt.stress_depth;
-        if (l_rb_hashes == NULL && l_frame % k == k - d && l_frame + d <= l_opt.frames) {
-            l_opt.rb_a = l_frame;
-            l_opt.rb_b = l_frame + d;
-            l_rb_done = 0;
-            rollback_save();
-        } else if (l_rb_hashes != NULL && l_frame == l_opt.rb_b) {
-            rollback_replay();
-        }
+        stress_frame();
     } else
     if (l_opt.rb_a >= 0 && !l_rb_done) {
         if (l_frame == l_opt.rb_a && l_rb_hashes == NULL)
@@ -693,6 +795,8 @@ static void frame_done(void)
         l_host->frame_done(l_frame, l_frame_ns);
     if (l_rb_hashes != NULL && !l_rb_done && l_frame <= l_opt.rb_b)
         l_rb_hashes[l_frame - l_opt.rb_a] = check_rdram();
+    if (l_st_hash != NULL)
+        l_st_hash[l_frame % l_st_slot_count] = check_rdram();
     if (l_opt.hash_every > 0 && l_frame % l_opt.hash_every == 0)
         out("hash %d %016llx", l_frame, (unsigned long long)hash_rdram());
     if (l_opt.check_every > 0 && l_frame % l_opt.check_every == 0) {
@@ -949,10 +1053,17 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
      * speed limiter and the old RDRAM pointer is hashed. */
     l_rdram = NULL;
     l_vs_done = 0;
+    l_vs_frame = -1;
     l_rb_done = 0;
     l_hash_ns = l_emu_ns = l_progress_ns = 0;
     l_frame_begin = 0;
     l_alive_ns = 0;
+    l_st_count = l_st_failed = 0;
+    l_st_first_bad = -1;
+    l_st_load_ns = l_st_replay_ns = l_st_load_worst = l_st_total_worst = 0;
+    l_st_fsave_ns = l_st_fsave_worst = l_st_rsave_ns = l_st_rsave_worst = l_st_rb_ns = l_st_rb_worst = 0;
+    l_st_fsaves = l_st_rsaves = 0;
+    l_st_rb_worst_frame = 0;
 
     if (l_opt.rom_path == NULL || l_opt.frames < 0) {
         err("%s: a ROM and a frame count are needed", l_name);
@@ -970,8 +1081,27 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         err("%s: the rollback test needs the rollback session (cpu 2)", l_name);
         return 2;
     }
+    if (l_opt.stress_every > 0 && (l_opt.stress_depth < 1 || l_opt.stress_depth >= l_opt.stress_every)) {
+        err("%s: the rollback stress test needs 0 < D < K", l_name);
+        return 2;
+    }
     if (l_opt.inputs_path != NULL && load_inputs(l_opt.inputs_path) != 0)
         return 1;
+    if (l_opt.stress_every > 0) {
+        /* GekkoNet keeps prediction window + 2 states (RMG-K's default window is 7) */
+        l_st_slot_count = l_opt.stress_depth + 2 > 9 ? l_opt.stress_depth + 2 : 9;
+        l_st_slots = calloc((size_t)l_st_slot_count, sizeof(*l_st_slots));
+        l_st_slot_frame = calloc((size_t)l_st_slot_count, sizeof(*l_st_slot_frame));
+        l_st_hash = calloc((size_t)l_st_slot_count, sizeof(*l_st_hash));
+        if (l_st_slots == NULL || l_st_slot_frame == NULL || l_st_hash == NULL)
+            return 1;
+        for (int i = 0; i < l_st_slot_count; ++i) {
+            l_st_slots[i] = calloc(1, ST_SLOT_CAPACITY);   /* GekkoNet's make_unique<u8[]>: zeroed */
+            l_st_slot_frame[i] = -1;
+            if (l_st_slots[i] == NULL)
+                return 1;
+        }
+    }
     if (l_opt.frames > 0) {   /* a run without an end keeps no per-frame times */
         l_frame_us10 = calloc((size_t)l_opt.frames, sizeof(*l_frame_us10));
         l_dynarec_stats = l_host->sym(host->core, "DebugDynarecStats");
@@ -1005,6 +1135,15 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         !CoreDetachPlugin || !ConfigOpenSection || !ConfigSetParameter || !ConfigOverrideUserPaths ||
         !DebugMemGetPointer || !rsp_startup || !rsp_shutdown)
         return 1;
+    /* Optional (patches/0014): the core's record of the RDRAM pages written since a rollback save. */
+    l_rb_verify = l_host->sym(host->core, "ZnxRollbackVerify");
+    l_rb_stats = l_host->sym(host->core, "ZnxRollbackStats");
+    l_rdram_written = l_host->sym(host->core, "ZnxRdramWritten");
+    l_rdram_writer_reports = l_host->sym(host->core, "ZnxRdramWriterReports");
+    if (l_rb_verify != NULL)
+        l_rb_verify(l_opt.rollback_verify);
+    else if (l_opt.rollback_verify)
+        err("%s: this core cannot verify its rollback states", l_name);
 
     error = CoreStartup(FRONTEND_API_VERSION, host->user_dir, host->data_dir, "core", debug_callback, NULL, NULL);
     if (error != M64ERR_SUCCESS)
@@ -1082,6 +1221,11 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         goto shutdown;
     }
     video_attached = 1;
+    /* A video plugin that never writes RDRAM says so (the null one does it itself); for GLideN64 the host
+     * knows (frame buffer emulation off). Otherwise the core takes every display list as having written
+     * all of RDRAM. */
+    if (host->video_rdram_free != NULL && host->video_rdram_free() && l_rdram_writer_reports != NULL)
+        l_rdram_writer_reports(1, 1);
     if (host->audio != NULL) {
         ptr_PluginStartup audio_startup = sym(host->audio, "PluginStartup");
         if (audio_startup == NULL || (error = audio_startup(host->core, "audio", debug_callback)) != M64ERR_SUCCESS) {
@@ -1199,12 +1343,28 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
                 l_st_failed ? "FAIL" : "PASS (every re-run frame identical)");
             if (l_st_failed)
                 out("rollback stress: %d re-runs differed, first at frame %d", l_st_failed, l_st_first_bad);
-            out("rollback stress: save %.0f us (worst %.0f), load %.0f us (worst %.0f), re-run %.0f us/frame, "
-                "load + re-run of %d frames %.2f ms on average, %.2f ms at worst",
-                l_st_save_ns / 1e3 / l_st_count, l_st_save_worst / 1e3,
+            const int d = l_opt.stress_depth;
+            out("rollback stress: save after a frame %.0f us (worst %.0f), save after a re-run frame %.0f us (worst %.0f), "
+                "load %.0f us (worst %.0f), re-run %.0f us/frame",
+                l_st_fsaves ? l_st_fsave_ns / 1e3 / l_st_fsaves : 0.0, l_st_fsave_worst / 1e3,
+                l_st_rsaves ? l_st_rsave_ns / 1e3 / l_st_rsaves : 0.0, l_st_rsave_worst / 1e3,
                 l_st_load_ns / 1e3 / l_st_count, l_st_load_worst / 1e3,
-                l_st_replay_ns / 1e3 / l_st_count / l_opt.stress_depth, l_opt.stress_depth,
-                (l_st_load_ns + l_st_replay_ns) / 1e6 / l_st_count, l_st_total_worst / 1e6);
+                l_st_replay_ns / 1e3 / l_st_count / d);
+            out("rollback stress: load + re-run of %d frames %.2f ms on average, %.2f ms at worst; "
+                "with a save after each re-run frame (what the session does) %.2f ms on average, %.2f ms at worst (frame %d)",
+                d, (l_st_load_ns + l_st_replay_ns) / 1e6 / l_st_count, l_st_total_worst / 1e6,
+                l_st_rb_ns / 1e6 / l_st_count, l_st_rb_worst / 1e6, l_st_rb_worst_frame);
+            if (l_rb_stats != NULL) {
+                unsigned long long v[16];
+                memset(v, 0, sizeof(v));
+                const int count = l_rb_stats(v, 16);
+                if (count >= 12)
+                    out("rollback states: %llu saves (%llu of them whole), %llu loads (%llu whole), %.1f RDRAM pages copied "
+                        "per save (most %llu), %.1f per load (most %llu); verify: %llu saves, %llu loads checked against whole "
+                        "ones, %llu differ, %llu RDRAM pages written without being noticed",
+                        v[0], v[1], v[2], v[3], v[0] ? (double)v[4] / v[0] : 0.0, v[10], v[2] ? (double)v[5] / v[2] : 0.0,
+                        v[11], v[6], v[7], v[8], v[9]);
+            }
         }
         print_windows();
         if (l_frame_full != NULL && l_warm_on) {
@@ -1259,6 +1419,14 @@ shutdown:
     CoreShutdown();
     free(l_rb_hashes);
     l_rb_hashes = NULL;
+    for (int i = 0; l_st_slots != NULL && i < l_st_slot_count; ++i)
+        free(l_st_slots[i]);
+    free(l_st_slots);
+    l_st_slots = NULL;
+    free(l_st_slot_frame);
+    l_st_slot_frame = NULL;
+    free(l_st_hash);
+    l_st_hash = NULL;
     free(l_events);
     l_events = NULL;
     l_event_count = 0;

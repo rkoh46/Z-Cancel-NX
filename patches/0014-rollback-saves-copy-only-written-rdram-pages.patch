@@ -1,0 +1,985 @@
+Rollback saves and loads copy only the RDRAM pages written since
+
+RMG-K's session (rmgk_gekko.cpp with GekkoNet, limited_saving off) saves the state after every
+frame into GekkoNet's slot for that frame, the frames re-run after a rollback included: a rollback
+of D frames is one load, D re-run frames each followed by a save, then the real frame and its save.
+Every save and load copied all 8 MB of RDRAM, on a Switch about 2.0 ms a save and 2.4 ms a load, so
+a 7-frame rollback spent about 2.4 + 8 x 2.0 = 18 ms copying. A frame of a match writes about 100 of
+RDRAM's 2,048 pages of 4 KB.
+
+The core now keeps a record of the RDRAM pages written since the last rollback save or load
+(device/rdram/rdram.h: rdram_written, or rdram_written_all when a writer cannot say where):
+- the memory handler (write_rdram_dram: every CPU write that is not the recompiler's direct store,
+  and the interpreters' writes), the PI, SI and SP DMAs, invalidate_r4300_cached_code (cheats; a
+  whole invalidation, as at a reset or a state load, counts as everything), the cheat engine;
+- the recompiler: its stores to RDRAM (kseg0) check invalid_code[page] != 1 after the store and call
+  invalidate_block() if so, which is how a write to compiled code is caught. After each rollback save
+  or load every page without code is set to 2 ("armed", new_dynarec_rdram_arm), so the first store to
+  it calls invalidate_block(), which notes the page and sets it back to 1, and nothing else happens:
+  the page behaves as any page without code. Everything in C that reads invalid_code only tests it
+  for zero, so 2 and 1 mean the same to it. Pages with code trap every store already, and
+  invalidate_block() notes the page it invalidates. With the TLB in use the recompiler's stores go
+  through memory_map instead, so then every save and load counts all of RDRAM as written;
+- plugins: the RSP plugin reports its writes (ZnxRdramWritten, patches/0015) and says so
+  (ZnxRdramWriterReports); a video plugin that never writes RDRAM says so (the null one does it
+  itself; for GLideN64 with frame buffer emulation off the front end does, game/game_core.c). Until
+  a plugin has said it, each of its calls that can write (DoRspCycles, ProcessDList, ProcessRDPList,
+  ShowCFB, UpdateScreen, FBRead, ViStatusChanged, ViWidthChanged) counts as having written all of
+  RDRAM; so does every audio list handed to the audio plugin. Reset when a plugin is attached;
+- the front end reports what it writes through its own pointer (ZnxRdramWritten; bench_core.c's
+  forced-match setup).
+
+Rollback slots (main/savestates.c). The core remembers the buffers it has saved into (up to 32, by
+address and a tag the save writes into the header: header[6..7], flag rollback_state_flag_has_tag,
+header size 8 words; loaders take the header size from header[1], so the rest of the layout is
+unchanged and spectator keyframes, made by savestates_save_full_buffer, keep the old 6-word header).
+For each it keeps the set of pages in which the buffer may differ from RDRAM: at each rollback save
+or load the pages written since the last one are added to every slot's set; a save into a slot
+copies only that set's pages of RDRAM (everything else in the state is written in full, as before)
+and empties it; a load from a slot copies only its set's pages into RDRAM, empties it and adds it
+to every other slot's set. Every page outside the set is equal already, so the buffer, and the
+machine after a load, are byte for byte what a whole copy gives. A buffer whose tag is not the one
+the core wrote last (changed or reallocated by someone else), a buffer the core has not saved into,
+or a different state length, is saved and loaded whole as before. Patch 0005's comparison of code
+pages before a load now only looks at the pages the load copies.
+
+ZnxRollbackVerify(1) (znx-bench --rollback-verify) checks it as it runs: after every save into a
+slot a whole save is made into a scratch buffer and compared with it byte for byte (but the tag);
+after every load from a slot likewise against the slot; and at every save or load each RDRAM page
+that changed since the last one without being noted is counted (a copy of RDRAM is kept for that).
+ZnxRollbackStats reads the counters.
+
+Measured (znx-bench --rollback-stress 10 7 over 9,000 frames with the mash script, which now saves
+after every frame and every re-run frame into a ring of slots as the session does; Mac M5): a save
+118 -> 14 us, a load 154 -> 26 us, about 90 pages copied per save and per load; the 7-frame rollback
+with its saves 1.75 -> 0.87 ms, of which the re-run frames are now 0.75 ms. Every RDRAM hash and
+check line of the harness is unchanged, and so is every re-run frame.
+
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
+@@ -43,6 +43,7 @@
+ #include "device/r4300/fpu.h"
+ #include "device/rcp/mi/mi_controller.h"
+ #include "device/rcp/rsp/rsp_core.h"
++#include "device/rdram/rdram.h"
+ 
+ #if !defined(WIN32) && !defined(__SWITCH__)
+ #include <sys/mman.h>
+@@ -2895,6 +2896,18 @@
+ void invalidate_block(u_int block)
+ {
+   u_int page;
++  // Z-Cancel NX: a page of RDRAM (kseg0) without compiled code that new_dynarec_rdram_arm() set to
++  // catch its first write since a rollback save or load (invalid_code 2). The write is noted, and
++  // from then on the page is what it was before it was armed: a page without code (1) whose writes
++  // are not trapped. Nothing else happens, as for any write to a page without code.
++  if(block-0x80000u<2048u&&g_dev.r4300.cached_interp.invalid_code[block]==2) {
++    g_dev.r4300.cached_interp.invalid_code[block]=1;
++    rdram_written[block-0x80000]=1;
++    return;
++  }
++  // Whatever invalidates a page of RDRAM has written it (a guest write, a DMA, a rollback load). (A page
++  // reached through the TLB is not marked: with the TLB in use every rollback save copies all of RDRAM.)
++  if(block-0x80000u<2048u||block-0xA0000u<2048u) rdram_written[block&2047]=1;
+   rollback_stats.block_invalidate_count++;
+   page=block^0x80000;
+   if(block<0x100000&&page>262143&&g_dev.r4300.cp0.tlb.LUT_r[block]) page=(g_dev.r4300.cp0.tlb.LUT_r[block]^0x80000000)>>12;
+@@ -3019,16 +3032,40 @@
+ static unsigned char rollback_changed_page[2048];
+ static int rollback_changed_noted;
+ 
+-void new_dynarec_rollback_note_ram(const void* incoming_rdram)
++// candidates: the pages the load can change (main/savestates.c knows the others are equal), or NULL: all
++void new_dynarec_rollback_note_ram(const void* incoming_rdram, const uint64_t* candidates)
+ {
+   const unsigned char* now=(const unsigned char*)g_dev.rdram.dram;
+   const unsigned char* then=(const unsigned char*)incoming_rdram;
+   u_int page;
+   for(page=0;page<2048;page++)
+-    rollback_changed_page[page]=(jump_in[page]||jump_out[page])&&memcmp(now+page*4096,then+page*4096,4096)!=0;
++    rollback_changed_page[page]=(candidates==NULL||(candidates[page>>6]>>(page&63)&1))&&
++      (jump_in[page]||jump_out[page])&&memcmp(now+page*4096,then+page*4096,4096)!=0;
+   rollback_changed_noted=1;
+ }
+ 
++// Z-Cancel NX: arms every page of RDRAM (kseg0) that has no compiled code, so that the recompiled code's
++// write check (invalid_code[page]!=1) traps the first write to it and invalidate_block() notes the page
++// in rdram_written. Pages with code already trap every write. Called after each rollback save and load.
++// Value 2 means "no code" to everything that reads invalid_code except that check: the C code only tests
++// it for zero. With the TLB in use, writes through it are checked against memory_map instead, so the
++// caller does not rely on this then (new_dynarec_rdram_tracked).
++void new_dynarec_rdram_arm(void)
++{
++  char* page=g_dev.r4300.cached_interp.invalid_code+0x80000;
++  u_int i;
++  for(i=0;i<2048;i++)
++    if(page[i]==1) page[i]=2;
++}
++
++// Whether every write the recompiled code makes to RDRAM is noticed: without the TLB, all its stores
++// to RDRAM go through the invalid_code check (stores through kseg1 and to I/O go through the memory
++// handlers).
++int new_dynarec_rdram_tracked(void)
++{
++  return !using_tlb;
++}
++
+ int new_dynarec_rollback_invalidate_changed(void)
+ {
+   u_int page;
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.h
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.h
+@@ -110,7 +110,9 @@
+ extern unsigned int using_tlb;
+ 
+ void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t address, size_t size);
+-void new_dynarec_rollback_note_ram(const void* incoming_rdram);
++void new_dynarec_rollback_note_ram(const void* incoming_rdram, const uint64_t* candidates);
++void new_dynarec_rdram_arm(void);
++int new_dynarec_rdram_tracked(void);
+ int new_dynarec_rollback_invalidate_changed(void);
+ /* Warm list: blocks compiled ahead of need (new_dynarec.c, "warm list"). Entries are three words. */
+ void new_dynarec_warm_reset(void);
+--- a/mupen64plus-core/src/device/r4300/r4300_core.c
++++ b/mupen64plus-core/src/device/r4300/r4300_core.c
+@@ -34,6 +34,7 @@
+ #ifdef DBG
+ #include "debugger/dbg_debugger.h"
+ #endif
++#include "device/rdram/rdram.h"
+ #include "main/main.h"
+ 
+ #include <stdlib.h>
+@@ -493,6 +494,14 @@
+ 
+ void invalidate_r4300_cached_code(struct r4300_core* r4300, uint32_t address, size_t size)
+ {
++    /* Z-Cancel NX: whoever invalidates code has written RDRAM there (device/rdram/rdram.h); a full
++     * invalidation (reset, state load) may have changed all of it. */
++    if (size == 0)
++        rdram_written_all = 1;
++    else if ((address & UINT32_C(0xc0000000)) == UINT32_C(0x80000000) && (address & UINT32_C(0x1fffffff)) < (RDRAM_PAGE_COUNT << 12))
++        rdram_mark_written(address & UINT32_C(0x1fffffff),
++            (uint32_t)(size < (RDRAM_PAGE_COUNT << 12) - (address & UINT32_C(0x1fffffff)) ? size : (RDRAM_PAGE_COUNT << 12) - (address & UINT32_C(0x1fffffff))));
++
+     if (r4300->emumode != EMUMODE_PURE_INTERPRETER)
+     {
+         if (size == 0)
+--- a/mupen64plus-core/src/device/rcp/pi/pi_controller.c
++++ b/mupen64plus-core/src/device/rcp/pi/pi_controller.c
+@@ -34,6 +34,7 @@
+ #include "device/rcp/mi/mi_controller.h"
+ #include "device/rcp/rdp/rdp_core.h"
+ #include "device/rcp/ri/ri_controller.h"
++#include "device/rdram/rdram.h"
+ 
+ #define __STDC_FORMAT_MACROS
+ #include <inttypes.h>
+@@ -112,6 +113,7 @@
+     if (length <= 0x80)
+         length -= dram_addr & 0x7;
+     unsigned int cycles = handler->dma_write(opaque, dram, dram_addr, cart_addr, length);
++    rdram_mark_written(dram_addr, length);
+ 
+     post_framebuffer_write(&pi->dp->fb, dram_addr, length);
+ 
+--- a/mupen64plus-core/src/device/rcp/rdp/fb.c
++++ b/mupen64plus-core/src/device/rcp/rdp/fb.c
+@@ -58,6 +58,7 @@
+ 
+         if ((address >= begin) && (address <= end) && (fb->dirty_page[address >> 12])) {
+             gfx.fBRead(address);
++            rdram_plugin_call_done(RDRAM_WRITER_VIDEO);
+             fb->dirty_page[address >> 12] = 0;
+         }
+     }
+--- a/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
++++ b/mupen64plus-core/src/device/rcp/rdp/rdp_core.c
+@@ -27,6 +27,7 @@
+ #include "device/rcp/mi/mi_controller.h"
+ #include "device/rcp/rsp/rsp_core.h"
+ #include "device/r4300/r4300_core.h"
++#include "device/rdram/rdram.h"
+ #include "main/main.h"
+ #include "plugin/plugin.h"
+ 
+@@ -47,8 +48,10 @@
+ 
+             clear_rsp_wait(dp->sp, WAIT_PENDING_DP_SYNC);
+         }
+-        if ((dp->do_on_unfreeze & DELAY_UPDATESCREEN) && main_frame_video_enabled())
++        if ((dp->do_on_unfreeze & DELAY_UPDATESCREEN) && main_frame_video_enabled()) {
+             gfx.updateScreen();
++            rdram_plugin_call_done(RDRAM_WRITER_VIDEO);
++        }
+         dp->do_on_unfreeze = 0;
+     }
+     if (w & DPC_SET_FREEZE) dp->dpc_regs[DPC_STATUS_REG] |= DPC_STATUS_FREEZE;
+@@ -146,6 +149,7 @@
+         }
+         unprotect_framebuffers(&dp->fb);
+         gfx.processRDPList();
++        rdram_plugin_call_done(RDRAM_WRITER_VIDEO);
+         protect_framebuffers(&dp->fb);
+         if (dp->mi->regs[MI_INTR_REG] & MI_INTR_DP)
+         {
+--- a/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
++++ b/mupen64plus-core/src/device/rcp/rsp/rsp_core.c
+@@ -55,6 +55,7 @@
+     if (dma->dir == SP_DMA_READ)
+     {
+         for(j=0; j<count; j++) {
++            rdram_mark_written(dramaddr & 0x7fffff, length);
+             for(i=0; i<length; i++) {
+                 dram[(dramaddr^S8) & 0x7fffff] = spmem[(memaddr^S8) & 0xfff];
+                 memaddr++;
+@@ -369,6 +370,7 @@
+ 
+     unprotect_framebuffers(&sp->dp->fb);
+     uint32_t rsp_cycles = rsp.doRspCycles(sp->first_run) / 2;
++    rdram_plugin_call_done(RDRAM_WRITER_RSP);
+ 
+     if (sp->mi->regs[MI_INTR_REG] & MI_INTR_DP && !dp_bit_set)
+     {
+--- a/mupen64plus-core/src/device/rcp/si/si_controller.c
++++ b/mupen64plus-core/src/device/rcp/si/si_controller.c
+@@ -69,6 +69,7 @@
+         for(i = 0; i < (PIF_RAM_SIZE / 4); ++i) {
+             dram[i] = tohl(pif_ram[i]);
+         }
++        rdram_mark_written(dram_addr & 0xffffff, PIF_RAM_SIZE);
+     }
+ }
+ 
+--- a/mupen64plus-core/src/device/rcp/vi/vi_controller.c
++++ b/mupen64plus-core/src/device/rcp/vi/vi_controller.c
+@@ -27,6 +27,7 @@
+ #include "device/memory/memory.h"
+ #include "device/r4300/r4300_core.h"
+ #include "device/rcp/mi/mi_controller.h"
++#include "device/rdram/rdram.h"
+ #include "main/main.h"
+ #include "plugin/plugin.h"
+ 
+@@ -123,6 +124,7 @@
+         {
+             masked_write(&vi->regs[VI_STATUS_REG], value, mask);
+             gfx.viStatusChanged();
++            rdram_plugin_call_done(RDRAM_WRITER_VIDEO);
+         }
+         return;
+ 
+@@ -131,6 +133,7 @@
+         {
+             masked_write(&vi->regs[VI_WIDTH_REG], value, mask);
+             gfx.viWidthChanged();
++            rdram_plugin_call_done(RDRAM_WRITER_VIDEO);
+         }
+         return;
+ 
+@@ -165,8 +168,10 @@
+     struct vi_controller* vi = (struct vi_controller*)opaque;
+     if (vi->dp->do_on_unfreeze & DELAY_DP_INT)
+         vi->dp->do_on_unfreeze |= DELAY_UPDATESCREEN;
+-    else if (main_frame_video_enabled())
++    else if (main_frame_video_enabled()) {
+         gfx.updateScreen();
++        rdram_plugin_call_done(RDRAM_WRITER_VIDEO);
++    }
+ 
+     /* allow main module to do things on VI event */
+     new_vi();
+--- a/mupen64plus-core/src/device/rdram/rdram.c
++++ b/mupen64plus-core/src/device/rdram/rdram.c
+@@ -170,6 +170,7 @@
+     size_t modules = get_modules_count(rdram);
+     memset(rdram->regs, 0, RDRAM_MAX_MODULES_COUNT*RDRAM_REGS_COUNT*sizeof(uint32_t));
+     memset(rdram->dram, 0, rdram->dram_size);
++    rdram_written_all = 1;
+ 
+     DebugMessage(M64MSG_INFO, "Initializing %u RDRAM modules for a total of %u MB",
+         (uint32_t) modules, (uint32_t) rdram->dram_size / (1024*1024));
+@@ -261,6 +262,10 @@
+         *value = 0;
+     }
+ }
++
++uint8_t rdram_written[RDRAM_PAGE_COUNT];
++int rdram_written_all = 1;
++int rdram_writer_reports[RDRAM_WRITER_COUNT];
+ 
+ void write_rdram_dram(void* opaque, uint32_t address, uint32_t value, uint32_t mask)
+ {
+@@ -270,5 +275,6 @@
+     if (address < rdram->dram_size)
+     {
+         masked_write(&rdram->dram[addr], value, mask);
++        rdram_written[address >> 12] = 1;
+     }
+ }
+--- a/mupen64plus-core/src/device/rdram/rdram.h
++++ b/mupen64plus-core/src/device/rdram/rdram.h
+@@ -85,4 +85,41 @@
+ void read_rdram_dram(void* opaque, uint32_t address, uint32_t* value);
+ void write_rdram_dram(void* opaque, uint32_t address, uint32_t value, uint32_t mask);
+ 
++/* Z-Cancel NX: the 4 KB pages of RDRAM written since the last rollback save or load, so that a save
++ * into a slot copies only the pages written since that slot was saved, and a load only the pages
++ * written since the state it restores (main/savestates.c). Everything that writes RDRAM marks the
++ * pages here: the CPU through the memory handler below or the recompiler's write traps
++ * (new_dynarec.c), the DMAs, the RSP plugin and the front end (ZnxRdramWritten), the code that
++ * restores a state. A writer that cannot say where it wrote sets rdram_written_all. */
++enum { RDRAM_PAGE_COUNT = 0x800 };   /* RDRAM_MAX_SIZE >> 12 */
++extern uint8_t rdram_written[RDRAM_PAGE_COUNT];
++extern int rdram_written_all;
++
++/* Plugins write RDRAM through their own pointer. One that reports what it writes (ZnxRdramWritten), or
++ * never writes, says so (ZnxRdramWriterReports); until then each of its calls counts as having written
++ * all of RDRAM. Reset when the plugin is attached or detached. */
++enum { RDRAM_WRITER_RSP, RDRAM_WRITER_VIDEO, RDRAM_WRITER_COUNT };
++extern int rdram_writer_reports[RDRAM_WRITER_COUNT];
++
++static osal_inline void rdram_plugin_call_done(int writer)
++{
++    if (!rdram_writer_reports[writer])
++        rdram_written_all = 1;
++}
++
++/* offset: a byte offset into RDRAM (a physical address) */
++static osal_inline void rdram_mark_written(uint32_t offset, uint32_t length)
++{
++    uint32_t page, last;
++    if (length == 0)
++        return;
++    if (offset >= (RDRAM_PAGE_COUNT << 12) || length > (RDRAM_PAGE_COUNT << 12) - offset) {
++        rdram_written_all = 1;
++        return;
++    }
++    last = (offset + length - 1) >> 12;
++    for (page = offset >> 12; page <= last; ++page)
++        rdram_written[page] = 1;
++}
++
+ #endif
+--- a/mupen64plus-core/src/main/cheat.c
++++ b/mupen64plus-core/src/main/cheat.c
+@@ -80,6 +80,7 @@
+ static void update_address_16bit(struct r4300_core* r4300, uint32_t address, uint16_t new_value)
+ {
+     *(uint16_t*)(((unsigned char*)r4300->rdram->dram + ((address & 0xFFFFFF)^S16))) = new_value;
++    rdram_mark_written(address & 0xFFFFFE, 2);
+     /* mask out bit 24 which is used by GS codes to specify 8/16 bits */
+     address &= 0xfeffffff;
+     invalidate_r4300_cached_code(r4300, address, 2);
+@@ -88,6 +89,7 @@
+ static void update_address_8bit(struct r4300_core* r4300, uint32_t address, uint8_t new_value)
+ {
+     *(uint8_t*)(((unsigned char*)r4300->rdram->dram + ((address & 0xFFFFFF)^S8))) = new_value;
++    rdram_mark_written(address & 0xFFFFFF, 1);
+     invalidate_r4300_cached_code(r4300, address, 1);
+ }
+ 
+--- a/mupen64plus-core/src/main/savestates.c
++++ b/mupen64plus-core/src/main/savestates.c
+@@ -140,6 +140,216 @@
+ static int rollback_save_full = 0;
+ static int rollback_verbose_stats = 0;
+ 
++/* ---- Z-Cancel NX: rollback slots ----
++ *
++ * The netplay session saves the state after every frame, re-run ones included, into a ring of
++ * buffers it owns (GekkoNet's slots, handed over as the preallocated buffer of a rollback save) and
++ * loads one of them for a rollback. Each such save or load used to copy all 8 MB of RDRAM, about
++ * 2 ms each on a Switch, while a frame writes about 100 of RDRAM's 2048 pages.
++ *
++ * The core now remembers the buffers it has saved into (up to ROLLBACK_SLOT_MAX). For each it keeps
++ * the set of RDRAM pages in which the buffer may differ from RDRAM now ("stale" pages): the pages
++ * written since the buffer was saved (device/rdram/rdram.h keeps the pages written since the last
++ * rollback save or load; at each save or load they are added to every slot's set and cleared),
++ * plus, after a load, the pages in which the loaded state differed. A save into a known buffer copies
++ * only its stale pages of RDRAM and writes everything else in full, as before; a load from one
++ * copies only its stale pages into RDRAM. Every other byte of RDRAM is already equal, so the buffer
++ * and the restored machine are byte for byte what a whole copy gives (--rollback-verify checks it).
++ *
++ * A buffer is known by its address and a tag the save writes into the header (header[6..7], with
++ * rollback_state_flag_has_tag; the header is then 8 words: loaders read the header size from
++ * header[1], so the layout after it is unchanged). A buffer with another tag, or none, was changed
++ * or reallocated by someone else: it is saved and loaded whole, as is any buffer when the record of
++ * written pages cannot be trusted (the TLB in use, a plugin that writes RDRAM without saying where:
++ * then rdram_written_all is set at every save or load). */
++enum { ROLLBACK_SLOT_MAX = 32, ROLLBACK_PAGE_WORDS = RDRAM_PAGE_COUNT / 64 };
++static const int rollback_state_flag_has_tag = 1 << 6;
++static const int rollback_state_tagged_header_size = 8 * sizeof(int);
++
++struct rollback_slot
++{
++    unsigned char* buffer;                    /* NULL: unused */
++    uint64_t tag;                             /* what the last save wrote into header[6..7] */
++    size_t len;                               /* the length of that save, header included */
++    uint64_t used;                            /* when it was last saved or loaded */
++    uint64_t stale[ROLLBACK_PAGE_WORDS];      /* RDRAM pages where the buffer may differ from RDRAM */
++};
++
++static struct rollback_slot rollback_slots[ROLLBACK_SLOT_MAX];
++static uint64_t rollback_slot_clock;
++static uint64_t rollback_tag_counter;
++/* The save or load in progress: the slot (or -1), and whether only its stale pages are copied. */
++static int rollback_op_slot = -1;
++static int rollback_op_delta = 0;
++static const uint64_t* rollback_op_pages = NULL;
++static int rollback_op_active = 0;          /* a save into or load from a front end's buffer is under way */
++/* --rollback-verify: RDRAM as the last rollback save or load left it, and a buffer for whole saves. */
++static int rollback_verify = 0;
++static int rollback_verify_running = 0;
++static unsigned char* rollback_verify_shadow = NULL;
++static int rollback_verify_shadow_valid = 0;
++static unsigned char* rollback_verify_scratch = NULL;
++static size_t rollback_verify_scratch_size = 0;
++
++enum {
++    RB_STAT_SAVES, RB_STAT_SAVES_WHOLE, RB_STAT_LOADS, RB_STAT_LOADS_WHOLE, RB_STAT_SAVE_PAGES, RB_STAT_LOAD_PAGES,
++    RB_STAT_VERIFY_SAVES, RB_STAT_VERIFY_LOADS, RB_STAT_VERIFY_DIFFER, RB_STAT_VERIFY_UNNOTICED,
++    RB_STAT_SAVE_PAGES_MOST, RB_STAT_LOAD_PAGES_MOST, RB_STAT_COUNT
++};
++static unsigned long long rollback_stats[RB_STAT_COUNT];
++
++static int rollback_rdram_tracked(void)
++{
++#if defined(M64P_BIG_ENDIAN)
++    return 0;
++#else
++    if (g_dev.r4300.emumode == EMUMODE_DYNAREC) {
++#ifdef NEW_DYNAREC
++        return new_dynarec_rdram_tracked();
++#else
++        return 0;   /* the old recompiler writes RDRAM directly */
++#endif
++    }
++    return 1;       /* the interpreters write through the memory handlers */
++#endif
++}
++
++static int rollback_page_count(const uint64_t* pages)
++{
++    int i, n = 0;
++    for (i = 0; i < ROLLBACK_PAGE_WORDS; ++i) {
++        uint64_t w = pages[i];
++        while (w) { w &= w - 1; ++n; }
++    }
++    return n;
++}
++
++/* Copies the pages of RDRAM set in pages (4 KB each; the state keeps RDRAM in host word order). */
++static void rollback_copy_pages(unsigned char* dst, const unsigned char* src, const uint64_t* pages)
++{
++    int i;
++    for (i = 0; i < ROLLBACK_PAGE_WORDS; ++i) {
++        uint64_t w = pages[i];
++        while (w) {
++            int first = __builtin_ctzll(w), run = 0;
++            /* a run of consecutive pages in one copy */
++            while (first + run < 64 && ((w >> (first + run)) & 1))
++                ++run;
++            memcpy(dst + ((size_t)(i * 64 + first) << 12), src + ((size_t)(i * 64 + first) << 12), (size_t)run << 12);
++            w &= run == 64 ? 0 : ~(((UINT64_C(1) << run) - 1) << first);
++        }
++    }
++}
++
++/* Ends the span since the last rollback save or load: the pages written in it may now differ in every
++ * slot. Called at the start of each rollback save or load into or from a buffer. */
++static void rollback_close_span(void)
++{
++    uint64_t written[ROLLBACK_PAGE_WORDS];
++    int i, j;
++    const int all = rdram_written_all || !rollback_rdram_tracked();
++
++    if (all)
++        memset(written, 0xff, sizeof(written));
++    else {
++        memset(written, 0, sizeof(written));
++        for (i = 0; i < RDRAM_PAGE_COUNT; ++i)
++            if (rdram_written[i])
++                written[i >> 6] |= UINT64_C(1) << (i & 63);
++    }
++    if (rollback_verify && rollback_verify_shadow_valid && !all) {
++        /* every page that changed must have been noticed */
++        const unsigned char* now = (const unsigned char*)g_dev.rdram.dram;
++        for (i = 0; i < RDRAM_PAGE_COUNT; ++i) {
++            if ((written[i >> 6] >> (i & 63)) & 1)
++                continue;
++            if (memcmp(now + ((size_t)i << 12), rollback_verify_shadow + ((size_t)i << 12), 4096) != 0) {
++                if (rollback_stats[RB_STAT_VERIFY_UNNOTICED]++ < 8)
++                    DebugMessage(M64MSG_WARNING, "rollback verify: RDRAM page %04x changed without being noticed", i);
++                written[i >> 6] |= UINT64_C(1) << (i & 63);
++            }
++        }
++    }
++    for (j = 0; j < ROLLBACK_SLOT_MAX; ++j) {
++        if (rollback_slots[j].buffer == NULL)
++            continue;
++        for (i = 0; i < ROLLBACK_PAGE_WORDS; ++i)
++            rollback_slots[j].stale[i] |= written[i];
++    }
++    memset(rdram_written, 0, sizeof(rdram_written));
++    rdram_written_all = 0;
++}
++
++/* Starts the next span, once the save or load has done its own copying. */
++static void rollback_open_span(void)
++{
++#ifdef NEW_DYNAREC
++    if (g_dev.r4300.emumode == EMUMODE_DYNAREC)
++        new_dynarec_rdram_arm();
++#endif
++    if (rollback_verify) {
++        if (rollback_verify_shadow == NULL)
++            rollback_verify_shadow = malloc(RDRAM_MAX_SIZE);
++        if (rollback_verify_shadow != NULL) {
++            memcpy(rollback_verify_shadow, g_dev.rdram.dram, RDRAM_MAX_SIZE);
++            rollback_verify_shadow_valid = 1;
++        }
++    }
++}
++
++static int rollback_slot_find(const unsigned char* buffer)
++{
++    int i;
++    for (i = 0; i < ROLLBACK_SLOT_MAX; ++i)
++        if (rollback_slots[i].buffer == buffer)
++            return i;
++    return -1;
++}
++
++/* Whether the buffer still holds what the slot's last save wrote, len bytes of it. */
++static int rollback_slot_intact(int slot, const unsigned char* buffer, size_t len)
++{
++    int header[8];
++    uint64_t tag;
++    if (slot < 0 || rollback_slots[slot].len != len || len < (size_t)rollback_state_tagged_header_size)
++        return 0;
++    memcpy(header, buffer, sizeof(header));
++    memcpy(&tag, &header[6], sizeof(tag));
++    return header[0] == rollback_state_header_magic && header[1] == rollback_state_tagged_header_size &&
++        (header[4] & rollback_state_flag_has_tag) != 0 && tag == rollback_slots[slot].tag;
++}
++
++static int rollback_slot_take(unsigned char* buffer)
++{
++    int i, pick = -1;
++    for (i = 0; i < ROLLBACK_SLOT_MAX; ++i) {
++        if (rollback_slots[i].buffer == NULL) { pick = i; break; }
++        if (pick < 0 || rollback_slots[i].used < rollback_slots[pick].used)
++            pick = i;
++    }
++    memset(&rollback_slots[pick], 0, sizeof(rollback_slots[pick]));
++    rollback_slots[pick].buffer = buffer;
++    return pick;
++}
++
++static void rollback_slots_all_stale(void)
++{
++    int i;
++    for (i = 0; i < ROLLBACK_SLOT_MAX; ++i)
++        memset(rollback_slots[i].stale, 0xff, sizeof(rollback_slots[i].stale));
++}
++
++static void rollback_verify_state(const unsigned char* buffer, size_t len, int frame, int is_load);
++
++static void rollback_slots_reset(void)
++{
++    memset(rollback_slots, 0, sizeof(rollback_slots));
++    rollback_op_slot = -1;
++    rollback_op_delta = 0;
++    rollback_op_pages = NULL;
++    rollback_verify_shadow_valid = 0;
++}
++
+ void savestates_set_rollback_verbose_stats(int enabled)
+ {
+     rollback_verbose_stats = enabled != 0;
+@@ -827,9 +1037,16 @@
+     }
+ #ifdef NEW_DYNAREC
+     if (rollback_buffer_load && dev->r4300.emumode == EMUMODE_DYNAREC)
+-        new_dynarec_rollback_note_ram(curr);   /* which code pages this load changes */
++        new_dynarec_rollback_note_ram(curr, rollback_op_pages);   /* which code pages this load changes */
+ #endif
+-    COPYARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
++    if (rollback_buffer_load && rollback_op_pages != NULL)
++    {
++        /* only the pages in which the slot may differ from RDRAM (rollback slots, above) */
++        rollback_copy_pages((unsigned char*)dev->rdram.dram, curr, rollback_op_pages);
++        curr += RDRAM_MAX_SIZE;
++    }
++    else
++        COPYARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+     if (memory_data != NULL && rollback_verbose_stats)
+         rollback_rdram_end = SDL_GetPerformanceCounter();
+     COPYARRAY(dev->sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
+@@ -2109,6 +2326,7 @@
+     uint64_t rollback_save_extra_end = 0;
+     uint64_t rollback_save_finalize_end = 0;
+     uint64_t rollback_save_end = 0;
++    int rollback_header_size;
+ 
+     char queue[1024];
+ 
+@@ -2186,9 +2404,12 @@
+     if (rollback_buffer_save)
+         save->size += AI_DMA_FIFO_SIZE * sizeof(uint32_t);
+     allocation_size = save->size;
++    /* Z-Cancel NX: a save into a front end's buffer carries the slot tag (rollback slots, above) */
++    rollback_header_size = rollback_buffer_save && !rollback_save_full && (rollback_op_active || rollback_verify_running)
++        ? rollback_state_tagged_header_size : rollback_state_header_size;
+     if (rollback_buffer_save)
+     {
+-        allocation_size += rollback_state_header_size;
++        allocation_size += rollback_header_size;
+         if (rollback_save_prealloc_data != NULL)
+         {
+             if (rollback_save_prealloc_capacity < (int)allocation_size)
+@@ -2205,7 +2426,11 @@
+         {
+             save->data = malloc(allocation_size);
+         }
+-        curr = save->data + rollback_state_header_size;
++        curr = save->data + rollback_header_size;
++        /* only the pages written since this buffer was saved, if it still holds that save */
++        if (rollback_op_active)
++            rollback_op_delta = rollback_op_slot >= 0 && rollback_slots[rollback_op_slot].len == allocation_size &&
++                rollback_slot_intact(rollback_op_slot, (const unsigned char*)save->data, allocation_size);
+     }
+     else if (memory_save)
+     {
+@@ -2387,7 +2612,25 @@
+         rollback_save_fixed_end = SDL_GetPerformanceCounter();
+         rollback_save_rdram_start = rollback_save_fixed_end;
+     }
+-    PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
++    if (rollback_buffer_save && rollback_op_active && rollback_op_delta)
++    {
++        const uint64_t* stale = rollback_slots[rollback_op_slot].stale;
++        const int pages = rollback_page_count(stale);
++        rollback_copy_pages((unsigned char*)curr, (const unsigned char*)dev->rdram.dram, stale);
++        rollback_stats[RB_STAT_SAVE_PAGES] += pages;
++        if ((unsigned long long)pages > rollback_stats[RB_STAT_SAVE_PAGES_MOST])
++            rollback_stats[RB_STAT_SAVE_PAGES_MOST] = pages;
++        curr += RDRAM_MAX_SIZE;
++    }
++    else
++    {
++        PUTARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
++        if (rollback_buffer_save && rollback_op_active)
++        {
++            rollback_stats[RB_STAT_SAVE_PAGES] += RDRAM_PAGE_COUNT;
++            rollback_stats[RB_STAT_SAVES_WHOLE]++;
++        }
++    }
+     if (rollback_buffer_save && rollback_verbose_stats)
+         rollback_save_rdram_end = SDL_GetPerformanceCounter();
+     PUTARRAY(dev->sp.mem, curr, uint32_t, SP_MEM_SIZE/4);
+@@ -2648,10 +2891,10 @@
+     if (rollback_buffer_save)
+     {
+         int *rollback_header = (int *)save->data;
+-        size_t rollback_buffer_len = save->size + (size_t)rollback_state_header_size;
++        size_t rollback_buffer_len = save->size + (size_t)rollback_header_size;
+ 
+         rollback_header[0] = rollback_state_header_magic;
+-        rollback_header[1] = rollback_state_header_size;
++        rollback_header[1] = rollback_header_size;
+         rollback_header[2] = savestate_latest_version;
+         rollback_header[3] = rollback_save_buffer_frame;
+         rollback_header[4] = rollback_save_full ? 0 : rollback_state_flag_omit_tlb_lut;
+@@ -2664,6 +2907,24 @@
+             rollback_header[4] |= rollback_state_flag_has_flashram;
+         rollback_header[4] |= rollback_state_flag_has_save_generation;
+         rollback_header[5] = (int)main_get_save_generation();
++        if (rollback_header_size == rollback_state_tagged_header_size)
++        {
++            /* the buffer now holds RDRAM as it is: no page of it is stale */
++            uint64_t tag = 0;
++            rollback_header[4] |= rollback_state_flag_has_tag;
++            if (rollback_op_active)
++            {
++                if (rollback_op_slot < 0)
++                    rollback_op_slot = rollback_slot_take((unsigned char*)save->data);
++                tag = ++rollback_tag_counter;
++                rollback_slots[rollback_op_slot].tag = tag;
++                rollback_slots[rollback_op_slot].len = rollback_buffer_len;
++                rollback_slots[rollback_op_slot].used = ++rollback_slot_clock;
++                memset(rollback_slots[rollback_op_slot].stale, 0, sizeof(rollback_slots[rollback_op_slot].stale));
++                rollback_stats[RB_STAT_SAVES]++;
++            }
++            memcpy(&rollback_header[6], &tag, sizeof(tag));
++        }
+ 
+         if (rollback_save_buffer_checksum != NULL)
+             *rollback_save_buffer_checksum = 0;
+@@ -3032,10 +3293,30 @@
+     rollback_save_buffer_frame = frame;
+     rollback_save_prealloc_data = prealloc_data;
+     rollback_save_prealloc_capacity = prealloc_capacity;
++
++    /* Z-Cancel NX: a save into a front end's buffer (a GekkoNet slot) copies only the RDRAM pages
++     * written since that buffer was last saved (rollback slots, above). */
++    rollback_op_active = prealloc_data != NULL && !rollback_save_full && !rollback_verify_running;
++    if (rollback_op_active)
++    {
++        rollback_close_span();
++        rollback_op_slot = rollback_slot_find(prealloc_data);
++        rollback_op_delta = 0;
++    }
+ 
+     main_rollback_log_state("save_begin", frame, -1, 0);
+     result = savestates_save_m64p(dev, "ROLLBACK");
+     main_rollback_log_state("save_end", frame, result, frame % 60 == 0);
++
++    if (rollback_op_active)
++    {
++        rollback_op_active = 0;
++        if (!result && rollback_op_slot >= 0)
++            memset(&rollback_slots[rollback_op_slot], 0, sizeof(rollback_slots[rollback_op_slot]));
++        rollback_open_span();
++        if (result && rollback_verify)
++            rollback_verify_state(prealloc_data, (size_t)*len, frame, 0);
++    }
+ 
+     rollback_save_buffer = NULL;
+     rollback_save_buffer_len = NULL;
+@@ -3079,11 +3360,61 @@
+ 
+     rollback_load_buffer = buffer;
+     rollback_load_buffer_size = (size_t)len;
++
++    /* Z-Cancel NX: from a buffer this core saved into and nobody changed since, only the RDRAM pages
++     * in which it differs from RDRAM are copied (rollback slots, above). */
++    rollback_close_span();
++    rollback_op_slot = rollback_slot_find(buffer);
++    rollback_op_delta = rollback_op_slot >= 0 && (size_t)len >= rollback_slots[rollback_op_slot].len &&
++        rollback_slot_intact(rollback_op_slot, buffer, rollback_slots[rollback_op_slot].len);
++    if (rollback_op_slot >= 0 && !rollback_op_delta)
++    {
++        memset(&rollback_slots[rollback_op_slot], 0, sizeof(rollback_slots[rollback_op_slot]));
++        rollback_op_slot = -1;
++    }
++    rollback_op_pages = rollback_op_delta ? rollback_slots[rollback_op_slot].stale : NULL;
++    rollback_op_active = 1;
++
+     main_rollback_capture_load_before_probe();
+     main_rollback_log_state("restore_begin", state_frame, -1, 0);
+     result = savestates_load_m64p(&g_dev, "ROLLBACK");
+     main_rollback_log_state("restore_end", state_frame, result, state_frame >= 0 && state_frame % 60 == 0);
++
++    rollback_op_active = 0;
++    rollback_op_pages = NULL;
++    if (result && rollback_op_delta)
++    {
++        /* RDRAM is now the slot's state: another slot may differ from it where it differed from RDRAM
++         * before, or where the slot did */
++        struct rollback_slot* loaded = &rollback_slots[rollback_op_slot];
++        const int pages = rollback_page_count(loaded->stale);
++        int i, j;
++        rollback_stats[RB_STAT_LOAD_PAGES] += pages;
++        if ((unsigned long long)pages > rollback_stats[RB_STAT_LOAD_PAGES_MOST])
++            rollback_stats[RB_STAT_LOAD_PAGES_MOST] = pages;
++        for (j = 0; j < ROLLBACK_SLOT_MAX; ++j)
++            if (j != rollback_op_slot && rollback_slots[j].buffer != NULL)
++                for (i = 0; i < ROLLBACK_PAGE_WORDS; ++i)
++                    rollback_slots[j].stale[i] |= loaded->stale[i];
++        memset(loaded->stale, 0, sizeof(loaded->stale));
++        loaded->used = ++rollback_slot_clock;
++    }
++    else
++    {
++        /* a whole load (or a failed one): RDRAM may differ from every slot anywhere */
++        rollback_slots_all_stale();
++        if (result)
++        {
++            rollback_stats[RB_STAT_LOAD_PAGES] += RDRAM_PAGE_COUNT;
++            rollback_stats[RB_STAT_LOADS_WHOLE]++;
++        }
++    }
+     if (result)
++        rollback_stats[RB_STAT_LOADS]++;
++    rollback_open_span();
++    if (result && rollback_verify && rollback_op_delta)
++        rollback_verify_state(buffer, rollback_slots[rollback_op_slot].len, state_frame, 1);
++    if (result)
+     {
+         main_rollback_capture_load_probe();
+         ++rollback_load_counter;
+@@ -3099,8 +3430,84 @@
+     free(buffer);
+ }
+ 
++/* --rollback-verify: a whole save made now must equal the buffer just saved into or loaded from (but for
++ * the tag). The save changes nothing in the machine. */
++static void rollback_verify_state(const unsigned char* buffer, size_t len, int frame, int is_load)
++{
++    unsigned char* scratch;
++    int scratch_len, checksum = 0, ok, differ;
++    const size_t want = len + 65536;
++    if (rollback_verify_scratch_size < want)
++    {
++        free(rollback_verify_scratch);
++        rollback_verify_scratch = malloc(want);
++        rollback_verify_scratch_size = rollback_verify_scratch != NULL ? want : 0;
++    }
++    if (rollback_verify_scratch == NULL || len < (size_t)rollback_state_tagged_header_size)
++        return;
++    scratch = rollback_verify_scratch;
++    scratch_len = (int)rollback_verify_scratch_size;
++    rollback_verify_running = 1;
++    ok = savestates_save_rollback_buffer(&scratch, &scratch_len, &checksum, frame);
++    rollback_verify_running = 0;
++    rollback_stats[is_load ? RB_STAT_VERIFY_LOADS : RB_STAT_VERIFY_SAVES]++;
++    differ = !ok || scratch != rollback_verify_scratch || (size_t)scratch_len != len ||
++        memcmp(buffer, scratch, 6 * sizeof(int)) != 0 ||
++        memcmp(buffer + rollback_state_tagged_header_size, scratch + rollback_state_tagged_header_size,
++               len - (size_t)rollback_state_tagged_header_size) != 0;
++    if (differ && rollback_stats[RB_STAT_VERIFY_DIFFER]++ < 8)
++    {
++        size_t at = 0;
++        if (ok && (size_t)scratch_len == len)
++            while (at < len && (at >= 6 * sizeof(int) && at < (size_t)rollback_state_tagged_header_size ? 1 : buffer[at] == scratch[at]))
++                ++at;
++        DebugMessage(M64MSG_WARNING, "rollback verify: the %s of frame %d differs from a whole save (length %d/%d, first at byte %zu)",
++                     is_load ? "load" : "save", frame, (int)len, scratch_len, at);
++    }
++}
++
++/* ---- Z-Cancel NX: rollback slots, the front end's side ---- */
++
++/* A plugin or the front end wrote RDRAM through its own pointer: offset is a byte offset into RDRAM. */
++EXPORT void CALL ZnxRdramWritten(unsigned int offset, unsigned int length)
++{
++    rdram_mark_written(offset, length);
++}
++
++/* writer 0: the RSP plugin, 1: the video plugin. reports 1: it reports every RDRAM write it makes with
++ * ZnxRdramWritten, or makes none. Valid until the plugin is attached again or detached. */
++EXPORT void CALL ZnxRdramWriterReports(int writer, int reports)
++{
++    if (writer >= 0 && writer < RDRAM_WRITER_COUNT)
++        rdram_writer_reports[writer] = reports != 0;
++}
++
++/* 1: every rollback save into a known buffer is compared with a whole save, every load from one with a
++ * whole save made right after it, and every page of RDRAM that changed between two saves or loads
++ * without having been noticed is counted. Slow (two 8 MB copies and compares per save). */
++EXPORT void CALL ZnxRollbackVerify(int on)
++{
++    rollback_verify = on != 0;
++    rollback_verify_shadow_valid = 0;
++}
++
++/* Counters since the core started: saves into a buffer (of them whole), loads (of them whole), RDRAM
++ * pages copied by saves, by loads; verify: saves checked, loads checked, of them different, pages
++ * changed without being noticed; the most pages one save and one load copied without copying all.
++ * Returns how many it wrote. */
++EXPORT int CALL ZnxRollbackStats(unsigned long long* out, int count)
++{
++    int i;
++    if (out == NULL)
++        return 0;
++    for (i = 0; i < count && i < RB_STAT_COUNT; ++i)
++        out[i] = rollback_stats[i];
++    return i;
++}
++
+ void savestates_init(void)
+ {
++    rollback_slots_reset();
+     savestates_lock = SDL_CreateMutex();
+     if (!savestates_lock) {
+         DebugMessage(M64MSG_ERROR, "Could not create savestates list lock");
+@@ -3120,6 +3527,12 @@
+     rollback_save_head = 0;
+     rollback_save_count = 0;
+     rollback_save_pending = 0;
++    rollback_slots_reset();
++    free(rollback_verify_shadow);
++    rollback_verify_shadow = NULL;
++    free(rollback_verify_scratch);
++    rollback_verify_scratch = NULL;
++    rollback_verify_scratch_size = 0;
+ 
+     SDL_DestroyMutex(savestates_lock);
+     savestates_clear_job();
+--- a/mupen64plus-core/src/plugin/plugin.c
++++ b/mupen64plus-core/src/plugin/plugin.c
+@@ -34,6 +34,7 @@
+ #include "device/rcp/rdp/rdp_core.h"
+ #include "device/rcp/rsp/rsp_core.h"
+ #include "device/rcp/vi/vi_controller.h"
++#include "device/rdram/rdram.h"
+ #include "dummy_audio.h"
+ #include "dummy_input.h"
+ #include "dummy_rsp.h"
+@@ -501,12 +502,34 @@
+  * this core), exactly what the null video plugin does for every list. */
+ static void znx_process_dlist(void)
+ {
+-    if (main_frame_video_enabled())
++    if (main_frame_video_enabled()) {
+         gfx.processDList();
++        rdram_plugin_call_done(RDRAM_WRITER_VIDEO);
++    }
+     else
+         *gfx_info.MI_INTR_REG |= MI_INTR_DP;
++}
++
++/* Z-Cancel NX: what the RSP plugin hands on to the other plugins, for the record of written RDRAM pages
++ * (device/rdram/rdram.h). An audio plugin that is given audio lists writes RDRAM without saying where. */
++static void znx_process_rdp_list(void)
++{
++    gfx.processRDPList();
++    rdram_plugin_call_done(RDRAM_WRITER_VIDEO);
+ }
+ 
++static void znx_show_cfb(void)
++{
++    gfx.showCFB();
++    rdram_plugin_call_done(RDRAM_WRITER_VIDEO);
++}
++
++static void znx_process_alist(void)
++{
++    audio.processAList();
++    rdram_written_all = 1;
++}
++
+ static m64p_error plugin_start_rsp(void)
+ {
+     /* fill in the RSP_INFO data structure */
+@@ -533,9 +556,9 @@
+     rsp_info.DPC_TMEM_REG = &g_dev.dp.dpc_regs[DPC_TMEM_REG];
+     rsp_info.CheckInterrupts = EmptyFunc;
+     rsp_info.ProcessDlistList = znx_process_dlist;
+-    rsp_info.ProcessAlistList = audio.processAList;
+-    rsp_info.ProcessRdpList = gfx.processRDPList;
+-    rsp_info.ShowCFB = gfx.showCFB;
++    rsp_info.ProcessAlistList = znx_process_alist;
++    rsp_info.ProcessRdpList = znx_process_rdp_list;
++    rsp_info.ShowCFB = znx_show_cfb;
+ 
+     /* call the RSP plugin  */
+     rsp.initiateRSP(rsp_info, NULL);
+@@ -551,6 +574,7 @@
+         case M64PLUGIN_GFX:
+             if (plugin_handle != NULL && (l_AudioAttached || l_InputAttached || l_RspAttached))
+                 DebugMessage(M64MSG_WARNING, "Front-end bug: plugins are attached in wrong order.");
++            rdram_writer_reports[RDRAM_WRITER_VIDEO] = 0;   /* until the new plugin says otherwise */
+             return plugin_connect_gfx(plugin_handle);
+         case M64PLUGIN_AUDIO:
+             if (plugin_handle != NULL && (l_InputAttached || l_RspAttached))
+@@ -561,6 +585,7 @@
+                 DebugMessage(M64MSG_WARNING, "Front-end bug: plugins are attached in wrong order.");
+             return plugin_connect_input(plugin_handle);
+         case M64PLUGIN_RSP:
++            rdram_writer_reports[RDRAM_WRITER_RSP] = 0;
+             return plugin_connect_rsp(plugin_handle);
+         default:
+             return M64ERR_INPUT_INVALID;

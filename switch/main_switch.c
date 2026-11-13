@@ -7,7 +7,7 @@
  * Files, all under sdmc:/switch/z-cancel-nx/:
  *   rom.z64      the ROM (or pass a path as the NRO's first argument)
  *   bench.ini    optional: frames=7200  hash_every=600  rollback_test=5400,5460
- *                rollback_stress=K,D  inputs=<file>  cpu_mhz=1785 (0 leaves the clock alone)  verbose=1
+ *                rollback_stress=K,D  rollback_verify=1  inputs=<file>  cpu_mhz=1785 (0 leaves the clock alone)  verbose=1
  *   bench.log    every line of output, flushed line by line
  *
  * Lines also go to a PC running nxlink (-s) when the NRO was sent with it, and to the
@@ -60,6 +60,7 @@ static bool ini_key(const char* key, const char* value, void* user)
         int k, d;
         if (sscanf(value, "%d ,%d", &k, &d) == 2 && k > d && d > 0) { s->options.stress_every = k; s->options.stress_depth = d; s->options.rb_a = s->options.rb_b = -1; }
     }
+    else if (!strcmp(key, "rollback_verify")) s->options.rollback_verify = atoi(value) != 0;   /* slow: checks every rollback state */
     else if (!strcmp(key, "verbose")) s->options.verbose = atoi(value);
     else if (!strcmp(key, "precompile_ms")) s->options.precompile_ms = atoi(value);   /* 0: only record the warm list */
     else if (!strcmp(key, "precompile_big")) s->options.precompile_big = atoi(value) != 0;

@@ -106,6 +106,7 @@ static bool ini_key(const char* key, const char* value, void* user)
         int k, d;
         if (sscanf(value, "%d ,%d", &k, &d) == 2 && k > d && d > 0) { s->options.stress_every = k; s->options.stress_depth = d; s->options.rb_a = s->options.rb_b = -1; }
     }
+    else if (!strcmp(key, "rollback_verify")) s->options.rollback_verify = atoi(value) != 0;   /* slow: checks every rollback state */
     else if (!strcmp(key, "matrix")) snprintf(s->matrix, sizeof(s->matrix), "%s", value);
     else if (!strcmp(key, "net_overlay")) s->net_overlay = atoi(value) != 0;
     else if (!strcmp(key, "net_vsync")) s->net_vsync = atoi(value) != 0;
@@ -572,6 +573,7 @@ static int play(const char* rom_path, bool have_romfs, bool online)
     host.frame_work_ns = znx_game_last_frame_work_ns; /* compiling ahead fits itself around the frame's work */
     host.vidext = znx_vidext_functions();
     host.video_config = znx_game_video_config;
+    host.video_rdram_free = znx_game_video_rdram_free;
     host.frame_done = frame_done;
     host.audio = settings.sound ? znx_static_lib("audio") : NULL;
     l_quitting = false;

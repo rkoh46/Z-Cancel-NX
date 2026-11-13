@@ -792,3 +792,21 @@ Not closed:
   the drawing out of those frames; it passes the rollback stress test on the Mac and has not run on a
   console yet (rollback_stress=K,D in the ini does it with the picture on). The console's Wi-Fi link
   itself spiked to 119 ms with the app idle, and the session held 12 to 27 s of a 150 s match for it.
+
+### Rollback on the console after patches 0014-0015, 2026-11-13
+
+`rollback_stress=10,7` now does what RMG-K's session does (a save after every frame and every re-run
+frame, into preallocated slots). Console, picture on, one stage per game, 365 rollbacks of 7 frames each,
+every re-run frame identical:
+
+| | Before (whole copies) | After (written pages only) |
+|---|---|---|
+| Save | 2.0 ms | 0.14-0.19 ms |
+| Load | 2.4 ms | 0.15-0.23 ms |
+| Re-run, per frame | 1.4-1.5 ms | 1.3-1.7 ms |
+| 7-frame rollback with its saves, average | about 27 ms (computed) | 10.3-13.0 ms (measured) |
+| Worst | | 21 ms |
+
+About 110 of 2,048 RDRAM pages are copied per save. What is left is re-simulation itself (on the Mac:
+about 65 % recompiled game code, 20 % RSP HLE audio, 8 % the recompiler's linker): a frame carrying a full
+7-frame rollback still lands at 15-18 ms; rollbacks of up to 5 frames fit.
