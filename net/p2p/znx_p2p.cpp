@@ -135,6 +135,14 @@ std::atomic<float> g_live_ahead{0};
 std::atomic<double> g_speed{1.0};
 int g_depth = 0;
 
+/* a lobby match (znx_p2p_run_lobby_session): no n02; the lobby's control callback reports drops */
+std::atomic<bool> g_lobby_mode{false};
+znx_p2p_lobby_match g_lobby{};
+std::atomic<bool> g_lobby_finish{false};
+std::atomic<bool> g_lobby_server{true};
+std::atomic<unsigned> g_lobby_left{0};   /* bit s: seat s left the match */
+std::string g_lobby_left_name;           /* g_mutex */
+
 void note(const char* format, ...)
 {
     char line[600];
@@ -144,6 +152,8 @@ void note(const char* format, ...)
     va_end(args);
     if (g_cfg.log != nullptr)
         g_cfg.log(line, g_cfg.user);
+    else if (g_lobby_mode.load() && g_lobby.log != nullptr)
+        g_lobby.log(line, g_lobby.user);
 }
 
 void set_phase(int phase, const std::string& message)
@@ -747,7 +757,13 @@ void session_control_loop(std::atomic<bool>& running)
     Clock::time_point last_progress = Clock::now();
     bool seen_connected = false;
     int lost_count = 0;
+    const bool lobby = g_lobby_mode.load();
+    unsigned remote_seats = 0;
+    for (int i = 0; lobby && i < g_lobby.num_remotes; ++i)
+        remote_seats |= 1u << g_lobby.remote_slot[i];
     while (running.load()) {
+        if (lobby && g_lobby.control != nullptr)
+            g_lobby.control(g_lobby.user);   /* the lobby's WebSocket, ICE signalling, MATCH_PEER_LEFT */
         const auto now = Clock::now();
         const int visible = g_visible.load();
         if (visible != last_visible) {
@@ -756,10 +772,31 @@ void session_control_loop(std::atomic<bool>& running)
         }
         int end = ZNX_P2P_END_NONE;
         std::string text;
-        if (g_peer_left.load()) {
+        if (lobby) {
+            /* RollbackLobbyDialog::onMatchWatchTick: close the game when every other player is gone, or
+             * when the lobby is lost and the game stands still (10 s). No late join here, so the host
+             * closes too. */
+            const unsigned left = g_lobby_left.load();
+            const bool everyone_left = remote_seats != 0 && (left & remote_seats) == remote_seats;
+            if (everyone_left && g_lobby_finish.load()) {
+                /* over for us (MATCH_FINISHED sent) and for everyone else: nothing more to wait for */
+                end = ZNX_P2P_END_LOCAL;
+                text = "The match is over.";
+            } else if (g_hooks != nullptr && g_hooks->stop_on_peer_drop && everyone_left) {
+                end = ZNX_P2P_END_PEER_DROP;
+                std::lock_guard<std::recursive_mutex> lock(g_mutex);
+                text = g_lobby.num_remotes == 1 && !g_lobby_left_name.empty()
+                    ? g_lobby_left_name + " left the match." : "Every other player left the match.";
+            } else if (!g_lobby_server.load() && now - last_progress > std::chrono::seconds(10)) {
+                end = ZNX_P2P_END_TIMEOUT;
+                text = "The connection to the lobby was lost and the game stopped moving.";
+            }
+        }
+        if (end != ZNX_P2P_END_NONE) {
+        } else if (!lobby && g_peer_left.load()) {
             end = ZNX_P2P_END_PEER_LEFT;
             text = "The other player left.";
-        } else if (g_peer_dropped.load() && (g_hooks == nullptr || g_hooks->stop_on_peer_drop)) {
+        } else if (!lobby && g_peer_dropped.load() && (g_hooks == nullptr || g_hooks->stop_on_peer_drop)) {
             end = ZNX_P2P_END_PEER_DROP;
             text = "The other player ended the match.";
         } else if (now - last_progress > std::chrono::seconds(20)) {
@@ -770,13 +807,18 @@ void session_control_loop(std::atomic<bool>& running)
             RollbackLagStats lag;
             rmgk_gekko::lag_stats(lag);
             if (lag.valid && !lag.peers.empty()) {
-                if (lag.peers[0].connected) {
+                bool any_connected = false;
+                for (const RollbackLagPeer& peer : lag.peers)
+                    any_connected = any_connected || peer.connected;
+                if (any_connected) {
                     seen_connected = true;
                     lost_count = 0;
-                } else if (seen_connected && ++lost_count > 25) {
-                    /* GekkoNet gives up on a peer after 5 s of silence; its inputs would be zeros from then on */
+                } else if (seen_connected && ++lost_count > (lobby ? 50 : 25)) {
+                    /* GekkoNet gives up on a peer after 5 s of silence (30 s in a lobby match); its inputs
+                     * would be zeros from then on */
                     end = ZNX_P2P_END_TIMEOUT;
-                    text = "The connection to the other player was lost.";
+                    text = lobby ? "The connection to the other players was lost."
+                                 : "The connection to the other player was lost.";
                 }
             }
         }
@@ -786,11 +828,11 @@ void session_control_loop(std::atomic<bool>& running)
                 std::lock_guard<std::recursive_mutex> lock(g_mutex);
                 g_end_text = text;
             }
-            note("p2p: %s", text.c_str());
+            note("%s: %s", lobby ? "lobby" : "p2p", text.c_str());
             rmgk_gekko::request_stop();
             return;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(lobby ? 10 : 20));
     }
 }
 
@@ -1248,14 +1290,17 @@ void znx_net_ready_line(const char* text)
         g_peer_ready = true;
 }
 
-extern "C" int znx_p2p_run_session(void* core, const struct znx_p2p_session_hooks* hooks)
+namespace
 {
-    const int player = g_game_player.load();
-    int delay, prediction;
+/* What both kinds of match share: the counters, the hooks, rmgk_gekko::execute() with the control
+ * thread beside it, and the summary. start() starts GekkoNet's session (start_p2p_session or
+ * start_lobby_session) and returns false with the reason in *why. */
+template <typename Start>
+int run_rmgk_session(void* core, const struct znx_p2p_session_hooks* hooks, int delay, Start start,
+                     RollbackLagStats& lag)
+{
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        delay = effective_delay_locked();
-        prediction = effective_prediction_locked();
         g_end_text.clear();
     }
     g_end = ZNX_P2P_END_NONE;
@@ -1273,30 +1318,21 @@ extern "C" int znx_p2p_run_session(void* core, const struct znx_p2p_session_hook
     } else {
         g_hooks = nullptr;
     }
-    auto error_end = [&](const char* text) {
-        note("p2p: %s", text);
+    auto error_end = [&](const std::string& text) {
+        note("%s: %s", g_lobby_mode.load() ? "lobby" : "p2p", text.c_str());
         g_end = ZNX_P2P_END_ERROR;
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
         g_end_text = text;
         return 1;
     };
-    if (player == 0)
-        return error_end("the match was not started in the lobby");
     if (!m64p::Core.Hook(core))
-        return error_end(("cannot hook the core: " + m64p::Core.GetLastError()).c_str());
-    char peer_ip[128] = {};
-    int peer_port = 0;
-    if (!p2p_core_get_peer_endpoint(peer_ip, sizeof(peer_ip), &peer_port) || p2p_core_get_port() <= 0)
-        return error_end("the other player's address is unknown");
-    /* CoreStartEmulation, the GEKKO| branch (Emulation.cpp:1135-1170) */
-    if (!rmgk_gekko::set_deterministic(true))
-        return error_end("set_deterministic failed");
-    if (!rmgk_gekko::start_p2p_session("rmgk-gekko", 2, (int)sizeof(uint32_t), player,
-            (unsigned short)p2p_core_get_port(), peer_ip, (unsigned short)peer_port, delay, prediction))
-        return error_end("GekkoNet's session did not start");
+        return error_end("cannot hook the core: " + m64p::Core.GetLastError());
+    std::string why;
+    if (!start(why)) {
+        m64p::Core.Unhook();
+        return error_end(why);
+    }
     rmgk_gekko::set_debug_hooks(nullptr, begin_visible_hook, end_visible_hook, nullptr);
-    note("p2p: session: player %d, delay %d, prediction window %d, peer %s:%d, local port %d", player, delay,
-        prediction, peer_ip, peer_port, p2p_core_get_port());
 
     g_in_game = true;
     std::atomic<bool> control_running{true};
@@ -1306,14 +1342,59 @@ extern "C" int znx_p2p_run_session(void* core, const struct znx_p2p_session_hook
     control.join();
     g_in_game = false;
 
-    RollbackLagStats lag;
     rmgk_gekko::lag_stats(lag);
     rmgk_gekko::set_debug_hooks(nullptr, nullptr, nullptr, nullptr);
     rmgk_gekko::close_session();
     m64p::Core.Unhook();
-    note("p2p: session over after %d frames: rollbacks %d (%d frames re-run, deepest %d), waited for input %.1f ms, "
-         "ping %d ms", g_visible.load(), lag.match.rollbacks, lag.match.rollbackFrames, lag.match.maxRollbackFrames,
-        lag.match.waitUs / 1000.0, lag.peers.empty() ? -1 : lag.peers[0].pingMs);
+    note("%s: session over after %d frames: rollbacks %d (%d frames re-run, deepest %d), waited for input %.1f ms, "
+         "ping %d ms", g_lobby_mode.load() ? "lobby" : "p2p", g_visible.load(), lag.match.rollbacks,
+         lag.match.rollbackFrames, lag.match.maxRollbackFrames, lag.match.waitUs / 1000.0,
+         lag.peers.empty() ? -1 : lag.peers[0].pingMs);
+    return ok ? 0 : 2;
+}
+} // namespace
+
+extern "C" int znx_p2p_run_session(void* core, const struct znx_p2p_session_hooks* hooks)
+{
+    const int player = g_game_player.load();
+    int delay, prediction;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        delay = effective_delay_locked();
+        prediction = effective_prediction_locked();
+    }
+    g_lobby_mode = false;
+    RollbackLagStats lag;
+    const int result = run_rmgk_session(core, hooks, delay, [&](std::string& why) {
+        if (player == 0) {
+            why = "the match was not started in the lobby";
+            return false;
+        }
+        char peer_ip[128] = {};
+        int peer_port = 0;
+        if (!p2p_core_get_peer_endpoint(peer_ip, sizeof(peer_ip), &peer_port) || p2p_core_get_port() <= 0) {
+            why = "the other player's address is unknown";
+            return false;
+        }
+        /* CoreStartEmulation, the GEKKO| branch (Emulation.cpp:1135-1170) */
+        if (!rmgk_gekko::set_deterministic(true)) {
+            why = "set_deterministic failed";
+            return false;
+        }
+        if (!rmgk_gekko::start_p2p_session("rmgk-gekko", 2, (int)sizeof(uint32_t), player,
+                (unsigned short)p2p_core_get_port(), peer_ip, (unsigned short)peer_port, delay, prediction)) {
+            why = "GekkoNet's session did not start";
+            return false;
+        }
+        note("p2p: session: player %d, delay %d, prediction window %d, peer %s:%d, local port %d", player, delay,
+            prediction, peer_ip, peer_port, p2p_core_get_port());
+        return true;
+    }, lag);
+    if (result == 1) {
+        g_game_player = 0;
+        g_hooks = nullptr;
+        return 1;
+    }
 
     int end = g_end.load();
     if (end == ZNX_P2P_END_NONE) {
@@ -1342,8 +1423,108 @@ extern "C" int znx_p2p_run_session(void* core, const struct znx_p2p_session_hook
     }
     g_game_player = 0;
     g_hooks = nullptr;
-    return ok || end != ZNX_P2P_END_ERROR ? 0 : 1;
+    return result == 0 || end != ZNX_P2P_END_ERROR ? 0 : 1;
 }
+
+extern "C" int znx_p2p_lobby_total_seats(const struct znx_p2p_lobby_match* m)
+{
+    /* Emulation.cpp:1188-1202: the highest occupied seat, or the seats a late-join match emulates */
+    int total = std::max(m->local_slot, m->seats);
+    for (int i = 0; i < m->num_remotes && i < 3; ++i)
+        total = std::max(total, m->remote_slot[i]);
+    return total;
+}
+
+extern "C" int znx_p2p_lobby_address(const struct znx_p2p_lobby_match* m, char* out, size_t out_size)
+{
+    /* EmulationThread::SetLobbyNetplay with RollbackLobbyDialog's "<slot>,ice,<userId>" peers and the
+     * "seats=N" option (RollbackLobbyDialog.cpp:5920-5943) */
+    std::string a = "LOBBY|" + std::to_string(m->delay) + "|" + std::to_string(m->prediction);
+    for (int i = 0; i < m->num_remotes && i < 3; ++i)
+        a += "|" + std::to_string(m->remote_slot[i]) + ",ice," + std::to_string((unsigned long long)m->remote_user[i]);
+    if (m->seats > 0)
+        a += "|seats=" + std::to_string(m->seats);
+    std::snprintf(out, out_size, "%s", a.c_str());
+    return (int)a.size();
+}
+
+extern "C" int znx_p2p_run_lobby_session(void* core, const struct znx_p2p_session_hooks* hooks,
+                                         const struct znx_p2p_lobby_match* match)
+{
+    g_lobby = *match;
+    g_lobby_mode = true;
+    g_lobby_finish = false;
+    g_lobby_server = true;
+    g_lobby_left = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        g_lobby_left_name.clear();
+    }
+    char address[256];
+    znx_p2p_lobby_address(match, address, sizeof(address));
+    const int players = znx_p2p_lobby_total_seats(match);
+    RollbackLagStats lag;
+    const int result = run_rmgk_session(core, hooks, match->delay, [&](std::string& why) {
+        /* CoreStartEmulation, the LOBBY| branch (Emulation.cpp:1168-1215) */
+        std::vector<LobbyRemotePeer> remotes;
+        for (int i = 0; i < match->num_remotes && i < 3; ++i) {
+            LobbyRemotePeer peer;
+            peer.slot = match->remote_slot[i];
+            peer.userId = match->remote_user[i];
+            remotes.push_back(peer);
+        }
+        if (match->delay < 0 || match->prediction < 1 || (remotes.empty() && match->seats == 0)) {
+            why = "invalid lobby session parameters";
+            return false;
+        }
+        if (!rmgk_gekko::set_deterministic(true)) {
+            why = "set_deterministic failed";
+            return false;
+        }
+        note("lobby: session %s: slot %d of %d seats", address, match->local_slot, players);
+        if (!rmgk_gekko::start_lobby_session("rmgk-gekko", players, (int)sizeof(uint32_t), match->local_slot, 0,
+                remotes.data(), (int)remotes.size(), match->delay, match->prediction)) {
+            why = "GekkoNet's session did not start (a player's ICE path closed before the game started?)";
+            return false;
+        }
+        return true;
+    }, lag);
+    int end = g_end.load();
+    if (result != 1 && end == ZNX_P2P_END_NONE) {
+        end = ZNX_P2P_END_LOCAL;   /* stopped from outside (the program is closing) */
+        g_end = end;
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (g_end_text.empty())
+            g_end_text = "You left the match.";
+    }
+    g_hooks = nullptr;
+    return result == 1 ? 1 : 0;
+}
+
+extern "C" void znx_p2p_lobby_peer_left(int slot, const char* name)
+{
+    if (!g_lobby_mode.load() || slot < 1 || slot > 4)
+        return;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        g_lobby_left_name = name != nullptr ? name : "";
+    }
+    g_lobby_left.fetch_or(1u << slot);
+    g_peer_dropped = true;
+    note("lobby: the player in seat %d (%s) left the match", slot, name != nullptr ? name : "?");
+    if (g_hooks != nullptr && g_hooks->stop_on_peer_drop)
+        rmgk_gekko::request_disconnect_player(slot);   /* RollbackLobbyDialog::onMatchPeerLeft */
+}
+
+extern "C" void znx_p2p_lobby_server_up(int up)
+{
+    const bool was = g_lobby_server.exchange(up != 0);
+    if (was != (up != 0))
+        note("lobby: %s", up ? "the lobby server is back" : "lost the lobby server; the match plays on");
+}
+
+extern "C" int znx_p2p_lobby_finish_requested(void) { return g_lobby_finish.load() ? 1 : 0; }
+extern "C" int znx_p2p_lobby_mode(void) { return g_lobby_mode.load() ? 1 : 0; }
 
 extern "C" void znx_p2p_leave_game(void)
 {
@@ -1353,13 +1534,16 @@ extern "C" void znx_p2p_leave_game(void)
             std::lock_guard<std::recursive_mutex> lock(g_mutex);
             g_end_text = "You left the match.";
         }
-        if (!g_peer_left.load() && !g_peer_dropped.load()) {
+        if (g_lobby_mode.load()) {
+            /* RollbackLobbyDialog::notifyEmulationFinished -> MATCH_FINISHED, sent by the control callback */
+            g_lobby_finish = true;
+        } else if (!g_peer_left.load() && !g_peer_dropped.load()) {
             /* KailleraP2PDialog::onDrop -> p2p_drop_game: n02 DROP */
             g_local_drop = true;
             p2p_drop_game();
             g_local_drop = false;
         }
-        note("p2p: leaving the match (n02 DROP)");
+        note(g_lobby_mode.load() ? "lobby: leaving the match (MATCH_FINISHED)" : "p2p: leaving the match (n02 DROP)");
     }
     rmgk_gekko::request_stop();
 }
@@ -1368,6 +1552,15 @@ extern "C" void znx_p2p_send_drop(void)
 {
     int expected = ZNX_P2P_END_NONE;
     g_end.compare_exchange_strong(expected, ZNX_P2P_END_LOCAL);
+    if (g_lobby_mode.load()) {
+        {
+            std::lock_guard<std::recursive_mutex> lock(g_mutex);
+            if (g_end_text.empty())
+                g_end_text = "The match is over.";
+        }
+        g_lobby_finish = true;
+        return;
+    }
     g_local_drop = true;
     p2p_drop_game();
     g_local_drop = false;

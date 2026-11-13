@@ -76,6 +76,10 @@ struct znx_host {
      * callbacks) and returns 0 on success. The bench's own frame callbacks, hash/check lines
      * and summary are then not used. */
     int (*session_run)(void);
+    /* With session_run: called once the ROM is open and the plugins are attached, in place of the blank
+     * save data, to put the match's cheats and save data into the core (a lobby match's pre-match
+     * manifest, net/lobby_play.h). Non-zero stops the run. NULL: blank saves, no cheats. */
+    int (*session_prepare)(void* core);
 };
 
 /* The core's configuration, for znx_host.video_config. Each returns 0 on success. */

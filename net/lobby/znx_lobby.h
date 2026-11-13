@@ -162,17 +162,21 @@ typedef struct znx_lobby_match_info {
 } znx_lobby_match_info;
 
 znx_lobby* znx_lobby_create(const znx_lobby_config* config);
+/* libjuice's own log lines (process-wide) to fn, INFO and up with verbose (WARN otherwise); NULL: stderr. */
+void znx_lobby_set_ice_log(void (*fn)(const char* line), int verbose);
 void znx_lobby_destroy(znx_lobby* lobby);
 
-/* rom_md5: the MD5 RMG-K reports for the game (hex, compared case-insensitively). It is sent in
- * HELLO.romHashes (RMG-K 0.9.16 itself sends an empty list there, RollbackLobbyDialog.cpp:2619)
- * and used as the default ROM of rooms created with znx_lobby_create_room. NULL client_version
+/* rom_md5: the MD5 RMG-K reports for the game (hex, compared case-insensitively). It is
+ * used as the default ROM of rooms created with znx_lobby_create_room (HELLO.romHashes is left empty,
+ * as RMG-K 0.9.16 sends it, RollbackLobbyDialog.cpp:2619). NULL client_version
  * sends ZNX_LOBBY_CLIENT_VERSION. Returns 0 on success (then wait for CONNECTED). */
 int znx_lobby_connect(znx_lobby* lobby, const char* server_url, const char* username,
                       const char* rom_md5, const char* client_version);
 void znx_lobby_disconnect(znx_lobby* lobby);
 int znx_lobby_connected(const znx_lobby* lobby);
 uint64_t znx_lobby_self_id(const znx_lobby* lobby);
+/* The region HELLO_OK placed this client in ("us-east", ...), "" before. Valid until the next poll. */
+const char* znx_lobby_self_region(const znx_lobby* lobby);
 
 /* Returns 1 and fills *ev while there are events, 0 when there are none for now. Call it often
  * (every frame of the UI, every few ms in a match: ICE signalling and pings ride on it). */
@@ -235,6 +239,11 @@ void znx_lobby_gekko_adapter_release(znx_lobby* lobby);
 /* For RMG-K's session driver compiled with -DNETPLAY: the LobbyIce::send / take_packets /
  * peer_connected it calls go to this lobby (lobby_ice_rmgk.cpp). NULL unbinds. */
 void znx_lobby_bind_rmgk(znx_lobby* lobby);
+/* Tests only (lobby_ice_rmgk.cpp): latency (+- jitter) and loss on every datagram the session sends
+ * through LobbyIce::send (GekkoNet's channel), like net/netsim.cpp on the n02 socket. */
+void znx_lobby_rmgk_netsim(int latency_ms, int jitter_ms, double loss_pct, unsigned seed);
+void znx_lobby_rmgk_netsim_stats(uint64_t* sent, uint64_t* dropped);
+void znx_lobby_rmgk_netsim_shutdown(void);
 
 #ifdef __cplusplus
 }

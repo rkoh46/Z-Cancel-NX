@@ -173,21 +173,56 @@ for f in core/p2p_core.cpp core/p2p_instruction.cpp stats.cpp errr.cpp; do
     queue_cxx "$N02/$f" "$OBJ/net/n02/$(basename "${f%.cpp}").o" "$N02_FLAGS"
 done
 queue_cxx "$N02/common/k_socket.cpp" "$OBJ/net/n02/k_socket.o" "$KSOCK_FLAGS"
-queue_cxx "$RMGC/rmgk_gekko.cpp" "$OBJ/net/rmgc/rmgk_gekko.o" "$RMGC_FLAGS"
+# rmgk_gekko.cpp with -DNETPLAY, as RMG-K builds it: its lobby path (start_lobby_session and the "ice:" adapter
+# over LobbyIce, which net/lobby/lobby_ice_rmgk.cpp supplies) next to the P2P one.
+queue_cxx "$RMGC/rmgk_gekko.cpp" "$OBJ/net/rmgc/rmgk_gekko.o" "$RMGC_FLAGS -DNETPLAY"
 queue_cxx "$RMGC/RollbackNetcode.cpp" "$OBJ/net/rmgc/RollbackNetcode.o" "$RBN_FLAGS"
+# RMG-Core's cheat and netplay-save code (no Qt): what a lobby match's pre-match manifest goes through
+# (net/lobby_play.cpp). NetplaySave.cpp's in-match save tracker hands its three hooks to net/rmgk_glue.cpp
+# (renamed here). Cheats.cpp formats floats with std::to_chars, which macOS has from 13.3.
+NSAVE_FLAGS="$RMGC_FLAGS -DNETPLAY -DCoreNetplaySaveTrackStateSaved=rmgk_CoreNetplaySaveTrackStateSaved -DCoreNetplaySaveTrackEndFrame=rmgk_CoreNetplaySaveTrackEndFrame -DCoreNetplaySaveTrackSessionEnd=rmgk_CoreNetplaySaveTrackSessionEnd"
+queue_cxx "$RMGC/NetplaySave.cpp" "$OBJ/net/rmgc/NetplaySave.o" "$NSAVE_FLAGS"
+queue_cxx "$RMGC/Cheats.cpp" "$OBJ/net/rmgc/Cheats.o" "${RMGC_FLAGS/-mmacosx-version-min=11.0/-mmacosx-version-min=13.3} -DNETPLAY"
 for f in Error.cpp Library.cpp m64p/Api.cpp m64p/CoreApi.cpp m64p/ConfigApi.cpp; do
     queue_cxx "$RMGC/$f" "$OBJ/net/rmgc/$(basename "${f%.cpp}").o" "$RMGC_FLAGS"
 done
-for f in net/*.cpp; do queue_cxx "$f" "$OBJ/net/glue/$(basename "${f%.cpp}").o" "$GLUE_FLAGS" net/znx_net.h; done
+for f in net/*.cpp; do queue_cxx "$f" "$OBJ/net/glue/$(basename "${f%.cpp}").o" "$GLUE_FLAGS" net/lobby_play.h; done
 # The lobby and session code the Switch program runs too (net/p2p/: the dialog's part, connect codes,
 # public list, the session).
 # (library_static.cpp and socket_switch.c are the Switch's stand-ins for dlsym and FIONBIO: not here)
 for f in net/p2p/znx_p2p.cpp net/p2p/http_list.cpp; do queue_cxx "$f" "$OBJ/net/p2p/$(basename "${f%.cpp}").o" "$GLUE_FLAGS" net/p2p/znx_p2p.h; done
+# RMG-K's rollback lobby client (net/lobby/, see docs/PLAN.md, "RMG-K lobby, in detail") with libjuice 1.7.3
+# for ICE, compiled from RMG-K's copy (ref/RMG-K/Source/3rdParty/libjuice, MPL-2.0, copied to build/src/libjuice
+# unchanged) as RMG-K builds it (NO_SERVER, no Nettle). Linked into znx-net and znx-game (the lobby path of
+# the session) and into znx-lobby-test below.
+JUICE="$SRC/libjuice"
+rsync -a --exclude .git --exclude test --exclude fuzzer "ref/RMG-K/Source/3rdParty/libjuice/" "$JUICE/"
+JUICE_FLAGS="-arch $ARCH -mmacosx-version-min=11.0 -O2 -std=gnu11 -w -DJUICE_STATIC -DUSE_NETTLE=0 -DNO_SERVER -DRELEASE=1 -I$JUICE/include -I$JUICE/include/juice -I$JUICE/src"
+LOBBY_FLAGS="-arch $ARCH -mmacosx-version-min=11.0 -O2 -std=gnu++17 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -DJUICE_STATIC -DGEKKONET_STATIC -I$JUICE/include -I$GEK/include -I$SRC/RMG-Core -Inet/lobby"
+LOBBY_LIB_OBJS=""
+for f in addr agent crc32 const_time conn conn_poll conn_thread conn_mux base64 hash hmac ice juice log random server stun timestamp tcp turn udp; do
+    o="$OBJ/lobby/juice/$f.o"
+    mkdir -p "$(dirname "$o")"
+    if [ ! -f "$o" ] || [ "$JUICE/src/$f.c" -nt "$o" ] || [ "$0" -nt "$o" ] || [ -n "${REBUILD:-}" ]; then
+        echo "echo '  CC libjuice/$f.c' && clang $JUICE_FLAGS -c $JUICE/src/$f.c -o $o" >> "$CMDS"
+    fi
+    LOBBY_LIB_OBJS="$LOBBY_LIB_OBJS $o"
+done
+for f in net/lobby/*.cpp net/lobby/test/znx-lobby-test.cpp; do
+    o="$OBJ/lobby/$(basename "${f%.cpp}").o"
+    mkdir -p "$(dirname "$o")"
+    if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ "$0" -nt "$o" ] || [ -n "${REBUILD:-}" ] || \
+       [ -n "$(find net/lobby -maxdepth 1 -name '*.h' -newer "$o" 2>/dev/null)" ]; then
+        echo "echo '  CXX $f' && clang++ $LOBBY_FLAGS -c $f -o $o" >> "$CMDS"
+    fi
+    [ "$f" = net/lobby/test/znx-lobby-test.cpp ] || LOBBY_LIB_OBJS="$LOBBY_LIB_OBJS $o"
+done
+NET_OBJS="$NET_OBJS $LOBBY_LIB_OBJS"
 tr '\n' '\0' < "$CMDS" | xargs -0 -n 1 -P "$JOBS" sh -c
 echo "  LD znx-net"
 clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -c bench/bench_core.c -I"$CORE/src/api" -o "$OBJ/net/bench_core.o"
 clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -w -c "$CORE/subprojects/md5/md5.c" -o "$OBJ/net/md5.o"
-clang++ -arch "$ARCH" -mmacosx-version-min=11.0 -o "$OUT/znx-net" $NET_OBJS "$OBJ/net/bench_core.o" "$OBJ/net/md5.o"
+clang++ -arch "$ARCH" -mmacosx-version-min=11.0 -o "$OUT/znx-net" $NET_OBJS "$OBJ/net/bench_core.o" "$OBJ/net/md5.o" -lz -lpthread
 echo "  LD znx-input-net.dylib"
 clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -fvisibility=hidden -dynamiclib -I"$CORE/src/api" \
     net/input-net.c -o "$OUT/znx-input-net.dylib"
@@ -249,36 +284,12 @@ if [ "${2:-}" = game ]; then
     echo "built $OUT/znx-game"
 fi
 
-# znx-lobby-test: RMG-K's rollback lobby client (net/lobby/, see docs/PLAN.md, "RMG-K lobby, in
-# detail") with libjuice 1.7.3 for ICE, compiled from RMG-K's copy (ref/RMG-K/Source/3rdParty/
-# libjuice, MPL-2.0, copied to build/src/libjuice unchanged) as RMG-K builds it (NO_SERVER, no
-# Nettle), and GekkoNet from the znx-net objects above. The test runs two clients against the
-# local mock server (net/lobby/test/mock_lobby.py) on 127.0.0.1:
+# znx-lobby-test: the lobby client library alone (objects above) and GekkoNet from the znx-net objects. The
+# test runs two clients against the local mock server (net/lobby/test/mock_lobby.py) on 127.0.0.1:
 #   build/mac-<arch>/znx-lobby-test --mock net/lobby/test/mock_lobby.py
-JUICE="$SRC/libjuice"
-rsync -a --exclude .git --exclude test --exclude fuzzer "ref/RMG-K/Source/3rdParty/libjuice/" "$JUICE/"
-JUICE_FLAGS="-arch $ARCH -mmacosx-version-min=11.0 -O2 -std=gnu11 -w -DJUICE_STATIC -DUSE_NETTLE=0 -DNO_SERVER -DRELEASE=1 -I$JUICE/include -I$JUICE/include/juice -I$JUICE/src"
-LOBBY_FLAGS="-arch $ARCH -mmacosx-version-min=11.0 -O2 -std=gnu++17 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -DJUICE_STATIC -DGEKKONET_STATIC -I$JUICE/include -I$GEK/include -I$SRC/RMG-Core -Inet/lobby"
-: > "$CMDS"
-LOBBY_OBJS=""
-for f in addr agent crc32 const_time conn conn_poll conn_thread conn_mux base64 hash hmac ice juice log random server stun timestamp tcp turn udp; do
-    o="$OBJ/lobby/juice/$f.o"
-    mkdir -p "$(dirname "$o")"
-    if [ ! -f "$o" ] || [ "$JUICE/src/$f.c" -nt "$o" ] || [ "$0" -nt "$o" ] || [ -n "${REBUILD:-}" ]; then
-        echo "echo '  CC libjuice/$f.c' && clang $JUICE_FLAGS -c $JUICE/src/$f.c -o $o" >> "$CMDS"
-    fi
-    LOBBY_OBJS="$LOBBY_OBJS $o"
-done
-for f in net/lobby/*.cpp net/lobby/test/znx-lobby-test.cpp; do
-    o="$OBJ/lobby/$(basename "${f%.cpp}").o"
-    mkdir -p "$(dirname "$o")"
-    if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ "$0" -nt "$o" ] || [ -n "${REBUILD:-}" ] || \
-       [ -n "$(find net/lobby -maxdepth 1 -name '*.h' -newer "$o" 2>/dev/null)" ]; then
-        echo "echo '  CXX $f' && clang++ $LOBBY_FLAGS -c $f -o $o" >> "$CMDS"
-    fi
-    LOBBY_OBJS="$LOBBY_OBJS $o"
-done
-tr '\n' '\0' < "$CMDS" | xargs -0 -n 1 -P "$JOBS" sh -c
 echo "  LD znx-lobby-test"
-clang++ -arch "$ARCH" -mmacosx-version-min=11.0 -o "$OUT/znx-lobby-test" $LOBBY_OBJS "$OBJ"/net/gekko/*.o -lpthread
+LOBBY_TEST_OBJS=""
+for o in $LOBBY_LIB_OBJS; do [ "$o" = "$OBJ/lobby/lobby_ice_rmgk.o" ] || LOBBY_TEST_OBJS="$LOBBY_TEST_OBJS $o"; done
+clang++ -arch "$ARCH" -mmacosx-version-min=11.0 -o "$OUT/znx-lobby-test" $LOBBY_TEST_OBJS "$OBJ/lobby/znx-lobby-test.o" \
+    "$OBJ"/net/gekko/*.o -lpthread
 echo "built $OUT/znx-lobby-test"

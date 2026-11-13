@@ -13,7 +13,12 @@
  *                                         as RMG-K keeps it (Kaillera P2PStaticCode / ...OwnerToken)
  *   nat_server=host:port, list_server=host:port   only for tests against a local stand-in; empty = RMG-K's
  *   net_vsync=0|1                         online: 0 (default) RMG-K's timer pacer with swap interval 0;
- *                                         1 the display's vsync with a frame dropped or repeated on drift */
+ *                                         1 the display's vsync with a frame dropped or repeated on drift
+ *   lobby_server=ws://host:port/ws        the lobby (RMG-K's "Join Rollback Netplay"); empty = RMG-K v0.9.16's
+ *                                         release server ws://216.128.157.98:8080/ws
+ *   lobby_stun=off|host:port              STUN for the lobby's ICE; empty = the server's (RMG-K's behaviour)
+ *   lobby_bind=a.b.c.d                    the ICE agents' local address; empty = this console's own address
+ * The three lobby_ keys are read only: the menu never writes them (other lines of the file are kept). */
 #ifndef ZNX_SETTINGS_H
 #define ZNX_SETTINGS_H
 
@@ -34,6 +39,9 @@ struct znx_menu_settings {
     char nat_server[128];
     char list_server[128];
     int net_vsync;
+    char lobby_server[160];
+    char lobby_stun[128];
+    char lobby_bind[64];
 };
 
 /* Defaults, then whatever the file says. */

@@ -231,7 +231,8 @@ void znx_menu_online_finished(struct znx_menu* m)
     if (znx_online_after_game(title, sizeof(title), text, sizeof(text)) == ZNX_ONLINE_STAY)
         m->screen = SCREEN_ONLINE;
     else
-        show_message(m, title, text, NULL, SCREEN_GAME);
+        /* back to the lobby's room if it is still open (how a lobby match ended), else the game's screen */
+        show_message(m, title, text, NULL, znx_online_connected() ? SCREEN_ONLINE : SCREEN_GAME);
 }
 
 void znx_menu_debug_online(struct znx_menu* m, int game, const char* which)
@@ -408,6 +409,12 @@ enum znx_menu_action znx_menu_update(struct znx_menu* m, uint32_t held)
         }
         break;
     case SCREEN_MESSAGE:
+        if (m->message_return == SCREEN_ONLINE && znx_online_match_ready()) {
+            /* the lobby's host started a match while a message was up: the other players are booting */
+            m->screen = SCREEN_ONLINE;
+            snprintf(m->rom_path, sizeof(m->rom_path), "%s", m->catalog.rom_path[m->game]);
+            return ZNX_MENU_PLAY_ONLINE;
+        }
         if (pressed & (ZNX_BTN_A | ZNX_BTN_B))
             m->screen = m->message_return;
         break;

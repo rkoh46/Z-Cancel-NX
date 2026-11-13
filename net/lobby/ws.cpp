@@ -276,6 +276,10 @@ bool WsClient::readSome()
         const long n = m_stream->read(buf, sizeof(buf));
         if (n < 0)
         {
+            // Frames that arrived together with the close (a server that sends HELLO_FAIL and hangs up at
+            // once) are delivered first.
+            if ((m_state == State::Open || m_state == State::Closing) && !m_in.empty())
+                parseFrames();
             fail(m_state == State::Closing ? "closed" : "connection closed by server");
             return false;
         }

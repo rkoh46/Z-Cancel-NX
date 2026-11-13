@@ -74,6 +74,9 @@ struct IcePacket
     std::vector<char> data;     // without the channel byte
 };
 
+/* libjuice's own messages to fn ("juice warn: ..."), INFO and up when verbose; nullptr: back to stderr. */
+void ice_log_to(void (*fn)(const char*), bool verbose);
+
 class IceMesh
 {
   public:

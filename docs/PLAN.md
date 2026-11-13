@@ -935,3 +935,107 @@ With `rdram_check=1` the console logs the same final-frame `check` lines as `znx
 - Mac hosting and the console joining by IP did not connect: macOS's application firewall blocks
   incoming UDP to the unsigned `znx-net`. The console's "Could not join / Nobody answered" screen is
   what showed. Not a console problem; the firewall setting was left alone.
+
+
+## Lobby on the Switch, 2026-11-12: built and tested on the Mac, not yet run on a console
+
+The online menu's "Lobby" row now opens RMG-K's "Join Rollback Netplay" lobby (`net/lobby/`, above) with its own
+screens, and a lobby match runs through RMG-K's own session driver.
+
+### The parts
+
+- `net/lobby_play.cpp` (C API `net/lobby_play.h`): what RollbackLobbyDialog does around LobbyClient, without Qt or
+  screens, shared by the console's screens and `znx-net --lobby` (the Mac test client): connect (HELLO with
+  `clientVersion` `v0.9.16`, `romHashes` `[]` as RMG-K 0.9.16 sends it, `saveData:true`), the room list of the chosen
+  ROM only (room ROM MD5 = ours, case-insensitive; ping column = RMG-K's region estimate, `LobbyRegions.hpp`), create
+  (CreateRoomDialog's defaults: `"<name>'s Room"`, 2 seats, delay 2, prediction 7, ROM name = the GoodName, region "")
+  / join / leave, room chat, own delay (Auto or fixed, ROOM_UPDATE_DELAY), the host's Start (`znx_lobby_can_start`),
+  MATCH_BEGIN -> ICE wait -> pre-match sync -> READY, problems for the player (server unreachable, version mismatch,
+  name refused, kicked, room closed, ICE failed after 20 attempts, match not started). The lobby is polled every
+  5 ms by its own thread while open (heartbeats and ICE signalling go on while the menu shows a message or the
+  system keyboard, and during the match). Username: the `name` setting made into RMG-K's 2-20 `[A-Za-z0-9_.-]`.
+- The match: `znx_p2p_run_lobby_session` (`net/p2p/znx_p2p.cpp`) shares everything with the P2P session (hooks,
+  statistics, overlay numbers, the quit hold through `znx_p2p_leave_game`, `rdram_check` checkpoints, pacing) and
+  starts GekkoNet the way CoreStartEmulation's `LOBBY|` branch does: `set_deterministic(true)`,
+  `start_lobby_session("rmgk-gekko", players = max(local seat, seats, remote seats), 4, seat, 0, remotes
+  {slot, userId}, delay, prediction)`; the address RMG-K would build is logged (`LOBBY|2|7|1,ice,1`). `rmgk_gekko.cpp`
+  is now compiled with `-DNETPLAY` everywhere (Mac and console; the P2P path is unchanged by it, RMG-K always builds
+  it so), and `net/lobby/lobby_ice_rmgk.cpp` supplies its three `LobbyIce` functions. Ends: the other players gone
+  (MATCH_PEER_LEFT -> `request_disconnect_player`, then the game closes when no one is left: RMG-K's
+  onMatchWatchTick, also for the host since there is no late join), lobby lost and no frame for 10 s, no frame for
+  20 s, GekkoNet's 30 s silence, the local quit (MATCH_FINISHED). MATCH_CONNECTED once the first frame ran.
+  The console's controller is port 1 of the console whatever seat it plays (`submit_local_input` samples
+  controller 1).
+- The pre-match manifest is applied before frame 0 with RMG-Core's own code, compiled unchanged: `Cheats.cpp`
+  (CoreDeserializeNetplayCheats, CoreSetNetplayCheats, CoreApplyNetplayCheats) and `NetplaySave.cpp`
+  (qUncompress with zlib, CoreDeserializeNetplaySaveData, CoreApplyNetplaySaveData(true)), through a new
+  `znx_host.session_prepare` hook in `bench_core.c` that replaces the blank saves. NetplaySave's three in-match
+  tracker hooks are renamed at compile time so `rmgk_glue.cpp` keeps them; the RMG-Core functions those files reach
+  but a match never calls (cheat files, ROM cache, settings) are stubs in `rmgk_glue.cpp`. Netplay cheats are
+  cleared after the match.
+- Settings (read only, `menu/settings.h`): `lobby_server=ws://host:port/ws` (default `ws://216.128.157.98:8080/ws`),
+  `lobby_stun=off|host:port` (default: the server's, as RMG-K), `lobby_bind=` (default: the console's own address).
+- Switch specifics: libjuice compiled unchanged with `NO_IFADDRS`, an empty `<ifaddrs.h>`, `__LITTLE_ENDIAN__`
+  (picohash wants `<endian.h>`), and `conn_poll.c` with `-Dpipe=znx_juice_pipe` (`switch/juice_switch.c`: libnx has
+  no pipe, so the poll thread's wake-up is a connected pair of loopback UDP sockets, or on the console's address if
+  loopback cannot be bound). The agents are bound to the console's address (the UDP-connect trick of the host
+  screen), which makes it the host candidate. `socketInitialize` with 8 BSD sessions (libjuice's poll thread
+  blocks inside poll) and doubled UDP buffers. libjuice's own log goes to latest.log (`juice info: ...`).
+  The Linux self-test stays peer to peer (its GCC 12 lacks `<format>` for Cheats.cpp; `switch/selftest/lobby_none.cpp`).
+- `ws.cpp` fix: frames that arrive together with the server's close (HELLO_FAIL then hang-up) are now delivered
+  before the close (before, a version mismatch showed as "server did not answer").
+- Mock server (`net/lobby/test/mock_lobby.py`): `--host 0.0.0.0`, `--stun host:port|none`, `--min-version`,
+  `--kick-after S`, and MATCH_FINISHED per player (the others get MATCH_PEER_LEFT "finished", the room is back to
+  waiting when all finished; the real server's behaviour here is unknown, the client handles both).
+
+### Screens (`menu/lobby_entry.c`, previews in `build/menu-preview/lobby/`)
+
+Connecting (server URL, name, "Speaks as RMG-K v0.9.16"), Rooms (first row opens a room: name through the system
+keyboard, 2-4 seats with left/right; rooms of this ROM with host, players, state and ping estimate; a note counts the
+hidden rooms of other games), Room (seats with ICE state and attempt, ping, published delay, host/you; the room chat's
+last lines; Y writes through the keyboard; left/right change our delay, saved as `input_delay`; A starts for the host
+when RMG-K's rule allows), Starting (direct connections with a countdown, pre-match sync, start). Errors are message
+screens. `real-*.png` come from the real code against the mock server and a `znx-net --lobby` peer; `debug-*.png` from
+`znx-game --menu-online 0,room:<which>`.
+
+### Tests (Mac only; nothing left 127.0.0.1)
+
+- `tools/lobby-match-test.sh ROM 17000 --sim-latency 60 --sim-jitter 20 --sim-loss 2`: mock server + two znx-net
+  through `lobby_play.cpp`, ICE on 127.0.0.1 without STUN/TURN, a real emulator match through `start_lobby_session`
+  (delay 2, window 7; latency, jitter and loss added where the session hands datagrams to the mesh,
+  `znx_lobby_rmgk_netsim`): 284 of 284 check lines identical on both sides and equal to `znx-bench --input-players 2`,
+  final `check 17000 2c0196363c2d2922 976c1aa7e40df3c7` (the P2P reference); 59.82 fps over 284 s; rollbacks
+  1,530 / 1,550, deepest 4 / 5; 1,218 / 1,292 of ~61,500 GekkoNet datagrams dropped.
+- The same with `--manifest-cheat 90 --manifest-save` (a 663-byte manifest: one cheat writing 0x5A at 0x80700000 and a
+  32 KB SRAM save): both sides log "1 cheat, save ... SRAM 32768", 30 of 30 check lines identical, and different from
+  the blank reference from frame 120 on, so cheats and saves reach the core before the game reads them.
+- `znx-lobby-test` (library alone) still passes; `znx-bench` still gives `hash 3600 1499ebb25c8606c4`;
+  `builder/build-switch.sh all` links `z-cancel-nx.nro` with no unresolved symbols.
+
+### Console against the Mac (to run)
+
+The Mac's firewall blocks incoming connections to unsigned programs, so the mock server runs under Apple's own
+`/usr/bin/python3` (signed: allowed in), and the Mac's ICE agent sends its connectivity checks out first or at the same
+time as the console's; ICE retransmits checks, so once the Mac's outbound checks have passed its firewall the
+console's get answered (the same reason the P2P LAN test worked with the Mac joining).
+
+    /usr/bin/python3 -I net/lobby/test/mock_lobby.py --host 0.0.0.0 --port 18080
+    # console z-cancel-nx.ini:  lobby_server=ws://<Mac LAN IP>:18080/ws   lobby_stun=off   rdram_check=1
+    # console: Online play -> Lobby -> Open a room
+    build/mac-arm64/znx-net --rom ROM --lobby ws://127.0.0.1:18080/ws --join-room --bind-any --ice-bind <Mac LAN IP> \
+        --inputs bench/inputs/ssb-usa-vs-mash.txt --frames 9000 --check-every 600 --check-skip 0x80040500 0x80040E00
+
+Untested against the real server: everything the server decides (field names as inferred from the client, the order
+of ROOM_STATE / MATCH_BEGIN, what it does on MATCH_FINISHED from one player, rate limits, whether it accepts
+`lateJoin:false`), STUN/TURN through the server's configuration, a real RMG-K client on the other end (libjuice
+interop, the manifest from RMG-K's serializer, a 3-4 player room), and everything on the console.
+
+### Lobby checked on the console, 2026-11-12
+
+Console (Wi-Fi) against the Mac over the LAN, with `net/lobby/test/mock_lobby.py` on the Mac standing in
+for the lobby server (`lobby_server=ws://<mac>:18080/ws`, `lobby_stun=off`, `rdram_check=1`): the console
+connected, opened a room (name from the on-screen keyboard), the Mac's `znx-net --lobby ... --join-room`
+joined, libjuice connected the two directly (18 ms), the console started the match. 9,000 frames, the
+console 55 rollbacks (deepest 7), the Mac 59 (deepest 5): all 15 check lines identical. The WebSocket
+client, libjuice (its wake-up pipe is a loopback UDP pair on Horizon) and the pre-match manifest all work
+on libnx. The real RMG-K lobby server and a real RMG-K peer are untested.

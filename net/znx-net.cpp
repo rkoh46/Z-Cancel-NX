@@ -5,6 +5,11 @@
  *   znx-net --rom ROM --host PORT              --inputs FILE --player 1
  *   znx-net --rom ROM --join IP:PORT|CODE      --inputs FILE --player 2
  *   znx-net --fetch-list HOST:PORT             (prints the public list, then exits)
+ *   znx-net --rom ROM --lobby ws://H:P/ws --create-room NAME [--start-players N] --inputs FILE --player 1
+ *   znx-net --rom ROM --lobby ws://H:P/ws --join-room [NAME]                    --inputs FILE --player 2
+ *       RMG-K's rollback lobby instead of P2P: net/lobby_play.cpp (the code behind the Switch's lobby
+ *       screens) connects, opens or joins a room of this ROM, the host starts once everyone is connected,
+ *       and the match runs through RMG-K's start_lobby_session over the room's ICE mesh (libjuice).
  *
  * Everything that is on the wire is RMG-K's own code, compiled unchanged from ref/RMG-K (see
  * docs/PLAN.md, "RMG-K P2P rollback, in detail"):
@@ -68,6 +73,7 @@ extern "C" {
 #include "m64p/Api.hpp"
 #include "rmgk_gekko.hpp"
 
+#include "lobby_play.h"
 #include "p2p/znx_p2p.h"
 #include "znx_net.h"
 
@@ -103,6 +109,17 @@ struct Options {
     int lobby_timeout_s = 60;
     const char* code_file = nullptr;   /* host: keeps the connect code and token between runs */
     int ready_after_s = 0;        /* press Ready this long after the peer arrived (lets the automatic delay settle) */
+    /* --lobby: RMG-K's rollback lobby (net/lobby_play.h) */
+    std::string lobby;            /* ws://host:port/ws */
+    std::string create_room;      /* host: open a room with this name */
+    bool join_room = false;       /* join a room of this ROM (the first one, or the one named) */
+    std::string join_room_name;
+    int max_players = 2;
+    int start_players = 2;        /* host: start when this many are seated and RMG-K's rule allows it */
+    std::string ice_bind;         /* the ICE agents' address; default 127.0.0.1 (every interface with --bind-any) */
+    std::string stun = "off";     /* "off" (default: nothing leaves the machine), "server", or host:port */
+    int manifest_cheat = -1;      /* host: a test cheat writing this byte at 0x80700000 */
+    bool manifest_save = false;   /* host: a test SRAM save in the manifest */
 };
 
 Options g_opt;
@@ -181,7 +198,8 @@ void note(const char* format, ...)
     va_start(args, format);
     std::vsnprintf(line, sizeof(line), format, args);
     va_end(args);
-    std::fprintf(stderr, "znx-net[%s]: %s\n", g_opt.host ? "host" : "join", line);
+    std::fprintf(stderr, "znx-net[%s]: %s\n", g_opt.lobby.empty() ? (g_opt.host ? "host" : "join")
+                                                : (!g_opt.create_room.empty() ? "room-host" : "room-join"), line);
 }
 
 void p2p_log(const char* line, void*)
@@ -333,7 +351,8 @@ int run_session()
     hooks.log_dir = g_log_dir.c_str();
 
     g_session_begin = Clock::now();
-    const int result = znx_p2p_run_session(g_core, &hooks);
+    const int result = g_opt.lobby.empty() ? znx_p2p_run_session(g_core, &hooks)
+                                           : znx_lobby_play_run_session(g_core, &hooks);
     const double wall = std::chrono::duration<double>(Clock::now() - g_session_begin).count();
     char end_text[256];
     const int end = znx_p2p_last_end(end_text, sizeof(end_text));
@@ -348,9 +367,15 @@ int run_session()
             std::printf(" %d:%d", i, g_depth_hist[i]);
     std::printf("\n");
     uint64_t sent, dropped, delayed;
-    znx_netsim_stats(&sent, &dropped, &delayed);
-    std::printf("netsim: %llu datagrams sent, %llu dropped, %llu delayed\n",
-        (unsigned long long)sent, (unsigned long long)dropped, (unsigned long long)delayed);
+    if (g_opt.lobby.empty()) {
+        znx_netsim_stats(&sent, &dropped, &delayed);
+        std::printf("netsim: %llu datagrams sent, %llu dropped, %llu delayed\n",
+            (unsigned long long)sent, (unsigned long long)dropped, (unsigned long long)delayed);
+    } else {
+        znx_lobby_rmgk_netsim_stats(&sent, &dropped);
+        std::printf("netsim: %llu GekkoNet datagrams sent over ICE, %llu dropped\n", (unsigned long long)sent,
+            (unsigned long long)dropped);
+    }
     note("session end %d: %s", end, end_text);
 
     if (result != 0)
@@ -363,6 +388,8 @@ int run_session()
 }
 
 /* ---- the ROM's GoodName, the game name n02 announces (RMG-K uses the ROM browser's) ---- */
+
+std::string g_rom_md5;
 
 std::string rom_goodname(const char* rom_path, const std::string& data_dir)
 {
@@ -381,6 +408,7 @@ std::string rom_goodname(const char* rom_path, const std::string& data_dir)
     char md5[33];
     for (int i = 0; i < 16; i++)
         std::snprintf(md5 + i * 2, 3, "%02X", digest[i]);
+    g_rom_md5 = md5;
     std::ifstream ini(data_dir + "/mupen64plus.ini");
     std::string line, section = std::string("[") + md5 + "]";
     bool in = false;
@@ -525,6 +553,109 @@ bool run_lobby()
     return true;
 }
 
+/* ---- the rollback lobby: net/lobby_play.cpp, driven as the Switch's lobby screens drive it ---- */
+
+void lobby_log(const char* line)
+{
+    note("%s", line);
+}
+
+bool run_lobby_room()
+{
+    struct znx_lobby_play_config config;
+    std::memset(&config, 0, sizeof(config));
+    const bool host = !g_opt.create_room.empty();
+    config.server_url = g_opt.lobby.c_str();
+    config.username = g_opt.name != nullptr ? g_opt.name : (host ? "znx-host" : "znx-join");
+    config.rom_md5 = g_rom_md5.c_str();
+    config.rom_name = g_goodname.c_str();
+    /* default: no STUN, no TURN, ICE on 127.0.0.1 only: nothing leaves this machine */
+    config.stun = g_opt.stun == "server" ? nullptr : g_opt.stun.c_str();
+    config.no_turn = 1;
+    if (!g_opt.ice_bind.empty())
+        config.bind_address = g_opt.ice_bind.c_str();
+    else if (!g_opt.bind_any)
+        config.bind_address = "127.0.0.1";
+    config.log = lobby_log;
+    char error[256];
+    if (znx_lobby_play_open(&config, error, sizeof(error)) != 0) {
+        note("%s", error);
+        return false;
+    }
+    const auto begin = Clock::now();
+    bool asked = false, started = false, delay_set = false, room_line = false;
+    for (;;) {
+        znx_lobby_play_poll();
+        struct znx_lobby_play_status s;
+        znx_lobby_play_status(&s);
+        char title[160], text[512];
+        const int problem = znx_lobby_play_take_problem(title, sizeof(title), text, sizeof(text));
+        if (problem != ZNX_LPP_NONE) {
+            note("problem: %s: %s", title, text);
+            return false;
+        }
+        if (s.phase == ZNX_LP_FAILED || s.phase == ZNX_LP_CLOSED)
+            return false;
+        if (s.phase == ZNX_LP_READY)
+            break;
+        if (Clock::now() - begin > std::chrono::seconds(g_opt.lobby_timeout_s)) {
+            note("lobby timed out in phase %d", s.phase);
+            return false;
+        }
+        if (s.phase == ZNX_LP_ROOMS && !asked) {
+            if (host) {
+                asked = znx_lobby_play_create_room(g_opt.create_room.c_str(), g_opt.max_players) == 0;
+            } else {
+                struct znx_lobby_play_room rooms[16];
+                int all = 0;
+                const int n = znx_lobby_play_rooms(rooms, 16, &all);
+                for (int i = 0; i < n && !asked; ++i)
+                    if (!rooms[i].in_game && rooms[i].players < rooms[i].max_players &&
+                        (g_opt.join_room_name.empty() || g_opt.join_room_name == rooms[i].name)) {
+                        note("joining room \"%s\" of %s (%d of %d players, %d rooms in all)", rooms[i].name, rooms[i].host,
+                             rooms[i].players, rooms[i].max_players, all);
+                        asked = znx_lobby_play_join_room(rooms[i].id) == 0;
+                    }
+            }
+        }
+        if (s.phase == ZNX_LP_ROOM) {
+            struct znx_lobby_play_room_view v;
+            if (znx_lobby_play_room_view(&v) == 0) {
+                if (!delay_set) {
+                    znx_lobby_play_set_delay(g_opt.delay > 0 ? g_opt.delay : -1);
+                    delay_set = true;
+                }
+                if (host && !started && v.seated >= g_opt.start_players && v.can_start) {
+                    if (!room_line) {
+                        for (const auto& seat : v.seats)
+                            if (seat.user_id != 0)
+                                std::printf("lobby: seat \"%s\"%s%s, delay %d, ICE %d, ping %d ms\n", seat.name,
+                                    seat.self ? " (us)" : "", seat.host ? " (host)" : "", seat.delay, seat.ice, seat.ping);
+                        room_line = true;
+                    }
+                    if (g_opt.manifest_cheat >= 0 || g_opt.manifest_save)
+                        znx_lobby_play_test_manifest(g_opt.manifest_cheat, g_opt.manifest_save);
+                    started = znx_lobby_play_start() == 0;
+                }
+            }
+        }
+        usleep(2000);
+    }
+    g_session_delay = znx_lobby_play_local_delay();
+    note("game starts: seat %d of %d, delay %d", znx_lobby_play_local_slot(), znx_lobby_play_input_players(),
+         g_session_delay);
+    if (g_opt.player == 0)
+        g_opt.player = znx_lobby_play_local_slot();
+    if (g_opt.inputs != nullptr && !load_script(g_opt.inputs, g_opt.player))
+        return false;
+    return true;
+}
+
+int prepare_core(void* core)
+{
+    return znx_lobby_play_prepare_core(core);
+}
+
 int fetch_list(const std::string& where)
 {
     std::string host;
@@ -550,7 +681,8 @@ int fetch_list(const std::string& where)
 void usage()
 {
     std::fprintf(stderr,
-        "usage: znx-net --rom FILE (--host PORT | --join IP:PORT|CODE) [--inputs FILE --player N]\n"
+        "usage: znx-net --rom FILE (--host PORT | --join IP:PORT|CODE | --lobby URL (--create-room NAME | --join-room [NAME]))\n"
+        "               [--inputs FILE --player N]\n"
         "               [--delay D] [--prediction P] [--frames N] [--check-every K] [--check-skip LO HI]\n"
         "               [--sim-latency MS] [--sim-jitter MS] [--sim-loss PCT] [--sim-seed S]\n"
         "               [--bind-any] [--nat HOST:PORT] [--list HOST:PORT] [--enlist] [--code-file F]\n"
@@ -576,6 +708,14 @@ void usage()
         "  --no-pace            run as fast as possible instead of RMG-K's 60 Hz presentation pacer\n"
         "  --gekko-log          write RMG-K's verbose GekkoNet log to build/<arch>/profile/net-<side>/Logs\n"
         "  --fetch-list H:P     GET http://H:P/plist.txt and print the games with a connect code\n"
+        "  --lobby URL          RMG-K's rollback lobby (ws://HOST:PORT/ws) instead of P2P; then:\n"
+        "  --create-room NAME   open a room of this ROM (this side starts the match), or\n"
+        "  --join-room [NAME]   join the first room of this ROM (or the one with that name)\n"
+        "  --max-players N      the room's seats (2-4), --start-players N start once N are seated (default 2)\n"
+        "  --ice-bind ADDR      the ICE agents' address (default 127.0.0.1; every interface with --bind-any)\n"
+        "  --stun off|server|H:P   STUN for ICE (default off: nothing leaves the machine)\n"
+        "  --manifest-cheat V, --manifest-save   host: a test cheat (byte V at 0x80700000) / SRAM save in the manifest\n"
+        "  In a lobby match --player defaults to this side's seat; --delay 0 means Auto (RMG-K's default).\n"
         "  Nothing is sent anywhere but the given peer and the servers named on the command line.\n");
     std::exit(2);
 }
@@ -665,16 +805,42 @@ int main(int argc, char** argv)
         else if (!std::strcmp(a, "--gekko-log")) g_opt.gekko_log = true;
         else if (!std::strcmp(a, "--verbose")) g_opt.verbose = true;
         else if (!std::strcmp(a, "--fetch-list")) return fetch_list(next());
+        else if (!std::strcmp(a, "--lobby")) g_opt.lobby = next();
+        else if (!std::strcmp(a, "--create-room")) g_opt.create_room = next();
+        else if (!std::strcmp(a, "--join-room")) {
+            g_opt.join_room = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                g_opt.join_room_name = argv[++i];
+        }
+        else if (!std::strcmp(a, "--max-players")) g_opt.max_players = std::atoi(next());
+        else if (!std::strcmp(a, "--start-players")) g_opt.start_players = std::atoi(next());
+        else if (!std::strcmp(a, "--ice-bind")) g_opt.ice_bind = next();
+        else if (!std::strcmp(a, "--stun")) g_opt.stun = next();
+        else if (!std::strcmp(a, "--manifest-cheat")) g_opt.manifest_cheat = std::atoi(next()) & 0xff;
+        else if (!std::strcmp(a, "--manifest-save")) g_opt.manifest_save = true;
         else usage();
     }
-    if (g_opt.rom == nullptr || (g_opt.host ? (g_opt.port <= 0 || g_opt.port > 65535) : g_opt.join.empty()) ||
-        g_opt.frames <= 0 || g_opt.check_every <= 0)
-        usage();
-    if (!g_opt.host && !g_opt.bind_any && !is_loopback(g_opt.join)) {
-        std::fprintf(stderr, "znx-net: without --bind-any this only joins 127.0.0.1\n");
-        return 2;
+    const bool lobby = !g_opt.lobby.empty();
+    if (lobby) {
+        if (g_opt.create_room.empty() == !g_opt.join_room || g_opt.rom == nullptr || g_opt.frames <= 0 ||
+            g_opt.check_every <= 0)
+            usage();
+        g_opt.host = !g_opt.create_room.empty();
+        const std::string where = g_opt.lobby.substr(0, g_opt.lobby.find('/', 5));
+        if (!g_opt.bind_any && where.find("127.0.0.1") == std::string::npos && where.find("localhost") == std::string::npos) {
+            std::fprintf(stderr, "znx-net: without --bind-any the lobby must be on 127.0.0.1\n");
+            return 2;
+        }
+    } else {
+        if (g_opt.rom == nullptr || (g_opt.host ? (g_opt.port <= 0 || g_opt.port > 65535) : g_opt.join.empty()) ||
+            g_opt.frames <= 0 || g_opt.check_every <= 0)
+            usage();
+        if (!g_opt.host && !g_opt.bind_any && !is_loopback(g_opt.join)) {
+            std::fprintf(stderr, "znx-net: without --bind-any this only joins 127.0.0.1\n");
+            return 2;
+        }
     }
-    if (g_opt.inputs != nullptr && (g_opt.player < 1 || g_opt.player > 2))
+    if (g_opt.inputs != nullptr && (lobby ? (g_opt.player < 0 || g_opt.player > 4) : (g_opt.player < 1 || g_opt.player > 2)))
         usage();
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
@@ -691,12 +857,12 @@ int main(int argc, char** argv)
     }
     std::strcpy(dir, dirname(dir));
     const std::string data_dir = std::string(dir) + "/data";
-    const std::string user_dir = std::string(dir) + "/profile/net-" + (g_opt.host ? "host" : "join");
+    const std::string user_dir = std::string(dir) + "/profile/net-" + (lobby ? "room-" : "") + (g_opt.host ? "host" : "join");
     mkdir((std::string(dir) + "/profile").c_str(), 0755);
     mkdir(user_dir.c_str(), 0755);
     g_log_dir = user_dir;
 
-    if (g_opt.inputs != nullptr && !load_script(g_opt.inputs, g_opt.player))
+    if (!lobby && g_opt.inputs != nullptr && !load_script(g_opt.inputs, g_opt.player))
         return 1;
     g_goodname = rom_goodname(g_opt.rom, data_dir);
     if (g_goodname.empty()) {
@@ -710,12 +876,22 @@ int main(int argc, char** argv)
     sim.loss_pct = g_opt.sim_loss;
     sim.seed = g_opt.sim_seed != 0 ? g_opt.sim_seed : (g_opt.host ? 1u : 2u);
     sim.loopback_only = g_opt.bind_any ? 0 : 1;
-    znx_netsim_configure(&sim);
-
-    if (!run_lobby()) {
-        znx_p2p_close();
-        znx_netsim_shutdown();
-        return 1;
+    if (lobby) {
+        /* the same latency, jitter and loss on GekkoNet's datagrams, added where the session hands them to
+         * the ICE mesh (net/lobby/lobby_ice_rmgk.cpp) */
+        znx_lobby_rmgk_netsim(sim.latency_ms, sim.jitter_ms, sim.loss_pct, sim.seed);
+        if (!run_lobby_room()) {
+            znx_lobby_play_close();
+            znx_lobby_rmgk_netsim_shutdown();
+            return 1;
+        }
+    } else {
+        znx_netsim_configure(&sim);
+        if (!run_lobby()) {
+            znx_p2p_close();
+            znx_netsim_shutdown();
+            return 1;
+        }
     }
 
     struct znx_options o;
@@ -723,7 +899,7 @@ int main(int argc, char** argv)
     o.rom_path = g_opt.rom;
     o.frames = 0;            /* the session decides when to stop */
     o.hash_every = 0;
-    o.input_players = 2;     /* what start_p2p_session sets too */
+    o.input_players = lobby ? znx_lobby_play_input_players() : 2;   /* what start_*_session sets too */
     o.verbose = g_opt.verbose ? 1 : 0;
 
     struct znx_host host;
@@ -745,11 +921,28 @@ int main(int argc, char** argv)
     host.data_dir = data_dir.c_str();
     host.user_dir = user_dir.c_str();
     host.session_run = run_session;
+    if (lobby)
+        host.session_prepare = prepare_core;
 
-    const int result = znx_bench_run(&host, &o);
+    int result = znx_bench_run(&host, &o);
 
-    znx_p2p_close();
-    znx_netsim_shutdown();
+    if (lobby) {
+        char title[160], text[512];
+        if (!znx_lobby_play_after_game(title, sizeof(title), text, sizeof(text)))
+            note("after the match: %s: %s", title, text);
+        else
+            note("after the match: back in the room");
+        znx_lobby_play_leave_room();
+        for (int i = 0; i < 50; ++i) {   /* let ROOM_LEAVE go out */
+            znx_lobby_play_poll();
+            usleep(2000);
+        }
+        znx_lobby_play_close();
+        znx_lobby_rmgk_netsim_shutdown();
+    } else {
+        znx_p2p_close();
+        znx_netsim_shutdown();
+    }
     unload(host.input);
     unload(host.rsp);
     unload(host.video);

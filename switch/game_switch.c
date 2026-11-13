@@ -97,7 +97,8 @@ static bool ini_key(const char* key, const char* value, void* user)
     /* the online settings the start screen keeps (menu/settings.h): read there */
     else if (!strcmp(key, "name") || !strcmp(key, "input_delay") || !strcmp(key, "public_list") ||
              !strcmp(key, "p2p_port") || !strcmp(key, "p2p_code") || !strcmp(key, "p2p_token") ||
-             !strcmp(key, "nat_server") || !strcmp(key, "list_server")) {}
+             !strcmp(key, "nat_server") || !strcmp(key, "list_server") || !strcmp(key, "lobby_server") ||
+             !strcmp(key, "lobby_stun") || !strcmp(key, "lobby_bind")) {}
     else return false;
     return true;
 }
@@ -289,7 +290,14 @@ static int net_session_run(void)
     }
     l_net_first = 1;
     l_net_leaving = 0;
-    return znx_p2p_run_session(l_core_lib, &hooks);
+    /* peer to peer (znx_p2p_run_session) or a lobby match (net/lobby_play.h): the same hooks, pacing,
+     * overlay, quit hold and checkpoints */
+    return znx_online_run_session(l_core_lib, &hooks);
+}
+
+static int net_session_prepare(void* core)
+{
+    return znx_online_prepare_core(core);
 }
 
 /* The settings file, read again before every game (the start screen may have changed it). */
@@ -345,7 +353,7 @@ static int play(const char* rom_path, bool have_romfs, bool online)
         l_net_mode = settings.net_vsync ? ZNX_PRESENT_VSYNC : ZNX_PRESENT_TIMER;
         settings.game.vsync = l_net_mode == ZNX_PRESENT_VSYNC;
         settings.options.inputs_path = NULL;
-        settings.options.input_players = 2;   /* what start_p2p_session sets too */
+        settings.options.input_players = znx_online_input_players();   /* what start_*_session sets too */
         l_net_overlay = settings.net_overlay;
         l_net_verbose = settings.options.verbose;
         l_check_on = settings.rdram_check;
@@ -384,6 +392,8 @@ static int play(const char* rom_path, bool have_romfs, bool online)
         znx_input_init(settings.stick_range);
         l_core_lib = host.core;
         host.session_run = net_session_run;
+        if (znx_online_lobby_match())
+            host.session_prepare = net_session_prepare;   /* the pre-match manifest's cheats and saves */
         znx_front_plus_stops(false);
     } else if (settings.options.inputs_path == NULL) {
         /* Played with controllers: Plus is the N64's Start, so it no longer stops the run. */

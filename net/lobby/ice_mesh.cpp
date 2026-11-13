@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 
 #include "net_io.h"
 
@@ -131,6 +132,34 @@ struct IceCallbacks
         peer->mesh->m_packets.push_back(std::move(q));
     }
 };
+
+namespace
+{
+std::atomic<void (*)(const char*)> g_juiceLog{nullptr};
+
+void juiceLog(juice_log_level_t level, const char* message)
+{
+    static const char* const names[] = { "verbose", "debug", "info", "warn", "error", "fatal" };
+    void (*fn)(const char*) = g_juiceLog.load();
+    if (!fn || !message)
+        return;
+    char line[600];
+    std::snprintf(line, sizeof(line), "juice %s: %s", level >= 0 && level <= 5 ? names[level] : "?", message);
+    fn(line);
+}
+} // namespace
+
+void ice_log_to(void (*fn)(const char*), bool verbose)
+{
+    g_juiceLog.store(fn);
+    if (fn) {
+        juice_set_log_handler(juiceLog);
+        juice_set_log_level(verbose ? JUICE_LOG_LEVEL_INFO : JUICE_LOG_LEVEL_WARN);
+    } else {
+        juice_set_log_handler(nullptr);
+        juice_set_log_level(JUICE_LOG_LEVEL_WARN);
+    }
+}
 
 IceMesh::IceMesh() = default;
 

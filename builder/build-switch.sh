@@ -51,6 +51,8 @@ if [ "${1:-}" != "--in-container" ]; then
     cd "$ROOT"
     builder/prepare-src.sh
     builder/fetch-menu-deps.sh   # xdelta3 into ref/xdelta for the start screen (git, on the host)
+    # libjuice for the lobby's ICE, from RMG-K's tree, unchanged (as builder/build-mac.sh copies it)
+    rsync -a --exclude .git --exclude test --exclude fuzzer "ref/RMG-K/Source/3rdParty/libjuice/" "build/src/libjuice/"
     command -v docker >/dev/null || { echo "docker not found (start Colima)" >&2; exit 69; }
     docker image inspect "$IMAGE" >/dev/null 2>&1 || {
         echo "Docker image $IMAGE not found: build it with Melee-NX-NetPlay's builder/docker.sh image" >&2; exit 69; }
@@ -136,6 +138,9 @@ FRONT_GAME="$FRONT_GAME switch/screen_switch.c switch/menu_switch.c menu/menu.c 
 # Online play (docs/PLAN.md "Netplay on the Switch"): the online screens, the Lobby row's hook, the match
 # overlay and the n02 socket's non-blocking switch; the C++ netplay code is built below (NET_SOURCES).
 FRONT_GAME="$FRONT_GAME menu/lobby_entry.c switch/overlay_switch.c net/p2p/socket_switch.c"
+# The lobby (docs/PLAN.md "Lobby on the Switch"): libjuice's poll thread wakes itself through a pipe, which
+# libnx does not have; switch/juice_switch.c gives it a pair of loopback UDP sockets instead.
+FRONT_GAME="$FRONT_GAME switch/juice_switch.c"
 if [ "$TARGET" = selftest ]; then
     ARCH="-fPIE"
     # zlib: Debian's runtime library with devkitPro's copy of the two headers.
@@ -328,22 +333,60 @@ if [ -n "$WITH_GAME" ] || [ "$TARGET" = selftest ]; then
         net_queue "$N02/$f" "$OBJ/net/n02/$(basename "${f%.cpp}").o" "$N02_FLAGS"
     done
     net_queue "$N02/common/k_socket.cpp" "$OBJ/net/n02/k_socket.o" "$KSOCK_FLAGS"
-    net_queue "$RMGC/rmgk_gekko.cpp" "$OBJ/net/rmgc/rmgk_gekko.o" "$RMGC_FLAGS -DRMGK_GEKKO_STATE_CAPACITY=10485760u"
+    # -DNETPLAY as RMG-K builds it: the lobby path (start_lobby_session over LobbyIce, net/lobby/lobby_ice_rmgk.cpp)
+    # (The Linux self-test stays the P2P build it was: its GCC 12 has no <format> for Cheats.cpp, so it gets
+    # neither the lobby nor NETPLAY, and switch/selftest/lobby_none.cpp answers znx-net's lobby calls.)
+    NETPLAY_DEF="-DNETPLAY"
+    [ "$TARGET" = selftest ] && NETPLAY_DEF=""
+    net_queue "$RMGC/rmgk_gekko.cpp" "$OBJ/net/rmgc/rmgk_gekko.o" "$RMGC_FLAGS $NETPLAY_DEF -DRMGK_GEKKO_STATE_CAPACITY=10485760u"
     net_queue "$RMGC/RollbackNetcode.cpp" "$OBJ/net/rmgc/RollbackNetcode.o" "$RBN_FLAGS"
+    if [ "$TARGET" != selftest ]; then
+        # RMG-Core's cheat and netplay-save code for the lobby's pre-match manifest (net/lobby_play.cpp); the save
+        # tracker's three hooks go to net/rmgk_glue.cpp (renamed here), as in the Mac build
+        net_queue "$RMGC/NetplaySave.cpp" "$OBJ/net/rmgc/NetplaySave.o" "$RMGC_FLAGS -DNETPLAY -DCoreNetplaySaveTrackStateSaved=rmgk_CoreNetplaySaveTrackStateSaved -DCoreNetplaySaveTrackEndFrame=rmgk_CoreNetplaySaveTrackEndFrame -DCoreNetplaySaveTrackSessionEnd=rmgk_CoreNetplaySaveTrackSessionEnd"
+        net_queue "$RMGC/Cheats.cpp" "$OBJ/net/rmgc/Cheats.o" "$RMGC_FLAGS -DNETPLAY"
+        # The lobby client (net/lobby/) and libjuice 1.7.3 from RMG-K's tree (build/src/libjuice, unchanged, as
+        # RMG-K builds it: NO_SERVER, no Nettle). On libnx: no getifaddrs (NO_IFADDRS, and an empty <ifaddrs.h>
+        # for socket.h's include; the agents are bound to the console's own address instead, menu/lobby_entry.c),
+        # picohash's byte order given (no <endian.h>), and the poll thread's wake-up pipe from juice_switch.c.
+        JUICE="$SRC/libjuice"   # copied from ref/ on the host, before the container starts
+        [ -f "$JUICE/src/agent.c" ] || { echo "build/src/libjuice is missing: run builder/build-switch.sh on the host" >&2; exit 1; }
+        mkdir -p "$OUT/include/juice-shim"
+        echo "/* libnx has no getifaddrs: libjuice is built with NO_IFADDRS (builder/build-switch.sh) */" > "$OUT/include/juice-shim/ifaddrs.h.new"
+        cmp -s "$OUT/include/juice-shim/ifaddrs.h.new" "$OUT/include/juice-shim/ifaddrs.h" 2>/dev/null \
+            || cp "$OUT/include/juice-shim/ifaddrs.h.new" "$OUT/include/juice-shim/ifaddrs.h"
+        rm -f "$OUT/include/juice-shim/ifaddrs.h.new"
+        JUICE_FLAGS="$ARCH -O2 -g -std=gnu11 -w -ffunction-sections -D__SWITCH__ -D__LITTLE_ENDIAN__ -DNO_IFADDRS -DJUICE_STATIC -DUSE_NETTLE=0 -DNO_SERVER -DRELEASE=1 -I$JUICE/include -I$JUICE/include/juice -I$JUICE/src -I$OUT/include/juice-shim $FRONT_INC"
+        for f in addr agent crc32 const_time conn conn_poll conn_thread conn_mux base64 hash hmac ice juice log random server stun timestamp tcp turn udp; do
+            extra=""
+            [ "$f" = conn_poll ] && extra="-Dpipe=znx_juice_pipe"
+            net_queue "$JUICE/src/$f.c" "$OBJ/net/juice/$f.o" "$JUICE_FLAGS $extra" gcc
+        done
+        LOBBY_FLAGS="$NET_CXX -std=gnu++17 -DJUICE_STATIC -DGEKKONET_STATIC -I$JUICE/include -I$GEK/include -I$RMGC -Inet/lobby"
+        for f in net/lobby/*.cpp; do
+            o="$OBJ/net/lobby/$(basename "${f%.cpp}").o"
+            for h in net/lobby/*.h; do [ -f "$o" ] && [ "$h" -nt "$o" ] && rm -f "$o"; done
+            net_queue "$f" "$o" "$LOBBY_FLAGS"
+        done
+    else
+        net_queue switch/selftest/lobby_none.cpp "$OBJ/net/glue/lobby_none.o" "$GLUE_FLAGS -Inet"
+    fi
     for f in Error.cpp m64p/Api.cpp m64p/CoreApi.cpp m64p/ConfigApi.cpp; do
         net_queue "$RMGC/$f" "$OBJ/net/rmgc/$(basename "${f%.cpp}").o" "$RMGC_FLAGS"
     done
-    for f in net/n02_glue.cpp net/rmgk_glue.cpp net/p2p/znx_p2p.cpp net/p2p/http_list.cpp net/p2p/library_static.cpp; do
+    GLUE_SOURCES="net/n02_glue.cpp net/rmgk_glue.cpp net/p2p/znx_p2p.cpp net/p2p/http_list.cpp net/p2p/library_static.cpp"
+    [ "$TARGET" = selftest ] || GLUE_SOURCES="$GLUE_SOURCES net/lobby_play.cpp"
+    for f in $GLUE_SOURCES; do
         o="$OBJ/net/glue/$(basename "${f%.cpp}").o"
         # the glue's headers are this repository's: rebuild when one changes
-        for h in net/znx_net.h net/p2p/znx_p2p.h; do [ -f "$o" ] && [ "$h" -nt "$o" ] && rm -f "$o"; done
+        for h in net/znx_net.h net/p2p/znx_p2p.h net/lobby_play.h net/lobby/znx_lobby.h; do [ -f "$o" ] && [ "$h" -nt "$o" ] && rm -f "$o"; done
         net_queue "$f" "$o" "$GLUE_FLAGS"
     done
     queue net/input-net.c "$OBJ/input-net.o" "$COMMON -I$CORE/src/api"
     if [ "$TARGET" = selftest ]; then
         # znx-net itself, with the linked-in tables in place of dlopen, its network simulator, md5.c, and
         # linux_main.c (code cache, caches, memory) with its main() renamed
-        o="$OBJ/net/glue/znx-net.o"; [ -f "$o" ] && [ net/p2p/znx_p2p.h -nt "$o" ] && rm -f "$o"
+        o="$OBJ/net/glue/znx-net.o"; [ -f "$o" ] && { [ net/p2p/znx_p2p.h -nt "$o" ] || [ net/lobby_play.h -nt "$o" ]; } && rm -f "$o"
         net_queue net/znx-net.cpp "$o" "$GLUE_FLAGS -DZNX_STATIC_LIBS -Inet -I$CORE/subprojects/md5"
         net_queue net/netsim.cpp "$OBJ/net/glue/netsim.o" "$GLUE_FLAGS"
         net_queue "$CORE/subprojects/md5/md5.c" "$OBJ/net/md5.o" "$ARCH -O2 -w" gcc

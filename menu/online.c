@@ -23,9 +23,10 @@
 #include "lobby_entry.h"
 #include "menu.h"
 #include "menu_ui.h"
+#include "lobby/znx_lobby.h"
 #include "p2p/znx_p2p.h"
 
-enum screen { S_MENU, S_HOST, S_JOINING, S_LOBBY, S_LIST };
+enum screen { S_MENU, S_HOST, S_JOINING, S_LOBBY, S_LIST, S_ROOMS /* the lobby's screens (lobby_entry.c) */ };
 
 enum menu_row { ROW_HOST, ROW_CODE, ROW_IP, ROW_LIST, ROW_LOBBY, MENU_ROWS };
 
@@ -268,6 +269,7 @@ void znx_online_close(void)
 {
     if (!l.debug && znx_p2p_is_open())
         znx_p2p_close();
+    znx_lobby_close();
     if (l.list_busy) {
         pthread_join(l.list_thread, NULL);
         l.list_busy = 0;
@@ -276,7 +278,32 @@ void znx_online_close(void)
 
 int znx_online_connected(void)
 {
-    return l.debug ? 0 : znx_p2p_is_open();
+    return l.debug ? 0 : znx_p2p_is_open() || znx_lobby_active();
+}
+
+int znx_online_lobby_match(void)
+{
+    return l.screen == S_ROOMS;
+}
+
+int znx_online_run_session(void* core, const struct znx_p2p_session_hooks* hooks)
+{
+    return l.screen == S_ROOMS ? znx_lobby_run_session(core, hooks) : znx_p2p_run_session(core, hooks);
+}
+
+int znx_online_prepare_core(void* core)
+{
+    return l.screen == S_ROOMS ? znx_lobby_prepare_core(core) : 0;
+}
+
+int znx_online_input_players(void)
+{
+    return l.screen == S_ROOMS ? znx_lobby_input_players() : 2;
+}
+
+int znx_online_match_ready(void)
+{
+    return l.screen == S_ROOMS && znx_lobby_match_ready();
 }
 
 static enum znx_online_result fail_open(const char* error, char* title, size_t title_size, char* text, size_t text_size)
@@ -360,11 +387,24 @@ enum znx_online_result znx_online_update(uint32_t pressed, uint32_t held, char* 
                 l.list_row = 0;
                 start_list_fetch();
                 return ZNX_ONLINE_STAY;
-            default:
-                return znx_lobby_open(&l.request, title, title_size, text, text_size);
+            default: {
+                const enum znx_online_result r = znx_lobby_enter(&l.request, title, title_size, text, text_size);
+                if (r == ZNX_ONLINE_STAY)
+                    l.screen = S_ROOMS;
+                return r;
+            }
             }
         }
         return ZNX_ONLINE_STAY;
+
+    case S_ROOMS: {
+        const enum znx_online_result r = znx_lobby_update(pressed, held, title, title_size, text, text_size);
+        if (r == ZNX_ONLINE_BACK || (r == ZNX_ONLINE_MESSAGE && !znx_lobby_active())) {
+            l.screen = S_MENU;
+            return r == ZNX_ONLINE_BACK ? ZNX_ONLINE_STAY : r;
+        }
+        return r;
+    }
 
     case S_LIST:
         if (pressed & ZNX_BTN_UP) l.list_row = l.list_row > 0 ? l.list_row - 1 : 0;
@@ -421,6 +461,13 @@ enum znx_online_result znx_online_after_game(char* title, size_t title_size, cha
 {
     struct znx_p2p_status s;
     char why[256];
+    if (l.screen == S_ROOMS) {
+        /* a lobby match: back in the room, or how it ended */
+        const enum znx_online_result r = znx_lobby_after_game(title, title_size, text, text_size);
+        if (!znx_lobby_active())
+            l.screen = S_MENU;
+        return r;
+    }
     const int end = znx_p2p_last_end(why, sizeof(why));
     get_status(&s);
     save_identity_if_new();
@@ -478,7 +525,7 @@ static void draw_menu(void)
         "The host's code, like ABC@12",
         "For a player on your network, or a forwarded port",
         "",
-        "",
+        "RMG-K's rooms: matches of up to four players",
     };
     const struct znx_menu_settings* set = l.request.settings;
     char title[160], delay[32], port[16], list_status[160];
@@ -488,12 +535,8 @@ static void draw_menu(void)
     snprintf(title, sizeof(title), "Online \xC2\xB7 %s", l.request.title);
     znx_ui_title(title);
     for (int i = 0; i < MENU_ROWS; ++i) {
-        const float h = i == ROW_LOBBY ? 64 : ROW_H;
-        if (i == ROW_LOBBY)
-            y += 8;
-        znx_ui_row(y, h, l.row == i, titles[i], i == ROW_LOBBY ? C_TEXT2 : C_TEXT1, i == ROW_LOBBY ? NULL : status[i],
-                   C_TEXT2, 0, i == ROW_LOBBY ? "Not yet" : NULL);
-        y += h + ROW_GAP;
+        znx_ui_row(y, ROW_H, l.row == i, titles[i], C_TEXT1, status[i], C_TEXT2, 0, NULL);
+        y += ROW_H + ROW_GAP;
     }
     setting_delay_text(set, delay, sizeof(delay));
     snprintf(port, sizeof(port), "UDP %d", set->p2p_port);
@@ -529,10 +572,16 @@ static void draw_menu(void)
             paragraph = "Players who listed a game on RMG-K's public list and are waiting for someone to join. Only "
                         "games with this ROM are shown.";
             break;
-        default:
-            paragraph = "Matchmaking through RMG-K's lobby server comes in a later version. Peer to peer plays "
-                        "against the same players.";
+        default: {
+            static char server[160];
+            snprintf(server, sizeof(server), "%s", set->lobby_server[0] ? set->lobby_server : ZNX_LOBBY_URL_RELEASE);
+            fields[count++] = (struct field){ "Name", set->name, 0 };
+            fields[count++] = (struct field){ "Server", server, 1 };
+            paragraph = "RMG-K's Join Rollback Netplay lobby: open a room or join one with this game, then play "
+                        "against RMG-K players and other Switches.";
+            note = "Your controller plays whatever seat the room gives you.";
             break;
+        }
         }
         znx_ui_panel(LIST_Y, fields, count, paragraph, note);
     }
@@ -808,6 +857,7 @@ void znx_online_draw(void)
     case S_HOST: get_status(&s); draw_host(&s); break;
     case S_JOINING: draw_joining(); break;
     case S_LOBBY: get_status(&s); draw_lobby(&s); break;
+    case S_ROOMS: znx_lobby_draw(); break;
     }
 }
 
@@ -816,6 +866,12 @@ void znx_online_draw(void)
 void znx_online_debug(const struct znx_online_request* request, const char* which)
 {
     znx_online_enter(request);
+    if (!strncmp(which, "room:", 5)) {
+        l.debug = 1;
+        l.screen = S_ROOMS;
+        znx_lobby_debug(request, which + 5);
+        return;
+    }
     l.debug = 1;
     memset(&l.fake, 0, sizeof(l.fake));
     l.fake.port = request->settings->p2p_port;

@@ -13,10 +13,14 @@
 #include <filesystem>
 #include <string>
 
+#include "CachedRomHeaderAndSettings.hpp"
+#include "Callback.hpp"
 #include "Directories.hpp"
 #include "Emulation.hpp"
 #include "NetplaySave.hpp"
 #include "RollbackNetcode.hpp"
+#include "RomHeader.hpp"
+#include "RomSettings.hpp"
 #include "Settings.hpp"
 #include "m64p/Api.hpp"
 #include "n02_client.h"
@@ -103,7 +107,40 @@ bool CoreSettingsGetBoolValue(SettingsID settingId)
     }
 }
 
-/* ---- NetplaySave.cpp: the tracker that publishes in-match save changes (lobby feature) ---- */
+/* ---- Callback.cpp: rmgk_gekko's late-join messages (compiled with NETPLAY; never reached here) ---- */
+
+void CoreAddCallbackMessage(CoreDebugMessageType type, std::string message)
+{
+    (void)type;
+    znx_net_debug(message.c_str());
+}
+
+/* ---- what RMG-Core's Cheats.cpp and NetplaySave.cpp reach outside the functions a lobby match uses
+ * (CoreDeserializeNetplayCheats, CoreSetNetplayCheats, CoreApplyNetplayCheats, CoreDeserializeNetplaySaveData,
+ * CoreSetNetplaySaveData, CoreApplyNetplaySaveData: net/lobby_play.cpp). The cheat files, the ROM browser's
+ * cache and the settings file are RMG-K's Qt program's; none of them exists here. ---- */
+
+bool CoreSettingsSetValue(std::string, std::string, int) { return false; }
+bool CoreSettingsSetValue(std::string, std::string, bool) { return false; }
+int CoreSettingsGetIntValue(std::string, std::string, int defaultValue) { return defaultValue; }
+bool CoreSettingsGetBoolValue(std::string, std::string, bool defaultValue) { return defaultValue; }
+int CoreSettingsGetIntValue(SettingsID) { return 0; }
+bool CoreGetCurrentRomHeader(CoreRomHeader&) { return false; }
+bool CoreGetCurrentRomSettings(CoreRomSettings&) { return false; }
+std::filesystem::path CoreGetUserDataDirectory(void) { return std::filesystem::path(znx_net_log_dir()); }
+std::filesystem::path CoreGetSharedDataDirectory(void) { return std::filesystem::path(znx_net_log_dir()); }
+std::filesystem::path CoreGetUserConfigDirectory(void) { return std::filesystem::path(znx_net_log_dir()); }
+std::filesystem::path CoreGetSaveDirectory(void) { return std::filesystem::path(znx_net_log_dir()); }
+bool CoreGetCachedRomHeaderAndSettings(std::filesystem::path, CoreRomType*, CoreRomHeader*, CoreRomSettings*, CoreRomSettings*)
+{
+    return false;
+}
+bool CoreUpdateCachedRomHeaderAndSettings(std::filesystem::path) { return false; }
+bool CoreIsEmulationRunning(void) { return false; }
+
+/* ---- NetplaySave.cpp: the tracker that publishes in-match save changes (lobby feature). NetplaySave.cpp is
+ * compiled with these three renamed (rmgk_...), so rmgk_gekko's calls land here; its CoreNetplaySaveTrackReset
+ * (called by CoreApplyNetplaySaveData and start_lobby_session) is its own. ---- */
 
 void CoreNetplaySaveTrackStateSaved(int frame)
 {

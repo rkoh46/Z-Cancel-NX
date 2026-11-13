@@ -762,7 +762,14 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
     }
     rsp_attached = 1;
 
-    {
+    if (host->session_prepare != NULL) {
+        /* the match's own cheats and saves (in memory, as RMG-K keeps them) */
+        if (host->session_prepare(host->core) != 0) {
+            err("%s: the match's cheats or save data could not be applied", l_name);
+            l_failed = 1;
+            goto shutdown;
+        }
+    } else {
         /* Cartridge saves start blank and stay in memory, as in a netplay match. */
         m64p_save_data blank_saves;
         memset(&blank_saves, 0, sizeof(blank_saves));

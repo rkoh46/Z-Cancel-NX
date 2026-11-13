@@ -349,10 +349,9 @@ struct znx_lobby
             d.set("anonymous", Json::boolean(true));
         if (tzOffset != 0)
             d.set("tzOffset", Json::integer(tzOffset));
-        Json roms = Json::array();
-        if (!romMd5.empty())
-            roms.push(Json::string(romMd5));
-        d.set("romHashes", roms);
+        // RMG-K 0.9.16 sends an empty list here (RollbackLobbyDialog.cpp:2619); so does this client, so
+        // the server sees exactly what it sees from RMG-K. romMd5 is only the default ROM of create_room.
+        d.set("romHashes", Json::array());
         d.set("iceSupported", Json::boolean(true));
         d.set("lateJoin", Json::boolean(false));   // no MATCH_ADMIT hand-off here
         d.set("saveData", Json::boolean(saveDataCapable));
@@ -1424,6 +1423,11 @@ znx_lobby* znx_lobby_create(const znx_lobby_config* config)
     return lb;
 }
 
+void znx_lobby_set_ice_log(void (*fn)(const char* line), int verbose)
+{
+    ice_log_to(fn, verbose != 0);
+}
+
 void znx_lobby_destroy(znx_lobby* lobby)
 {
     if (!lobby)
@@ -1453,6 +1457,11 @@ int znx_lobby_connected(const znx_lobby* lobby)
 uint64_t znx_lobby_self_id(const znx_lobby* lobby)
 {
     return lobby ? lobby->selfId : 0;
+}
+
+const char* znx_lobby_self_region(const znx_lobby* lobby)
+{
+    return lobby ? lobby->region.c_str() : "";
 }
 
 int znx_lobby_poll(znx_lobby* lobby, znx_lobby_event* ev)

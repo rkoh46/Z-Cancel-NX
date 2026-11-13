@@ -156,6 +156,47 @@ void znx_p2p_stop_game(void);
 int znx_p2p_last_end(char* text, size_t text_size);   /* enum znx_p2p_end and a sentence for the player */
 int znx_p2p_peer_dropped(void);   /* the peer's DROP arrived during this session */
 
+/* ---- a lobby match (RMG-K's "Join Rollback Netplay": net/lobby/, net/lobby_play.h) ----
+ * The same session as above (same hooks, statistics, ends, overlay numbers), started the way RMG-K's
+ * CoreStartEmulation starts a LOBBY| address (Emulation.cpp:1168-1215): rmgk_gekko::start_lobby_session
+ * over the room's ICE mesh ("ice:<userId>" actors, LobbyIce channel 3), one actor per occupied seat,
+ * `players` = the highest occupied seat, GekkoNet's 30 s peer timeout; drops come from the lobby server
+ * (MATCH_PEER_LEFT -> request_disconnect_player). No n02 is involved. */
+struct znx_p2p_lobby_match {
+    int local_slot;             /* this console's controller port in the match, 1..4 */
+    int seats;                  /* MATCH_BEGIN.seats (late-join matches), 0 otherwise */
+    int delay, prediction;
+    int num_remotes;
+    int remote_slot[3];
+    uint64_t remote_user[3];
+    /* Called every 10 ms on the session's control thread while the match runs: polls the lobby (its
+     * WebSocket and ICE signalling must keep moving) and reports with znx_p2p_lobby_peer_left /
+     * znx_p2p_lobby_server_up. */
+    void (*control)(void* user);
+    void (*log)(const char* line, void* user);   /* used when no P2P lobby is open */
+    void* user;
+};
+/* The address string RMG-K's EmulationThread::SetLobbyNetplay builds for this match
+ * ("LOBBY|<delay>|<prediction>|<slot>,ice,<userId>|...[|seats=N]"), for the log. */
+int znx_p2p_lobby_address(const struct znx_p2p_lobby_match* match, char* out, size_t out_size);
+/* The `players` CoreStartEmulation passes: max(local slot, seats, remote slots). */
+int znx_p2p_lobby_total_seats(const struct znx_p2p_lobby_match* match);
+int znx_p2p_run_lobby_session(void* core, const struct znx_p2p_session_hooks* hooks,
+                              const struct znx_p2p_lobby_match* match);
+/* From the control callback: the server says this seat left the match (MATCH_PEER_LEFT). With
+ * hooks->stop_on_peer_drop the seat's input becomes idle at once (request_disconnect_player) and the
+ * session ends when no other player is left; without it only znx_p2p_peer_dropped() turns true. */
+void znx_p2p_lobby_peer_left(int slot, const char* name);
+/* From the control callback: the lobby's WebSocket is up (1) or lost (0). A match plays on without the
+ * server; with it lost and no frame for 10 s the session ends (RollbackLobbyDialog onMatchWatchTick). */
+void znx_p2p_lobby_server_up(int up);
+/* A lobby match that is over for this side (znx-net's "every frame is final", or the player left):
+ * set from any thread by znx_p2p_send_drop / znx_p2p_leave_game, read by the control callback, which
+ * then tells the server (MATCH_FINISHED). */
+int znx_p2p_lobby_finish_requested(void);
+/* 1 while the session that runs (or ran last) is a lobby match. */
+int znx_p2p_lobby_mode(void);
+
 /* While a session runs (any thread): for the overlay. */
 struct znx_p2p_live {
     int ping, delay, rollbacks, deepest, frames;

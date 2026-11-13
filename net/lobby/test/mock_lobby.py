@@ -7,6 +7,11 @@ HELLO/HELLO_OK, presence, room list, rooms (create/join/leave/delay/prediction/s
 the ICE_SIGNAL relay and MATCH_BEGIN. Standard library only.
 
     python3 net/lobby/test/mock_lobby.py --port 18080          (listens on 127.0.0.1 only)
+    python3 net/lobby/test/mock_lobby.py --host 0.0.0.0 --port 18080   (a LAN test with a console)
+
+MATCH_FINISHED is per player here: the others still in the match get MATCH_PEER_LEFT (reason
+"finished") and the room goes back to "waiting" once every player has finished. What the real server
+does is not known; RMG-K's client handles both.
 """
 import argparse
 import asyncio
@@ -21,6 +26,9 @@ import time
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 USERNAME = re.compile(r"^[A-Za-z0-9_\-\.]{2,20}$")
 VERBOSE = False
+STUN = {"host": "127.0.0.1", "port": 3478}
+MIN_VERSION = (0, 9, 13)
+KICK_AFTER = 0.0
 
 
 def log(*args):
@@ -31,7 +39,7 @@ def version_ok(v):
     # RollbackLobbyDialog.cpp:2744-2746: "requires RMG-K 0.9.13 or vdev-2367 or newer".
     m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", v or "")
     if m:
-        return tuple(int(x) for x in m.groups()) >= (0, 9, 13)
+        return tuple(int(x) for x in m.groups()) >= MIN_VERSION
     m = re.match(r"^vdev-(\d+)", v or "")
     return bool(m) and int(m.group(1)) >= 2367
 
@@ -102,6 +110,7 @@ class Room:
         self.state = "waiting"
         self.match_id = 0
         self.started_at = 0
+        self.in_match = set()  # user ids still playing the running match
 
     def slot_of(self, c):
         for s, x in self.seats.items():
@@ -115,7 +124,7 @@ class Room:
             c = self.seats[slot]
             players.append({
                 "userId": c.id, "username": c.username, "slot": slot, "frameDelay": c.frame_delay,
-                "iceSupported": bool(c.hello.get("iceSupported")), "inMatch": self.state == "in_game",
+                "iceSupported": bool(c.hello.get("iceSupported")), "inMatch": c.id in self.in_match,
                 "lateJoin": bool(c.hello.get("lateJoin")), "saveData": bool(c.hello.get("saveData")),
             })
         return {
@@ -167,8 +176,12 @@ class Server:
         room.seats.pop(slot, None)
         c.room = None
         if room.state == "in_game":
+            room.in_match.discard(c.id)
             await self.broadcast("MATCH_PEER_LEFT", {"matchId": room.match_id, "userId": c.id, "slot": slot,
                                                      "reason": reason}, only=list(room.seats.values()))
+            if not room.in_match:
+                room.state = "waiting"
+                room.match_id = 0
         if not room.seats:
             del self.rooms[room.id]
         else:
@@ -176,6 +189,13 @@ class Server:
                 room.host = room.seats[min(room.seats)]
             await self.room_state(room)
         await self.room_list()
+
+    async def kick(self, room, c):
+        # --kick-after: the host "kicks" whoever joined (tests the client's ROOM_LEFT "kicked")
+        if c.room is room and room.state == "waiting":
+            log(f"kicking {c.username} (--kick-after)")
+            await self.leave_room(c, "kicked")
+            await c.send("ROOM_LEFT", {"reason": "kicked"})
 
     async def handle(self, c, env):
         t = env.get("type", "")
@@ -204,8 +224,10 @@ class Server:
             host = c.peer[0] if c.peer else "127.0.0.1"
             # STUN points at this machine so nothing ever leaves it, even for a client that does
             # not override the server's ICE configuration (nothing listens there).
-            await c.send("HELLO_OK", {"userId": c.id, "observedIp": host, "region": "us-east",
-                                      "ice": {"stun": {"host": "127.0.0.1", "port": 3478}, "turn": []}})
+            ice = {"turn": []}
+            if STUN:
+                ice["stun"] = STUN
+            await c.send("HELLO_OK", {"userId": c.id, "observedIp": host, "region": "us-east", "ice": ice})
             await c.send("PRESENCE_FULL", {"users": [x.presence() for x in self.clients.values()]})
             await c.send("ROOM_LIST", {"rooms": [r.summary() for r in self.rooms.values()]})
             await self.broadcast("PRESENCE_DELTA", {"added": [c.presence()], "updated": [], "removed": []},
@@ -255,6 +277,9 @@ class Server:
                 await self.room_state(room)
                 await self.room_list()
                 await self.presence_update(c)
+                if KICK_AFTER > 0:
+                    asyncio.get_running_loop().call_later(
+                        KICK_AFTER, lambda: asyncio.ensure_future(self.kick(room, c)))
         elif t == "ROOM_LEAVE":
             if c.room:
                 await self.leave_room(c)
@@ -286,6 +311,7 @@ class Server:
                 room.match_id = self.next_match
                 self.next_match += 1
                 room.started_at = int(time.time() * 1000)
+                room.in_match = {p.id for p in room.seats.values()}
                 await self.room_state(room)
                 peers = []
                 for slot in sorted(room.seats):
@@ -299,10 +325,16 @@ class Server:
                 await self.room_list()
         elif t in ("MATCH_FINISHED", "MATCH_PUNCH_FAILED"):
             room = c.room
-            if room and room.state == "in_game" and int(d.get("matchId", 0)) == room.match_id:
-                room.state = "waiting"
-                room.match_id = 0
-                room.started_at = 0
+            if room and room.state == "in_game" and int(d.get("matchId", 0)) == room.match_id and c.id in room.in_match:
+                room.in_match.discard(c.id)
+                others = [p for p in room.seats.values() if p.id in room.in_match]
+                if others:
+                    await self.broadcast("MATCH_PEER_LEFT", {"matchId": room.match_id, "userId": c.id,
+                                                             "slot": room.slot_of(c), "reason": "finished"}, only=others)
+                else:
+                    room.state = "waiting"
+                    room.match_id = 0
+                    room.started_at = 0
                 await self.room_state(room)
                 await self.room_list()
         elif t == "MATCH_CONNECTED":
@@ -405,13 +437,27 @@ class Server:
 async def main():
     global VERBOSE
     ap = argparse.ArgumentParser()
+    global STUN
     ap.add_argument("--port", type=int, default=18080)
+    ap.add_argument("--host", default="127.0.0.1", help="address to listen on (0.0.0.0 for a LAN test)")
+    ap.add_argument("--stun", default="127.0.0.1:3478",
+                    help="the STUN server HELLO_OK names (host:port), or 'none' to leave it out (RMG-K then uses Google's)")
+    ap.add_argument("--min-version", default="0.9.13", help="HELLO_FAIL version_mismatch below this clientVersion")
+    ap.add_argument("--kick-after", type=float, default=0.0, help="kick every joiner this many seconds after it joins")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     VERBOSE = args.verbose
+    global MIN_VERSION, KICK_AFTER
+    MIN_VERSION = tuple(int(x) for x in args.min_version.split("."))
+    KICK_AFTER = args.kick_after
+    if args.stun == "none":
+        STUN = None
+    else:
+        h, _, p = args.stun.rpartition(":")
+        STUN = {"host": h, "port": int(p)}
     server = Server()
-    srv = await asyncio.start_server(server.serve, "127.0.0.1", args.port)
-    log(f"listening on ws://127.0.0.1:{args.port}/ws")
+    srv = await asyncio.start_server(server.serve, args.host, args.port)
+    log(f"listening on ws://{args.host}:{args.port}/ws")
     print("READY", flush=True)
     async with srv:
         await srv.serve_forever()

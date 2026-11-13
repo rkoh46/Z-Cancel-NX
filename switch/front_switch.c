@@ -163,7 +163,18 @@ void znx_front_begin(const char* program, const char* log_name, bool text_screen
     l_program = program;
     l_text_screen = text_screen;
     mutexInit(&l_log_lock);
-    socketInitializeDefault();
+    {
+        /* The socket service as libnx sets it up by default, with more room for what the online modes keep
+         * open at once: up to 8 threads can be inside a socket call together (the lobby thread, libjuice's
+         * poll thread blocking in poll(), the n02 thread, the menu, the emulation thread sending GekkoNet's
+         * datagrams), and the UDP buffers per socket doubled for a burst of ICE and GekkoNet packets. */
+        SocketInitConfig config = *socketGetDefaultInitConfig();
+        config.udp_tx_buf_size *= 2;
+        config.udp_rx_buf_size *= 2;
+        config.num_bsd_sessions = 8;
+        if (R_FAILED(socketInitialize(&config)))
+            socketInitializeDefault();
+    }
     l_nxlink = nxlinkStdio() >= 0; /* stdout and stderr to the PC that sent the NRO with nxlink -s */
     if (!l_nxlink && text_screen) {
         consoleInit(NULL);         /* otherwise to the screen */

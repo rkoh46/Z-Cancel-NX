@@ -21,8 +21,8 @@
 #include "settings.h"
 
 /* What the platform offers for typing: the system keyboard on the console (libnx swkbd), a scripted
- * answer in the Mac preview. kind: 0 a name, 1 a connect code, 2 an IP address and port. Returns 1 with
- * the text in out, 0 when the player cancelled. */
+ * answer in the Mac preview. kind: 0 a name, 1 a connect code, 2 an IP address and port, 3 a chat line,
+ * 4 a room name. Returns 1 with the text in out, 0 when the player cancelled. */
 typedef int (*znx_keyboard_fn)(int kind, const char* header, const char* guide, const char* initial,
                                char* out, size_t out_size);
 
@@ -62,11 +62,25 @@ void znx_online_draw(void);
 enum znx_online_result znx_online_after_game(char* title, size_t title_size, char* text, size_t text_size);
 /* The connection is open (a lobby or a match). */
 int znx_online_connected(void);
+
+/* ---- the match ZNX_ONLINE_PLAY starts: peer to peer (net/p2p) or a lobby match (net/lobby_play.h) ---- */
+struct znx_p2p_session_hooks;
+/* 1 when it is a lobby match. */
+int znx_online_lobby_match(void);
+/* Runs it (the platform's session_run): znx_p2p_run_session or the lobby's. */
+int znx_online_run_session(void* core, const struct znx_p2p_session_hooks* hooks);
+/* The lobby match's cheats and save data, for bench_core's session_prepare (0 on success). */
+int znx_online_prepare_core(void* core);
+/* The controller ports the match synchronizes (2 peer to peer; the highest seat in a lobby match). */
+int znx_online_input_players(void);
+/* A lobby match became ready while another screen of the menu (a message) was up. */
+int znx_online_match_ready(void);
 /* Leaves whatever is open (the program is closing). */
 void znx_online_close(void);
 
 /* Preview only (znx-game --menu-shot): shows a screen with made-up content, no network. which:
- * "lobby", "lobby-mismatch", "host", "host-ip", "joining", "list", "list-empty". */
+ * "lobby", "lobby-mismatch", "host", "host-ip", "joining", "list", "list-empty", and the lobby's screens as
+ * "room:<which>" (lobby_entry.h znx_lobby_debug). */
 void znx_online_debug(const struct znx_online_request* request, const char* which);
 
 #endif
