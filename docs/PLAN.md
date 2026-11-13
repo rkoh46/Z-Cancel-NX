@@ -270,3 +270,18 @@ Both are in `z-cancel-nx.nro` and checked on the console.
   to the Homebrew Menu. The bot's first press after its controller detaches is lost: send a throwaway
   press first, and never send presses after the program has exited (a stray Minus opened hbmenu's theme
   menu).
+
+### Shader cache, 2026-11-12
+
+`EnableShadersStorage` is on: GLideN64 saves the combiners a game used when it closes
+(`<user cache>/shaders`) and compiles them at the next start. The Switch's Mesa offers 0 program
+binary formats, so it is the key list that is saved and the compile happens at start, not a binary
+load. On the console, the intro's first 7,200 frames went from 50 frames over 16.7 ms (worst 504) to
+20 (worst 181), and sound ran dry 9 times instead of 28.
+
+The scripted VS match on the console with the picture (`inputs=` the mash script), the second time
+(combiners cached): from the stage load to the results screen not one frame over 16.7 ms after the
+first second; worst 14.2 ms, typical 3.7 ms of the emulation thread per frame. The first time it had
+one 113 ms stop (a combiner seen for the first time). The remaining spikes (frame 1,647 of the intro:
+181 ms; the match start: 29 ms) are also there without any picture, so they are the recompiler
+compiling newly loaded game code, at scene loads.

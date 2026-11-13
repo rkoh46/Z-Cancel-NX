@@ -237,6 +237,15 @@ static m64p_error vidext_set_mode(int width, int height, int bits_per_pixel, int
         znx_log("video: GL_RENDERER %s", (const char*)get_string(0x1F01));
         znx_log("video: GL_VERSION %s", (const char*)get_string(0x1F02));
         znx_log("video: GLSL %s", (const char*)get_string(0x8B8C));
+        {
+            /* GL_NUM_PROGRAM_BINARY_FORMATS: whether compiled shaders can be saved and loaded back. */
+            void (*get_integerv)(unsigned, int*) = (void (*)(unsigned, int*))eglGetProcAddress("glGetIntegerv");
+            int formats = -1;
+            if (get_integerv != NULL) get_integerv(0x87FE, &formats);
+            znx_log("video: %d program binary formats (%s)", formats,
+                    formats > 0 ? "compiled shaders are saved to the SD card"
+                                : "the shader list is saved and compiled at start");
+        }
         /* Black in every buffer of the swap chain (four swaps cover the most it can have):
          * without frame buffer emulation the plugin only ever draws the 4:3 middle. */
         for (int i = 0; i < 4; ++i) {

@@ -86,7 +86,10 @@ int znx_game_video_config(const struct znx_config* config)
         /* No per-game overrides (GLideN64.custom.ini has none for this game and is not shipped). */
         { "Video-GLideN64", "EnableCustomSettings",             1, 0 },
         /* No files: shader cache, texture packs, texture cache, dumps. */
-        { "Video-GLideN64", "EnableShadersStorage",             1, 0 },
+        /* The combiners a game used are saved when it closes and compiled at the next start, so a scene's
+         * first appearance does not stop the game to compile them (30 to 500 ms each on the Switch). It
+         * writes only to the cache folder, never RDRAM. */
+        { "Video-GLideN64", "EnableShadersStorage",             1, 1 },
         { "Video-GLideN64", "txFilterMode",                     0, 0 },
         { "Video-GLideN64", "txEnhancementMode",                0, 0 },
         { "Video-GLideN64", "txHiresEnable",                    1, 0 },
