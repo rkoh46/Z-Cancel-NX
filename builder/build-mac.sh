@@ -6,6 +6,11 @@
 #   build/mac-<arch>/znx-video-null.dylib        video plugin that only completes display lists (bench/)
 #   build/mac-<arch>/znx-bench                   the harness (bench/znx-bench.c + bench/bench_core.c)
 # Usage: builder/build-mac.sh [arm64|x86_64]     (x86_64 runs under Rosetta and needs nasm)
+#        builder/build-mac.sh arm64 game        also the check build of the picture program:
+#   build/mac-arm64/mupen64plus-video-GLideN64.dylib   RMG-K's GLideN64 (patches/ applied), built as for the Switch
+#                                                      except for the OpenGL it talks to (macOS's instead of EGL)
+#   build/mac-arm64/znx-game                           game/mac/: the same frame driver and settings as the Switch
+#                                                      program, drawing into an offscreen OpenGL context (no window)
 set -euo pipefail
 ARCH="${1:-arm64}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -137,3 +142,34 @@ clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -I"$CORE/src/api" bench/
 mkdir -p "$OUT/data"
 cp "$CORE"/data/mupen64plus.ini "$CORE"/data/mupencheat.txt "$OUT/data/"
 echo "built $OUT/znx-bench"
+
+if [ "${2:-}" = game ]; then
+    [ "$ARCH" = arm64 ] || { echo "the picture check build is arm64 only" >&2; exit 1; }
+    GLN="$SRC/mupen64plus-video-GLideN64/src"
+    . builder/gliden64-sources.sh
+    mkdir -p "$GEN/gliden64"
+    [ -f "$GEN/gliden64/Revision.h" ] || : > "$GEN/gliden64/Revision.h"
+    GLN_FLAGS="$COMMON -fvisibility-inlines-hidden -DMUPENPLUSAPI -DTXFILTER_LIB -DOS_MAC_OS_X -DGL_SILENCE_DEPRECATION -I$GLN -I$GLN/inc -I$GLN/osal -I$GEN/gliden64"
+    : > "$CMDS"
+    GLN_OBJS=""
+    for f in $GLN_SOURCES; do
+        o="$OBJ/gliden64/${f%.*}.o"
+        mkdir -p "$(dirname "$o")"
+        if [ ! -f "$o" ] || [ "$GLN/$f" -nt "$o" ] || [ "$0" -nt "$o" ] || [ "$SRC/.stamp" -nt "$o" ] || [ -n "${REBUILD:-}" ]; then
+            case "$f" in
+                *.c) echo "echo '  CC $f' && clang $GLN_FLAGS -c $GLN/$f -o $o" >> "$CMDS" ;;
+                *)   echo "echo '  CC $f' && clang++ -std=gnu++17 $GLN_FLAGS -c $GLN/$f -o $o" >> "$CMDS" ;;
+            esac
+        fi
+        GLN_OBJS="$GLN_OBJS $o"
+    done
+    tr '\n' '\0' < "$CMDS" | xargs -0 -n 1 -P "$JOBS" sh -c
+    echo "  LD mupen64plus-video-GLideN64.dylib"
+    clang++ -arch "$ARCH" -mmacosx-version-min=11.0 -dynamiclib -o "$OUT/mupen64plus-video-GLideN64.dylib" $GLN_OBJS \
+        -framework OpenGL
+    echo "  CC znx-game"
+    clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -I"$CORE/src/api" -Ibench -Igame \
+        game/mac/znx-game-mac.c game/mac/vidext_cgl.c game/game_core.c bench/bench_core.c \
+        -framework OpenGL -lz -o "$OUT/znx-game"
+    echo "built $OUT/znx-game"
+fi

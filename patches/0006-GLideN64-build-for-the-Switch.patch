@@ -1,0 +1,60 @@
+GLideN64: build for the Switch (libnx has no dlopen, no <dlfcn.h>, and is not __unix__)
+
+Three things stop RMG-K's GLideN64 from compiling for devkitA64; nothing about how it draws
+changes, and other platforms compile exactly as before.
+
+- winlnxdefs.h includes <dlfcn.h>, which libnx does not have.
+- mupenplus/MupenPlusAPIImpl.cpp finds the core's functions with dlsym on the core's library
+  handle. On the Switch the core is linked into the program and its "handle" is a table of
+  names (switch/dynlib_static.c): look them up with osal_dynlib_getproc, as the core and the
+  RSP plugin already do there.
+- ThreadedOpenGl/atomicops.h picks its semaphore by platform and knows no Switch; devkitA64's
+  newlib has POSIX semaphores, so take the __unix__ branch (mupen64plus-libretro-nx does the
+  same with HAVE_LIBNX). The threaded renderer itself stays off (ThreadedVideo=0).
+
+--- a/mupen64plus-video-GLideN64/src/winlnxdefs.h
++++ b/mupen64plus-video-GLideN64/src/winlnxdefs.h
+@@ -30,7 +30,9 @@
+ #ifndef WINLNXDEFS_H
+ #define WINLNXDEFS_H
+ 
++#ifndef __SWITCH__ /* libnx has no dynamic loader */
+ #include <dlfcn.h>
++#endif
+ #include <errno.h>
+ #include <limits.h> // PATH_MAX
+ #include <stdlib.h> // malloc(), srand()
+--- a/mupen64plus-video-GLideN64/src/mupenplus/MupenPlusAPIImpl.cpp
++++ b/mupen64plus-video-GLideN64/src/mupenplus/MupenPlusAPIImpl.cpp
+@@ -6,6 +6,11 @@
+ 
+ #ifdef OS_WINDOWS
+ #define DLSYM(a, b) GetProcAddress(a, b)
++#elif defined(__SWITCH__)
++// Z-Cancel NX: the core is linked into the program; its handle is a table of names
++// (switch/dynlib_static.c).
++extern "C" void* osal_dynlib_getproc(void* lib, const char* name);
++#define DLSYM(a, b) osal_dynlib_getproc(a, b)
+ #else
+ #include <dlfcn.h>
+ #define DLSYM(a, b) dlsym(a, b)
+--- a/mupen64plus-video-GLideN64/src/Graphics/OpenGLContext/ThreadedOpenGl/atomicops.h
++++ b/mupen64plus-video-GLideN64/src/Graphics/OpenGLContext/ThreadedOpenGl/atomicops.h
+@@ -349,7 +349,7 @@
+ }
+ #elif defined(__MACH__)
+ #include <mach/mach.h>
+-#elif defined(__unix__)
++#elif defined(__unix__) || defined(__SWITCH__)
+ #include <semaphore.h>
+ #endif
+ 
+@@ -483,7 +483,7 @@
+ 				}
+ 			}
+ 		};
+-#elif defined(__unix__)
++#elif defined(__unix__) || defined(__SWITCH__)
+ 		//---------------------------------------------------------
+ 		// Semaphore (POSIX, Linux)
+ 		//---------------------------------------------------------

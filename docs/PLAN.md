@@ -190,3 +190,65 @@ what does differ never propagates: a divergence that reached game logic would pe
 later. This is the evidence that inputs-only rollback between a Switch and a PC can hold for vanilla.
 Still open: the three stray frames (probably a register save somewhere else), Smash Remix, and RMG-K's
 own x86-64 build (GCC/MinGW, not Clang under Rosetta) which only step 5 can test.
+
+### Picture (step 3a): builds, checked on the Mac, not yet run on a console, 2026-11-12
+
+`builder/build-switch.sh game` builds `build/switch/z-cancel-nx.nro`: the bench's core, RSP plugin, forced
+netplay settings and frame driver (`bench/bench_core.c`, now shared by both programs) with RMG-K's GLideN64
+in place of the null video plugin. Files under `sdmc:/switch/z-cancel-nx/`: `rom.z64`, optional `inputs.txt`
+(the format of `bench/inputs/`), optional `z-cancel-nx.ini` (`scale=`, `rdram_check=1`, `vsync=`, `frames=`,
+`inputs=`, `cpu_mhz=`, `verbose=`), log in `latest.log`. Plus leaves. No sound, no controllers yet.
+
+- GLideN64 is RMG-K's revision with one patch (`patches/0006`: no `<dlfcn.h>`, the core found through the
+  static name table, POSIX semaphores). Built as mupen64plus-libretro-nx builds it for the Switch: desktop
+  OpenGL through EGL (`-DEGL -DOS_LINUX`), no threaded renderer; and without Qt (settings come from the
+  core's configuration, `mupenplus/Config_mupenplus.cpp`), texture packs and on-screen text.
+- The plugin gets its window from `switch/vidext_switch.c` (the core's video extension, `CoreOverrideVidExt`):
+  EGL on `nwindowGetDefault()`, 1280x720, the OpenGL 3.3 core context GLideN64 asks for (Mesa gives 4.3),
+  24-bit depth, swap interval 1. Context and every GL call live on the emulation thread. The swap paces
+  the game; the core's speed limiter is off (frames run without `M64FRAME_OUTPUT_PACING`), and a frame in
+  which the plugin does not swap waits out a refresh by the clock.
+- What RMG-K's players render with: nothing is forced or checked for a netplay session. RMG-K builds
+  GLideN64 with its Qt dialog, settings in `GLideN64.ini`; a fresh install has none and gets
+  `Config::resetToDefaults` (`Config.cpp:72`): frame buffer emulation off. With it off GLideN64 never writes
+  RDRAM for this game (`FrameBufferList::saveBuffer` returns at `FrameBuffer.cpp:793` before a current
+  buffer exists, and every copy hangs off that buffer). `GLideN64.custom.ini` has no entry for Smash.
+- Check build on the Mac (`builder/build-mac.sh arm64 game`, `build/mac-arm64/znx-game`): the same driver,
+  settings and patched GLideN64 drawing into an offscreen OpenGL 4.1 context, no window. The title, the
+  intro and the demo fight render correctly, 4:3 centred in 1280x720, and RDRAM hashes equal znx-bench's
+  at every 600th frame to 7,200, without input and through the scripted VS match: with frame buffer
+  emulation off the picture does not touch the emulated machine.
+- With frame buffer emulation on (`scale=1` or `2`), every copy option off, RDRAM differs from the bench
+  from frame 600 on (the plugin clears colour and depth images in RDRAM itself, `FrameBufferList::fillRDRAM`,
+  `FrameBuffer.cpp:1708`); scale 1 and 2 give the same hashes as each other. So a PC player who turned
+  frame buffer emulation on has different bytes in the framebuffer areas of RDRAM than one who did not.
+  Whether that can reach game logic is not known; it is another reason a raw RDRAM hash is not a desync
+  check. The Switch default is off, like a fresh RMG-K.
+- Untested: everything that is Horizon or Mesa: EGL on the console, nouveau with GLideN64's shaders,
+  the 4.3 code paths the Mac's 4.1 does not take (buffer storage), vsync pacing, speed with a picture.
+
+
+### Picture on the console, and Smash Remix, 2026-11-12
+
+Picture (`bash builder/build-switch.sh game` -> `build/switch/z-cancel-nx.nro`): GLideN64 on the
+console's OpenGL (nouveau NV120, OpenGL 4.3 core, Mesa 20.1), 1280x720, vsync. First run on the Erista:
+
+- the picture is right (How to Play demo and title checked from console screenshots);
+- every RDRAM hash to 7,200 equals the headless bench's, so the renderer does not touch the machine;
+- the emulation thread (core, RSP, GLideN64, GL driver's CPU side) runs 2.2 to 4.4 ms per frame; the
+  frame is paced by vsync at 59 to 60 fps. The driver waits for vsync somewhere other than
+  `eglSwapBuffers`, so "swap wait" in the log is near zero and the thread's own running time
+  (`the emulation thread ran ...`) is the number to read;
+- first-time spikes of 30 to 500 ms where new shaders compile (frame 118, scene changes): to fix with
+  a shader cache or by compiling ahead.
+
+Smash Remix: `xdelta3 -d -s <vanilla> <patch>` on the release patches gives ROMs whose MD5s are the ones
+in the releases' own ROM database entries and in RMG-K's `mupen64plus.ini` (Remix 2.0.1:
+2B2D6B295106C54216B7FC7A2F14346E, 65,536,000 bytes; Remix 2.0.1 +EXTRA 0.6.0:
+823DFA3414285939A44FD715413421F6, 80,421,504 bytes; both CountPerOp 1). Both patches are against the
+vanilla US ROM (MD5 F7C52568A31AADF26E14DC2B6416B2ED). On the console, 9,000 frames with a 7-frame
+rollback every 10 frames: 900 of 900 exact for each, load + 7 frames 8.6 and 8.7 ms (vanilla 8.6), and
+the hashes equal the Mac's. Their intro/demo frames cost about 1.25 ms without a picture (vanilla 1.0).
+
+Written but not yet linked in: `switch/audio_switch.c` (audio plugin: ring, resampling to 48 kHz,
+audout) and `switch/input_switch.c` (controllers as N64 BUTTONS; GameCube and Pro layouts).

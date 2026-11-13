@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* One line to nxlink (or the on-screen console) and to bench.log; printf format. */
+/* One line to nxlink (or the on-screen console) and to the log file; printf format (front_switch.c). */
 void znx_log(const char* format, ...) __attribute__((format(printf, 1, 2)));
 
 /* jit_switch.c */
@@ -16,7 +16,7 @@ int znx_jit_map(size_t size, void** rw, void** rx);
 void znx_jit_unmap(void* rw, void* rx, size_t size);
 
 /* dynlib_static.c: the handles CoreAttachPlugin takes, by name ("core", "rsp_hle",
- * "video_null"), and the lookup that replaces dlsym. */
+ * "video_null", "gliden64"), and the lookup that replaces dlsym. */
 void* znx_static_lib(const char* name);
 void* osal_dynlib_getproc(void* lib, const char* name);
 

@@ -13,7 +13,7 @@ order things get tested in are in [docs/PLAN.md](docs/PLAN.md).
 |---|---|
 | 1. Speed test: RMG-K's emulator core on the Switch, no picture | done: 0.8 ms per frame in a fight; a 7-frame rollback costs 8.6 ms |
 | 2. Determinism rig: ARM64 against x86-64, same inputs, state hashed every frame | a 3-minute mashed VS match stays identical outside saved register slots |
-| 3. Picture, sound, controllers | not started |
+| 3. Picture, sound, controllers | picture: builds for the Switch (RMG-K's GLideN64 on the console's OpenGL) and is verified on a Mac to leave the emulated state untouched; not yet run on a console |
 | 4. Netplay: rollback, connect codes, lobby | not started |
 | 5. Cross-play against RMG-K on a PC | not started |
 | 6. ROM picker and on-device Remix patching | not started |

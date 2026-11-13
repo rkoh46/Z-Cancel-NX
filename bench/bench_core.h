@@ -18,7 +18,7 @@ struct znx_window {
 struct znx_options {
     const char* rom_path;
     const char* inputs_path;   /* or NULL */
-    int frames;                /* frames (vertical interrupts) to run */
+    int frames;                /* frames (vertical interrupts) to run; 0 = until znx_bench_stop() */
     int hash_every;            /* "hash" line every K frames, 0 = never */
     int emumode;               /* 2 recompiler in a rollback session; 0/1 interpreters */
     int verbose;               /* also pass the core's info and verbose messages on */
@@ -35,6 +35,8 @@ struct znx_options {
     int window_count;
 };
 
+struct znx_config;
+
 struct znx_host {
     /* Library handles in the form CoreAttachPlugin wants them, and the way to look a
      * function up in one: dlopen/dlsym on the Mac, the static tables on the Switch. */
@@ -46,12 +48,31 @@ struct znx_host {
     void (*print)(int is_error, const char* line);
     const char* data_dir;      /* holds mupen64plus.ini, the core's ROM database */
     const char* user_dir;      /* scratch profile; must exist */
+
+    /* The rest is for a program that shows a picture (game/); znx-bench leaves it zero. */
+    const char* name;          /* prefix of diagnostics, "znx-bench" when NULL */
+    /* An m64p_video_extension_functions table for CoreOverrideVidExt: how the video plugin
+     * gets its window and OpenGL context from this program instead of from SDL. */
+    void* vidext;
+    /* Called after the video plugin's PluginStartup (its settings exist with their defaults)
+     * and before it is attached: write the plugin's settings. Non-zero stops the run. */
+    int (*video_config)(const struct znx_config* config);
+    /* Called on the emulation thread after every completed frame with the number of frames
+     * completed and the time the frame took (begin_frame to end_frame), before hashing. */
+    void (*frame_done)(int frames, uint64_t frame_ns);
+};
+
+/* The core's configuration, for znx_host.video_config. Each returns 0 on success. */
+struct znx_config {
+    int (*set_int)(const char* section, const char* name, int value);
+    int (*set_bool)(const char* section, const char* name, int value);
+    int (*set_string)(const char* section, const char* name, const char* value);
 };
 
 void znx_options_defaults(struct znx_options* options);
 
-/* Runs the whole measurement on the calling thread. Returns 0 when every frame ran and
- * the rollback test (if any) passed. */
+/* Runs the whole measurement on the calling thread. Returns 0 when every frame ran (or, with
+ * frames = 0, when the run was stopped) and the rollback test (if any) passed. */
 int znx_bench_run(const struct znx_host* host, const struct znx_options* options);
 
 /* For a watchdog on another thread. znx_bench_stall_ns: how long the frame (or replayed

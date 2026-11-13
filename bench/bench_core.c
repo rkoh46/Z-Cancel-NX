@@ -50,6 +50,7 @@ static ptr_ConfigOpenSection  ConfigOpenSection;
 static ptr_ConfigSetParameter ConfigSetParameter;
 static ptr_ConfigOverrideUserPaths ConfigOverrideUserPaths;
 static ptr_DebugMemGetPointer DebugMemGetPointer;
+static const char* l_name = "znx-bench";
 
 /* ---- run state ---- */
 
@@ -77,6 +78,7 @@ static uint64_t l_st_begin;
 
 static uint32_t* l_frame_us10; /* time of every frame in units of 0.1 us */
 static uint64_t l_frame_begin; /* when the frame in flight started, 0 between frames */
+static uint64_t l_frame_ns;    /* time of the frame that just ended */
 static uint64_t l_emu_ns;      /* sum of all frame times */
 static uint64_t l_progress_ns; /* frame time since the last progress line */
 static volatile uint64_t l_alive_ns; /* start of the frame or replayed frame in flight, 0 = idle */
@@ -321,7 +323,8 @@ static void frame_timer_stop(void)
     l_alive_ns = 0;
     l_emu_ns += ns;
     l_progress_ns += ns;
-    if (l_frame >= 0 && l_frame < l_opt.frames)
+    l_frame_ns = ns;
+    if (l_frame_us10 != NULL && l_frame >= 0 && l_frame < l_opt.frames)
         l_frame_us10[l_frame] = ns / 100 > 0xffffffffull ? 0xffffffffu : (uint32_t)(ns / 100);
 }
 
@@ -347,7 +350,7 @@ static int begin_frame(void* user)
         else if (l_frame == l_opt.rb_b)
             rollback_replay();
     }
-    if (l_frame >= l_opt.frames || l_failed || l_stop) {
+    if ((l_opt.frames > 0 && l_frame >= l_opt.frames) || l_failed || l_stop) {
         l_alive_ns = 0;
         return 0;
     }
@@ -359,6 +362,8 @@ static int begin_frame(void* user)
 static void frame_done(void)
 {
     l_frame++;
+    if (l_host->frame_done != NULL)
+        l_host->frame_done(l_frame, l_frame_ns);
     if (l_rb_hashes != NULL && !l_rb_done && l_frame <= l_opt.rb_b)
         l_rb_hashes[l_frame - l_opt.rb_a] = check_rdram();
     if (l_opt.hash_every > 0 && l_frame % l_opt.hash_every == 0)
@@ -371,7 +376,7 @@ static void frame_done(void)
             ? check_rdram_range(0, lo, 1) ^ (check_rdram_range(hi, RDRAM_SIZE, 2) * 11) : whole;
         out("check %d %016llx %016llx", l_frame, (unsigned long long)whole, (unsigned long long)rest);
     }
-    if (l_opt.progress_every > 0 && l_frame % l_opt.progress_every == 0) {
+    if (l_opt.progress_every > 0 && l_frame % l_opt.progress_every == 0 && l_opt.frames > 0) {
         out("progress %d of %d, %.3f ms/frame over the last %d", l_frame, l_opt.frames,
             l_progress_ns / 1e6 / l_opt.progress_every, l_opt.progress_every);
         l_progress_ns = 0;
@@ -379,7 +384,7 @@ static void frame_done(void)
     if (l_frame == l_opt.dump_frame) {
         FILE* f = fopen(l_opt.dump_path, "wb");
         if (f == NULL || fwrite(l_rdram, 1, RDRAM_SIZE, f) != RDRAM_SIZE)
-            err("znx-bench: cannot write %s", l_opt.dump_path);
+            err("%s: cannot write %s", l_name, l_opt.dump_path);
         if (f != NULL)
             fclose(f);
     }
@@ -407,11 +412,11 @@ static void plain_frame_callback(unsigned int index)
 {
     (void)index;
     first_frame_setup();
-    if (l_frame >= l_opt.frames)
+    if (l_opt.frames > 0 && l_frame >= l_opt.frames)
         return;
     frame_timer_stop();
     frame_done();
-    if (l_frame >= l_opt.frames || l_stop)
+    if ((l_opt.frames > 0 && l_frame >= l_opt.frames) || l_stop)
         CoreDoCommand(M64CMD_STOP, 0, NULL);
     else
         frame_timer_start();
@@ -421,7 +426,7 @@ static void plain_frame_callback(unsigned int index)
 
 static int fail(const char* what, m64p_error error)
 {
-    err("znx-bench: %s: %s", what, CoreErrorMessage ? CoreErrorMessage(error) : "error");
+    err("%s: %s: %s", l_name, what, CoreErrorMessage ? CoreErrorMessage(error) : "error");
     return 1;
 }
 
@@ -429,7 +434,7 @@ static void* sym(void* lib, const char* name)
 {
     void* p = l_host->sym(lib, name);
     if (p == NULL)
-        err("znx-bench: %s is missing from the library", name);
+        err("%s: %s is missing from the library", l_name, name);
     return p;
 }
 
@@ -438,7 +443,7 @@ static void* read_file(const char* path, long* size)
     FILE* f = fopen(path, "rb");
     void* data;
     if (f == NULL) {
-        err("znx-bench: cannot open %s: %s", path, strerror(errno));
+        err("%s: cannot open %s: %s", l_name, path, strerror(errno));
         return NULL;
     }
     fseek(f, 0, SEEK_END);
@@ -446,7 +451,7 @@ static void* read_file(const char* path, long* size)
     fseek(f, 0, SEEK_SET);
     data = *size > 0 ? malloc((size_t)*size) : NULL;
     if (data == NULL || fread(data, 1, (size_t)*size, f) != (size_t)*size) {
-        err("znx-bench: cannot read %s", path);
+        err("%s: cannot read %s", l_name, path);
         free(data);
         data = NULL;
     }
@@ -464,7 +469,7 @@ static int load_inputs(const char* path)
     char line[256];
     int lineno = 0;
     if (f == NULL) {
-        err("znx-bench: cannot open %s: %s", path, strerror(errno));
+        err("%s: cannot open %s: %s", l_name, path, strerror(errno));
         return 1;
     }
     while (fgets(line, sizeof(line), f) != NULL) {
@@ -477,7 +482,7 @@ static int load_inputs(const char* path)
         if (line[strspn(line, " \t\r\n")] == '\0')
             continue;
         if (sscanf(line, "%d %d %x", &frame, &player, &value) != 3 || frame < 0 || player < 1 || player > MAX_PLAYERS) {
-            err("znx-bench: %s:%d: expected \"frame player(1-4) buttons_hex\"", path, lineno);
+            err("%s: %s:%d: expected \"frame player(1-4) buttons_hex\"", l_name, path, lineno);
             fclose(f);
             return 1;
         }
@@ -503,6 +508,33 @@ static int set_bool(m64p_handle section, const char* name, int value)
     m64p_error error = ConfigSetParameter(section, name, M64TYPE_BOOL, &value);
     return error == M64ERR_SUCCESS ? 0 : fail(name, error);
 }
+
+/* znx_config, for the host's video_config: the same, by section name. */
+static int config_set(const char* section, const char* name, m64p_type type, const void* value)
+{
+    m64p_handle handle;
+    m64p_error error = ConfigOpenSection(section, &handle);
+    if (error == M64ERR_SUCCESS)
+        error = ConfigSetParameter(handle, name, type, value);
+    return error == M64ERR_SUCCESS ? 0 : fail(name, error);
+}
+
+static int config_set_int(const char* section, const char* name, int value)
+{
+    return config_set(section, name, M64TYPE_INT, &value);
+}
+
+static int config_set_bool(const char* section, const char* name, int value)
+{
+    return config_set(section, name, M64TYPE_BOOL, &value);
+}
+
+static int config_set_string(const char* section, const char* name, const char* value)
+{
+    return config_set(section, name, M64TYPE_STRING, value);
+}
+
+static const struct znx_config l_config_api = { config_set_int, config_set_bool, config_set_string };
 
 static void print_windows(void)
 {
@@ -531,33 +563,41 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
     char user_dir[4200];
     m64p_error error;
     m64p_handle core_cfg;
-    ptr_PluginStartup rsp_startup;
-    ptr_PluginShutdown rsp_shutdown;
-    int rom_open = 0, video_attached = 0, rsp_attached = 0, rsp_started = 0;
+    ptr_PluginStartup rsp_startup, video_startup;
+    ptr_PluginShutdown rsp_shutdown, video_shutdown;
+    int rom_open = 0, video_attached = 0, rsp_attached = 0, rsp_started = 0, video_started = 0;
 
     l_host = host;
+    l_name = host->name != NULL ? host->name : "znx-bench";
     l_opt = *options;
     l_frame = 0;
     l_failed = 0;
+    l_stop = 0;
     l_watch_last = -1;
 
-    if (l_opt.rom_path == NULL || l_opt.frames <= 0) {
-        err("znx-bench: a ROM and a positive frame count are needed");
+    if (l_opt.rom_path == NULL || l_opt.frames < 0) {
+        err("%s: a ROM and a frame count are needed", l_name);
+        return 2;
+    }
+    if (l_opt.frames == 0 && (l_opt.rb_a >= 0 || l_opt.emumode < 2)) {
+        err("%s: a run without a frame count has no rollback test and needs the rollback session", l_name);
         return 2;
     }
     if (l_opt.rb_a >= 0 && (l_opt.rb_b <= l_opt.rb_a || l_opt.rb_b > l_opt.frames)) {
-        err("znx-bench: the rollback test needs 0 <= A < B <= frames");
+        err("%s: the rollback test needs 0 <= A < B <= frames", l_name);
         return 2;
     }
     if (l_opt.rb_a >= 0 && l_opt.emumode < 2) {
-        err("znx-bench: the rollback test needs the rollback session (cpu 2)");
+        err("%s: the rollback test needs the rollback session (cpu 2)", l_name);
         return 2;
     }
     if (l_opt.inputs_path != NULL && load_inputs(l_opt.inputs_path) != 0)
         return 1;
-    l_frame_us10 = calloc((size_t)l_opt.frames, sizeof(*l_frame_us10));
-    if (l_frame_us10 == NULL)
-        return 1;
+    if (l_opt.frames > 0) {   /* a run without an end keeps no per-frame times */
+        l_frame_us10 = calloc((size_t)l_opt.frames, sizeof(*l_frame_us10));
+        if (l_frame_us10 == NULL)
+            return 1;
+    }
 
     CoreErrorMessage = sym(host->core, "CoreErrorMessage");
     CoreStartup = sym(host->core, "CoreStartup");
@@ -571,6 +611,10 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
     DebugMemGetPointer = sym(host->core, "DebugMemGetPointer");
     rsp_startup = sym(host->rsp, "PluginStartup");
     rsp_shutdown = sym(host->rsp, "PluginShutdown");
+    video_startup = sym(host->video, "PluginStartup");
+    video_shutdown = sym(host->video, "PluginShutdown");
+    if (!video_startup || !video_shutdown)
+        return 1;
     if (!CoreErrorMessage || !CoreStartup || !CoreShutdown || !CoreDoCommand || !CoreAttachPlugin ||
         !CoreDetachPlugin || !ConfigOpenSection || !ConfigSetParameter || !ConfigOverrideUserPaths ||
         !DebugMemGetPointer || !rsp_startup || !rsp_shutdown)
@@ -581,6 +625,14 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         return fail("CoreStartup", error);
     snprintf(user_dir, sizeof(user_dir), "%s/", host->user_dir); /* the core appends "save/" and friends without a separator */
     ConfigOverrideUserPaths(user_dir, user_dir);
+    if (host->vidext != NULL) {
+        ptr_CoreOverrideVidExt override_vidext = sym(host->core, "CoreOverrideVidExt");
+        error = override_vidext != NULL ? override_vidext(host->vidext) : M64ERR_INPUT_NOT_FOUND;
+        if (error != M64ERR_SUCCESS) {
+            l_failed = fail("CoreOverrideVidExt", error);
+            goto shutdown;
+        }
+    }
 
     /* What RMG-K forces for a netplay or rollback session (Emulation.cpp,
      * apply_kaillera_deterministic_settings and the local rollback branch). */
@@ -621,9 +673,20 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
     }
 
     /* Video: znx-video-null, which draws nothing but tells the core each display list is
-     * done (the core's own dummy plugin does not, and the game then waits for ever).
+     * done (the core's own dummy plugin does not, and the game then waits for ever), or a
+     * real plugin whose settings the host writes once the plugin has declared them.
      * Audio and input stay unattached: the core uses its dummy plugins (src/plugin/plugin.c).
      * RSP: the HLE plugin. Order as in any front end: video, audio, input, RSP. */
+    error = video_startup(host->core, "video", debug_callback);
+    if (error != M64ERR_SUCCESS) {
+        l_failed = fail("video PluginStartup", error);
+        goto shutdown;
+    }
+    video_started = 1;
+    if (host->video_config != NULL && host->video_config(&l_config_api) != 0) {
+        l_failed = 1;
+        goto shutdown;
+    }
     error = CoreAttachPlugin(M64PLUGIN_GFX, host->video);
     if (error != M64ERR_SUCCESS) {
         l_failed = fail("CoreAttachPlugin(video)", error);
@@ -690,7 +753,7 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         l_frame_begin = 0;
         l_alive_ns = 0;
         if (error != M64ERR_SUCCESS) {
-            err("znx-bench: execute: %s", CoreErrorMessage(error));
+            err("%s: execute: %s", l_name, CoreErrorMessage(error));
             l_failed = 1;
         }
 
@@ -712,8 +775,8 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
                 (l_st_load_ns + l_st_replay_ns) / 1e6 / l_st_count, l_st_total_worst / 1e6);
         }
         print_windows();
-        if (l_frame < l_opt.frames) {
-            err("znx-bench: stopped after %d of %d frames", l_frame, l_opt.frames);
+        if (l_opt.frames > 0 && l_frame < l_opt.frames) {
+            err("%s: stopped after %d of %d frames", l_name, l_frame, l_opt.frames);
             l_failed = 1;
         }
     }
@@ -727,6 +790,8 @@ shutdown:
         CoreDetachPlugin(M64PLUGIN_RSP);
     if (rsp_started)
         rsp_shutdown();
+    if (video_started)
+        video_shutdown();
     if (rom_open)
         CoreDoCommand(M64CMD_ROM_CLOSE, 0, NULL);
     CoreShutdown();
