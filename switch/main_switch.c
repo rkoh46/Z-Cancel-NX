@@ -61,6 +61,9 @@ static bool ini_key(const char* key, const char* value, void* user)
         if (sscanf(value, "%d ,%d", &k, &d) == 2 && k > d && d > 0) { s->options.stress_every = k; s->options.stress_depth = d; s->options.rb_a = s->options.rb_b = -1; }
     }
     else if (!strcmp(key, "verbose")) s->options.verbose = atoi(value);
+    else if (!strcmp(key, "precompile_ms")) s->options.precompile_ms = atoi(value);   /* 0: only record the warm list */
+    else if (!strcmp(key, "precompile_big")) s->options.precompile_big = atoi(value) != 0;
+    else if (!strcmp(key, "warm")) s->options.warm_off = atoi(value) == 0;             /* warm=0: no warm list at all */
     else return false;
     return true;
 }
@@ -105,6 +108,7 @@ int main(int argc, char** argv)
     host.print = znx_front_print;
     host.data_dir = "romfs:/data";
     host.user_dir = ZNX_BASE_DIR "/profile";
+    host.warm_dir = "romfs:/data/warm";
 
     if (settings.options.rom_path == NULL)
         ;

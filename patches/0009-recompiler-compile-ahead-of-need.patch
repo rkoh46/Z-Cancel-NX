@@ -1,0 +1,1193 @@
+Recompiler: compile ahead of need from a per-ROM warm list
+
+On a Switch (Cortex-A57) a block costs about 0.5 ms to compile, and the only frames of a match that
+miss 16.7 ms are those that compile blocks for the first time (a frame with 68 new blocks: 59 ms).
+Every start of the emulator and every newly loaded piece of game code pays that again.
+
+What this adds
+- Recording: new_recompile_block notes every block it compiles as (address as it was asked for,
+  length of the source in bytes, checksum of the source words), without duplicates.
+  new_dynarec_warm_load/read/reset move the list in and out; api/debugger.c exports them as
+  DebugDynarecWarmLoad/Read/Reset, with DebugDynarecPrecompile, DebugDynarecWarmStats and
+  DebugDynarecWarmConfig (1 verify mode, 2 hash the generated code). A front end keeps the list
+  per ROM. It holds no game code.
+- Compiling ahead: new_dynarec_warm_precompile(budget_us, oversized_us) compiles listed blocks whose source is in
+  RDRAM now (kseg0 addresses; the checksum must be equal), with the length the list gives, until the
+  budget is used; a block is only started when the time it should take (a running average per
+  instruction, times 1.5) is left. A block that should take longer than a whole budget (the lists
+  have about thirty of over 430 instructions, up to 2,728) waits for a call with more: a larger
+  budget, or the second argument, the time the caller will give to one such block compiled alone
+  in a call. Entries whose source is not there stay pending.
+- Cheap when there is nothing to do: entries are indexed by the RDRAM page they start in, and a
+  page's entries are looked at only after something that can have brought code there: a DMA into
+  the page (invalidate_cached_code_new_dynarec with a size, which the cartridge and disk DMAs call),
+  a write to a page that holds compiled code (invalidate_block; also how a rollback load reports
+  the pages it changed, patch 0005), a full invalidation (a state load: every page), a compile on
+  demand (the block's pages; every page when the list knew the block, since then code arrived
+  unseen, copied by the CPU), and one page per call in rotation as a net. With nothing pending the
+  call returns at once.
+
+How a block compiled ahead is kept, and why that is safe
+A block compiled ahead (a "shadow") goes through the same passes, at `out`, where the next block
+would go; then its code is copied to the heap as data and `out` is put back. Pass 10 is not run.
+(a) Where the call may be made. In a rollback session the frame callbacks run in r4300_core.c's
+    loop after new_dyna_start/new_dyna_resume has returned: new_dyna_stop has unwound the generated
+    code and the next frame goes in through get_addr_ht(pcaddr), so no block is on the stack. The
+    function does not rely on that, though. It writes: the bytes from `out` on (free space by the
+    cache's own rule; the next compile writes there, and the 256K after `out` are what the wrap
+    check keeps available), its own heap data, and the compiler's scratch arrays, which are idle
+    between two blocks. It does not expire anything, patches no jump of any existing block (no
+    add_link, no kill_pointer; set_jump_target only inside the scratch code), frees no list entry
+    and flushes nothing. So no block that is going to be resumed, and nothing the rollback code
+    relies on, can change under it. It must be called on the emulation thread and not from inside
+    a compile.
+(b) No emulated state. The compiler reads RDRAM and, for a shadow, leaves alone: the registers,
+    hi/lo, cp0, cp1, the cycle count and next_interrupt, pending_exception, the interrupt queue,
+    the TLB, memory_map, invalid_code, mini_ht, the hash table, jump_in, jump_dirty, jump_out,
+    restore_candidate and the expiry pointer; stop_after_jal is saved and put back (a shadow notes
+    that its compile would have set it; the flag is set when the shadow is adopted, which is when a
+    compile on demand would have set it). Pages are write protected when a block is adopted, i.e.
+    at the moment a compile on demand protects them, not when a shadow is made: a guest write to
+    such a page neither traps nor invalidates anything, as without a list, and if it changed the
+    block's words the shadow no longer matches. What the guest can time is not touched: the count
+    register advances by constants compiled into the code, per instruction, and interrupts are
+    taken at the same branches whenever the block was compiled.
+(c) The same blocks as without a list. When the game asks for an address, new_recompile_block runs
+    pass 1 as always, so the block's extent is decided by what is compiled at that moment
+    (check_addr) and by stop_after_jal, exactly as without a list. Only then is a shadow looked for,
+    by start address, length, using_tlb and the source words themselves (memcmp). Its code is copied
+    to `out` with every pc-relative reference to a place outside the block re-encoded for the new
+    address (warm_relocate: b/bl, b.cond, cbz, tbz, ldr literal, adr, adrp; the block's own
+    references and its literal pool need no change), and the compile goes on from the linker pass:
+    exits are linked to what exists now (check_addr asked with `out` where a compile stands at that
+    exit), the entry points go into jump_dirty, jump_in and the hash table in the same order, then
+    the common end: cache flush, wrap check, write protection, pass 10. The cache then holds, at the
+    same address, what a full compile at that moment would have put there. A run with a list
+    therefore compiles the same sequence of blocks, of the same shapes, at the same cache positions
+    as a run without one, across cache wraps too, and executes the same code.
+    That needs the compiler to be a function of the block alone, which it was not:
+    - passes 3 to 7 read regs[] entries not yet written in this compile (register maps of later
+      instructions, and the entry after the last instruction), i.e. what the previous compile left
+      there: about 2% of blocks got another register allocation depending on the order of compiles.
+      They now start from the same state every time.
+    - the dirty stubs loaded their list node's address in one of three forms depending on where
+      malloc had put the node (arm64/assem_arm64.c), so block sizes and with them the layout of the
+      cache differed from run to run. They always use the literal pool now.
+    Both change generated host code against the unpatched core (register choice in a few blocks,
+    one instruction instead of two in dirty stubs); every RDRAM hash and checksum of the harness is
+    unchanged.
+    Checked on the Mac: (1) with DebugDynarecWarmConfig(2) the core hashes every block as it enters
+    the cache (without its literal pool); with address randomization off that hash is the same
+    with and without compiling ahead (znx-bench --no-aslr --code-hash), i.e. the cache receives the
+    same code in the same order; (2) in verify mode (config 1) every shadow the game asks for is
+    compiled in full as well and compared word for word with the shadow moved to that address:
+    none of about 2,900 differ in a 17,000-frame match; (3) the same with all 37 scratch arrays of the compiler
+    overwritten with junk before every compile, other junk for shadows than for compiles on demand
+    (seven pairs of values): the same code hash each time, 0 differ.
+(d) Rollback loads and state loads (patches 0004, 0005). Shadows are in no list, so
+    new_dynarec_rollback_note_ram and the invalidations see exactly what they see without them. A
+    load only marks pages to be looked at again; a shadow whose source the load changed does not
+    match until the code is back. Adopted blocks are ordinary blocks.
+
+Limits: blocks in kseg0 RDRAM only, not those starting in a delay slot or spanning the end of a
+mapping (they are recorded, and compiled on demand); moving code is written for ARM64 only, so the
+other back ends record but do not compile ahead; at most 64 MB of shadow code is kept. Code that is
+loaded and first run within one frame is still compiled in that frame.
+
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
+@@ -310,6 +310,11 @@
+ static struct ll_entry *jump_out[4096];
+ static unsigned char restore_candidate[512];
+ static struct new_dynarec_rollback_stats rollback_stats;
++
++/* Warm list (see "Z-Cancel NX: warm list" below): RDRAM pages whose pending entries need another look. */
++static int warm_count;
++static void warm_mark_range(u_int first, u_int last);
++static void warm_mark_all(void);
+ 
+ /*
+  * Keep the low-overhead call counters, but do not time these dynarec paths.
+@@ -2427,6 +2432,13 @@
+   new_entry->next=*head;
+   *head=new_entry;
+   return new_entry;
++}
++
++// The same entry, not (yet) in a list: a shadow block's, entered when the block is adopted
++static struct ll_entry *ll_new_32(int vaddr,u_int reg32,void *addr,void *clean_addr,u_int start,void *copy,u_int length)
++{
++  struct ll_entry *head=NULL;
++  return ll_add_32(&head,vaddr,reg32,addr,clean_addr,start,copy,length);
+ }
+ 
+ // Add virtual address mapping to linked list
+@@ -2887,6 +2899,7 @@
+   page=block^0x80000;
+   if(block<0x100000&&page>262143&&g_dev.r4300.cp0.tlb.LUT_r[block]) page=(g_dev.r4300.cp0.tlb.LUT_r[block]^0x80000000)>>12;
+   if(page>2048) page=2048+(page&2047);
++  if(page<2048) warm_mark_range(page,page);
+   inv_debug("INVALIDATE: %x (%d)\n",block<<12,page);
+   u_int first,last;
+   first=last=page;
+@@ -3048,10 +3061,14 @@
+     {
+         rollback_stats.full_invalidate_count++;
+         invalidate_all_pages();
++        warm_mark_all();
+     }
+     else
+     {
+         rollback_stats.range_invalidate_count++;
++        // RDRAM was written from outside the CPU (a DMA from the cartridge): code may have arrived.
++        if((address&0xc0000000)==0x80000000&&(address&0x1fffffff)<0x800000)
++            warm_mark_range((address&0x1fffffff)>>12,((address&0x1fffffff)+size-1)>>12);
+         begin = address >> 12;
+         end = (address+size-1) >> 12;
+ 
+@@ -8751,8 +8768,572 @@
+   set_jump_target(branch,(intptr_t)out);
+   store_regs_bt(regs[0].regmap,regs[0].is32,regs[0].dirty,start+4);
+   load_regs_bt(regs[0].regmap,regs[0].is32,regs[0].dirty,start+4);
++}
++
++/**** Z-Cancel NX: warm list (compile ahead of need) ****/
++// The only frames that miss 16.7 ms on a Switch are the ones that compile blocks for the first
++// time (about 0.5 ms a block on a Cortex-A57). So: every compile is recorded as (address, source
++// length, checksum of the source words); the front end keeps that list per ROM and loads it at
++// the next start; and in the idle time after a frame new_dynarec_warm_precompile() compiles the
++// listed blocks whose source is in RAM right now, before the game asks for them.
++//
++// A block compiled ahead is a "shadow". It is generated by the same passes at `out`, where the
++// next block would go, but then its code is copied away as plain data and `out` is put back:
++// the code cache, jump_in, jump_dirty, jump_out, the hash table, the write protection of pages,
++// the expiry pointer, and so everything the running game can reach, are exactly as before the
++// call (the bytes past `out` are free space, which the next compile overwrites anyway).
++// When the game asks for a block, new_recompile_block() runs its first pass as always, so the
++// block's extent is decided as without a list: by what is compiled at that moment. If a shadow
++// with that address, that length and those source words exists, its code is copied to `out`
++// with its references to places outside the block adjusted (warm_relocate), and the compile goes
++// on from its linker pass: exits linked to what exists now, entry points entered, the cache
++// flushed, the pages protected, old blocks expired. The code cache then holds what a full compile
++// at that moment would have put there, at the same place; passes 2 to 8 are the same function of
++// the same input. So a run with a list goes through the same blocks, of the same shape, at the
++// same cache positions as a run without one, for as long as it lasts, and nothing the guest can
++// observe differs. See the patch description for the argument in full.
++#define WARM_PAGES 2048               // RDRAM pages; only kseg0 RDRAM blocks are compiled ahead
++#define WARM_SHADOW_BINS 4096
++#define WARM_SHADOW_LIMIT (64u<<20)   // bytes of shadow code kept at most
++
++struct warm_entry
++{
++  u_int addr;     // as passed to new_recompile_block (bit 0: starts in a delay slot)
++  u_int len;      // source bytes
++  u_int sum;      // warm_sum() of the source words
++  int page_next;  // next entry starting in the same page (index+1, 0 = end)
++  u_char done;    // compiled (on demand or ahead) in this session: not pending
++};
++
++struct warm_link { u_int jump; u_int stub; u_int target; u_int linkable; }; // jump, stub: offsets in the code
++struct warm_node { struct ll_entry *dirty; struct ll_entry *in; u_int page; u_int vpage; u_int hash; };
++struct warm_shadow
++{
++  struct warm_shadow *next;
++  u_int addr;
++  u_int slen;
++  u_int tlb;            // using_tlb when it was compiled (changes the code of loads and stores)
++  u_int sets_saj;       // the compile set stop_after_jal (delayslot_alloc)
++  char *copy;           // the source it was compiled from, as every block keeps it
++  u_char *code;         // the generated code, as data
++  u_char *origin;       // where in the cache it was generated: as it is, it would run there
++  u_int size, lit;      // bytes of code; where its literal pool starts
++  struct warm_link *links;
++  struct warm_node *nodes;
++  int nlinks, nnodes;
++};
++
++static struct warm_entry *warm_list;
++static int warm_cap;
++static int *warm_set;                 // open addressing, index+1
++static u_int warm_set_size;
++static int warm_page_head[WARM_PAGES];
++static u_char warm_page_span[WARM_PAGES];   // pages the longest entry of this page reaches past it
++static u_char warm_page_dirty[WARM_PAGES];
++static u_short warm_queue[WARM_PAGES];
++static u_int warm_q_head, warm_q_count;
++static int warm_cursor;               // where in the page at the head of the queue to go on (index+1)
++static int warm_cursor_waiting;       //   and whether that page has a block waiting for a call with more time
++static u_int warm_rotate;
++static struct warm_shadow *warm_shadows[WARM_SHADOW_BINS];
++static int warm_shadow_count;
++static size_t warm_shadow_bytes;
++static int warm_pending;              // entries that could be compiled ahead and are not done
++static int warm_active;               // between new_dynarec_init and new_dynarec_cleanup
++static int warm_flags;                // 1: verify (compile anyway and compare with the shadow), 2: hash the generated code
++static double warm_us_per_word = 8.0; // running cost of a compile, to stay inside the budget
++// What new_recompile_block's body is doing: 0 a compile on demand, else the forced length of a shadow.
++static u_int warm_shadow_slen;
++static struct
++{
++  uint64_t loaded, shadows, shadow_failed, adopted, full, full_known, precompile_us, tests, calls, oversized;
++  uint64_t verify_bad, verified, code_bytes, code_hash, size_hash, analysis_hash, adopt_us;
++} warm_stats;
++
++static u_int warm_sum(const u_int *words, u_int count)
++{
++  u_int h=0x811c9dc5u^count, i;
++  for(i=0;i<count;i++) { h=(h^words[i])*0x9e3779b1u; h^=h>>15; }
++  return h;
++}
++
++static int warm_can_precompile(u_int addr, u_int len)
++{
++#if NEW_DYNAREC == NEW_DYNAREC_ARM64
++  return addr>=0x80000000u&&addr<0x80800000u&&(addr&3)==0&&len>=4&&(len&3)==0&&
++         len<=(MAXBLOCK-2)*4&&addr+len<=0x80800000u-8;
++#else
++  (void)addr; (void)len;
++  return 0; // moving generated code is written for ARM64 only (warm_relocate)
++#endif
++}
++
++static void warm_set_done(struct warm_entry *e)
++{
++  if(!e->done) {
++    e->done=1;
++    if(warm_can_precompile(e->addr,e->len)) warm_pending--;
++  }
++}
++
++static u_int warm_slot(u_int addr, u_int len, u_int sum)
++{
++  u_int h=(addr*0x9e3779b1u)^(len*0x85ebca6bu)^sum;
++  return (h^(h>>16))&(warm_set_size-1);
++}
++
++static void warm_set_grow(void)
++{
++  u_int size=warm_set_size?warm_set_size*2:4096;
++  int *table=(int *)calloc(size,sizeof(int));
++  int i;
++  assert(table!=NULL);
++  free(warm_set);
++  warm_set=table;
++  warm_set_size=size;
++  for(i=0;i<warm_count;i++) {
++    u_int s=warm_slot(warm_list[i].addr,warm_list[i].len,warm_list[i].sum);
++    while(warm_set[s]) s=(s+1)&(warm_set_size-1);
++    warm_set[s]=i+1;
++  }
++}
++
++// The entry's index, or -1.
++static int warm_find(u_int addr, u_int len, u_int sum)
++{
++  u_int s;
++  if(!warm_set_size) return -1;
++  s=warm_slot(addr,len,sum);
++  while(warm_set[s]) {
++    const struct warm_entry *e=&warm_list[warm_set[s]-1];
++    if(e->addr==addr&&e->len==len&&e->sum==sum) return warm_set[s]-1;
++    s=(s+1)&(warm_set_size-1);
++  }
++  return -1;
++}
++
++// Adds the entry if it is new. Returns its index; *known says whether it was there already.
++static int warm_add(u_int addr, u_int len, u_int sum, int *known)
++{
++  int index=warm_find(addr,len,sum);
++  struct warm_entry *e;
++  u_int s;
++  if(known) *known=index>=0;
++  if(index>=0) return index;
++  if(warm_count==warm_cap) {
++    warm_cap=warm_cap?warm_cap*2:4096;
++    warm_list=(struct warm_entry *)realloc(warm_list,warm_cap*sizeof(struct warm_entry));
++    assert(warm_list!=NULL);
++  }
++  if((u_int)(warm_count+1)*2>warm_set_size) warm_set_grow();
++  index=warm_count++;
++  e=&warm_list[index];
++  e->addr=addr; e->len=len; e->sum=sum; e->page_next=0; e->done=0;
++  s=warm_slot(addr,len,sum);
++  while(warm_set[s]) s=(s+1)&(warm_set_size-1);
++  warm_set[s]=index+1;
++  if(warm_can_precompile(addr,len)) {
++    u_int page=(addr-0x80000000u)>>12;
++    u_int span=((addr+len-4-0x80000000u)>>12)-page;
++    e->page_next=warm_page_head[page];
++    warm_page_head[page]=index+1;
++    if(span>warm_page_span[page]) warm_page_span[page]=span;
++    warm_pending++;
++  }
++  return index;
++}
++
++static void warm_mark_page(u_int page)
++{
++  if(page<WARM_PAGES&&warm_page_head[page]&&!warm_page_dirty[page]) {
++    warm_page_dirty[page]=1;
++    warm_queue[(warm_q_head+warm_q_count)%WARM_PAGES]=page;
++    warm_q_count++;
++  }
++}
++
++// RDRAM pages first..last may hold new code: their pending entries are tested again, and so are
++// those of the pages before whose blocks reach into them.
++static void warm_mark_range(u_int first, u_int last)
++{
++  u_int k,page;
++  if(!warm_pending) return;
++  if(last>=WARM_PAGES) last=WARM_PAGES-1;
++  for(k=1;k<=4&&k<=first;k++)
++    if(warm_page_span[first-k]>=k) warm_mark_page(first-k);
++  for(page=first;page<=last;page++) warm_mark_page(page);
++}
++
++static void warm_mark_all(void)
++{
++  warm_mark_range(0,WARM_PAGES-1);
++}
++
++static void warm_shadow_free(struct warm_shadow *s, int adopted)
++{
++  if(!adopted) {
++    // Never entered anywhere: the list nodes and the source copy are still this shadow's own.
++    int n;
++    for(n=0;n<s->nnodes;n++) { free(s->nodes[n].dirty); free(s->nodes[n].in); }
++    free(s->copy);
++    copy_size-=s->slen*4+4;
++  }
++  warm_shadow_bytes-=s->size;
++  free(s->code);
++  free(s->links);
++  free(s->nodes);
++  free(s);
++  warm_shadow_count--;
++}
++
++static void warm_drop_shadows(void)
++{
++  int bin;
++  for(bin=0;bin<WARM_SHADOW_BINS;bin++) {
++    struct warm_shadow *s=warm_shadows[bin];
++    warm_shadows[bin]=NULL;
++    while(s) {
++      struct warm_shadow *next=s->next;
++      warm_shadow_free(s,0);
++      s=next;
++    }
++  }
++  assert(warm_shadow_count==0);
++}
++
++// The shadow for a block that pass 1 of a compile on demand has just measured, taken out of the table.
++static struct warm_shadow *warm_shadow_take(u_int addr, u_int slen, const u_int *words)
++{
++  struct warm_shadow **cur=&warm_shadows[((addr>>2)^(addr>>14))&(WARM_SHADOW_BINS-1)];
++  while(*cur) {
++    struct warm_shadow *s=*cur;
++    if(s->addr==addr&&s->slen==slen&&s->tlb==using_tlb&&!memcmp(s->copy,words,slen*4)) {
++      *cur=s->next;
++      return s;
++    }
++    cur=&s->next;
++  }
++  return NULL;
++}
++
++static int warm_shadow_exists(u_int addr, u_int slen, const u_int *words)
++{
++  const struct warm_shadow *s=warm_shadows[((addr>>2)^(addr>>14))&(WARM_SHADOW_BINS-1)];
++  for(;s;s=s->next)
++    if(s->addr==addr&&s->slen==slen&&s->tlb==using_tlb&&!memcmp(s->copy,words,slen*4)) return 1;
++  return 0;
++}
++
++// Writes a shadow's code into buffer as it would have been generated at cache address `at`.
++// Generated code refers to itself with pc-relative instructions, which need no change, and to
++// places outside the block (the C helpers, the list nodes its dirty stubs name) pc-relatively
++// too, which do: every A64 pc-relative instruction whose target lies outside the block is
++// re-encoded for the new place. The literal pool at the end is data (absolute addresses).
++// Returns 0 when a target is out of the instruction's reach from there (not adopted then).
++static int warm_relocate(const struct warm_shadow *s, u_char *buffer, const u_char *at)
++{
++#if NEW_DYNAREC == NEW_DYNAREC_ARM64
++  const intptr_t delta=(intptr_t)at-(intptr_t)s->origin;
++  const u_int *src=(const u_int *)s->code;
++  u_int *dst=(u_int *)buffer;
++  const u_int words=s->lit>>2;
++  u_int i;
++  memcpy(buffer,s->code,s->size);
++  if(!delta) return 1;
++  for(i=0;i<words;i++) {
++    const u_int w=src[i];
++    const intptr_t pc=(intptr_t)s->origin+i*4;
++    intptr_t offset,limit;
++    int kind;
++    if((w&0x7c000000)==0x14000000) { offset=((intptr_t)(int)(w<<6))>>4; limit=134217728; kind=0; }   // b, bl
++    else if((w&0xff000010)==0x54000000||(w&0x7e000000)==0x34000000||(w&0x3b000000)==0x18000000) {
++      offset=((intptr_t)(int)(w<<8))>>11; limit=1048576; kind=1;                                       // b.cond, cbz, cbnz, ldr literal
++    }
++    else if((w&0x7e000000)==0x36000000) { offset=((intptr_t)(int)(w<<13))>>16; limit=32768; kind=2; }  // tbz, tbnz
++    else if((w&0x9f000000)==0x10000000) { offset=(((intptr_t)(int)(w<<8))>>11)|((w>>29)&3); limit=1048576; kind=3; } // adr
++    else if((w&0x9f000000)==0x90000000) {                                                               // adrp
++      // pages of the executable view, as emit_adrp counts them
++      const intptr_t rx=pc-(intptr_t)base_addr+(intptr_t)base_addr_rx;
++      const intptr_t page=(rx&~(intptr_t)0xfff)+(((((intptr_t)(int)(w<<8))>>11)|((w>>29)&3))<<12);
++      offset=(page-((rx+delta)&~(intptr_t)0xfff))>>12;
++      if(offset<-1048576||offset>=1048576) return 0;
++      dst[i]=(w&0x9f00001f)|((u_int)offset&3)<<29|(((u_int)(offset>>2))&0x7ffff)<<5;
++      continue;
++    }
++    else continue;
++    if(pc+offset>=(intptr_t)s->origin&&pc+offset<(intptr_t)s->origin+(intptr_t)s->size) continue; // inside the block
++    offset-=delta;
++    if(offset<-limit||offset>=limit) return 0;
++    if(kind==0) dst[i]=(w&0xfc000000)|(((u_int)(offset>>2))&0x3ffffff);
++    else if(kind==1) dst[i]=(w&0xff00001f)|(((u_int)(offset>>2))&0x7ffff)<<5;
++    else if(kind==2) dst[i]=(w&0xfff8001f)|(((u_int)(offset>>2))&0x3fff)<<5;
++    else dst[i]=(w&0x9f00001f)|((u_int)offset&3)<<29|(((u_int)(offset>>2))&0x7ffff)<<5;
++  }
++  return 1;
++#else
++  (void)s; (void)buffer; (void)at;
++  return 0;
++#endif
++}
++
++// Verify mode: is the shadow, moved to `begin`, the code the full compile has just put there?
++// Every instruction must be equal except the exits (the compile linked those it could, a
++// shadow's go to their stubs until it is adopted). The literal pool holds the addresses of the
++// list nodes, which are each compile's own; its size must be equal.
++static int warm_same_code(const struct warm_shadow *s, const u_char *begin, const u_char *lit, const u_char *end)
++{
++  u_char *moved;
++  const u_int *a,*b;
++  u_int i;
++  int n,same=1;
++  if((size_t)(end-begin)!=s->size||(size_t)(lit-begin)!=s->lit) return 0;
++  moved=(u_char *)malloc(s->size);
++  assert(moved!=NULL);
++  if(!warm_relocate(s,moved,begin)) { free(moved); return 0; }
++  a=(const u_int *)moved;
++  b=(const u_int *)begin;
++  for(i=0;i<s->lit>>2&&same;i++) {
++    if(a[i]==b[i]) continue;
++    for(n=0;n<s->nlinks;n++)
++      if(s->links[n].jump==i*4) break;
++    if(n<s->nlinks) continue;
++    same=0;
++  }
++  free(moved);
++  return same;
++}
++
++// Flag 2: everything passes 1 to 7 have worked out for the block being compiled, which is all
++// the assembler (pass 8) goes by, into a running hash. Two builds of the recompiler that give
++// the same hash for the same run generate the same code, wherever the libraries are loaded.
++static void warm_hash_analysis(void)
++{
++  uint64_t h=warm_stats.analysis_hash?warm_stats.analysis_hash:0xcbf29ce484222325ull;
++  int i,hr;
++  size_t n;
++  #define WARM_HASH(p,size) { const u_char *bytes=(const u_char *)(p); for(n=0;n<(size_t)(size);n++) { h^=bytes[n]; h*=0x100000001b3ull; } }
++  WARM_HASH(&start,sizeof(start)); WARM_HASH(&slen,sizeof(slen));
++  for(i=0;i<slen;i++) {
++    const int branch=itype[i]==RJUMP||itype[i]==UJUMP||itype[i]==CJUMP||itype[i]==SJUMP||itype[i]==FJUMP;
++    WARM_HASH(&itype[i],1); WARM_HASH(&bt[i],1); WARM_HASH(&likely[i],1); WARM_HASH(&is_ds[i],1); WARM_HASH(&ooo[i],1);
++    WARM_HASH(&rs1[i],1); WARM_HASH(&rs2[i],1); WARM_HASH(&rt1[i],1); WARM_HASH(&rt2[i],1);
++    WARM_HASH(&us1[i],1); WARM_HASH(&us2[i],1); WARM_HASH(&dep1[i],1); WARM_HASH(&dep2[i],1);
++    WARM_HASH(&ccadj[i],sizeof(ccadj[i])); WARM_HASH(&minimum_free_regs[i],1);
++    WARM_HASH(&unneeded_reg[i],8); WARM_HASH(&unneeded_reg_upper[i],8); WARM_HASH(&requires_32bit[i],8);
++    WARM_HASH(&needed_reg[i],sizeof(needed_reg[i]));
++    WARM_HASH(regmap_pre[i],HOST_REGS); WARM_HASH(regs[i].regmap_entry,HOST_REGS); WARM_HASH(regs[i].regmap,HOST_REGS);
++    WARM_HASH(&regs[i].was32,8); WARM_HASH(&regs[i].is32,8); WARM_HASH(&regs[i].wasdirty,8); WARM_HASH(&regs[i].dirty,8);
++    WARM_HASH(&regs[i].wasconst,4); WARM_HASH(&regs[i].isconst,4);
++    for(hr=0;hr<HOST_REGS;hr++)
++      if((regs[i].isconst>>hr)&1) WARM_HASH(&constmap[i][hr],8);
++    if(branch) {
++      WARM_HASH(&ba[i],sizeof(ba[i]));
++      WARM_HASH(branch_regs[i].regmap_entry,HOST_REGS); WARM_HASH(branch_regs[i].regmap,HOST_REGS);
++      WARM_HASH(&branch_regs[i].is32,8); WARM_HASH(&branch_regs[i].dirty,8);
++      WARM_HASH(&branch_regs[i].u,8); WARM_HASH(&branch_regs[i].uu,8);
++      WARM_HASH(&branch_unneeded_reg[i],8); WARM_HASH(&branch_unneeded_reg_upper[i],8);
++    }
++  }
++  #undef WARM_HASH
++  warm_stats.analysis_hash=h;
++}
++
++static uint64_t recompile_now_us(void);
++static int recompile_block_body(int addr);
++
++// A compile on demand has finished in full (1) or by adopting a shadow (0).
++static void warm_note_demand(u_int addr, u_int slen, const u_int *words, int full)
++{
++  int known=0;
++  int index=warm_add(addr,slen*4,warm_sum(words,slen),&known);
++  int missed=known&&!warm_list[index].done;
++  warm_set_done(&warm_list[index]);
++  if(full) {
++    warm_stats.full++;
++    if(known) warm_stats.full_known++;
++    if(addr>=0x80000000u&&addr<0x80800000u) {
++      // Code this session had not seen is being run. If the list knew the block, a whole piece of
++      // game code has arrived without a DMA telling (copied by the CPU): look at every page again.
++      if(missed) warm_mark_all();
++      else warm_mark_range((addr-0x80000000u)>>12,(addr+slen*4-4-0x80000000u)>>12);
++    }
++  }
++  else warm_stats.adopted++;
++  if((uintptr_t)out-(uintptr_t)base_addr>warm_stats.code_bytes) warm_stats.code_bytes=(uintptr_t)out-(uintptr_t)base_addr;
++}
++
++void new_dynarec_warm_reset(void)
++{
++  free(warm_list); warm_list=NULL; warm_count=warm_cap=0;
++  free(warm_set); warm_set=NULL; warm_set_size=0;
++  memset(warm_page_head,0,sizeof(warm_page_head));
++  memset(warm_page_span,0,sizeof(warm_page_span));
++  memset(warm_page_dirty,0,sizeof(warm_page_dirty));
++  warm_q_head=warm_q_count=0;
++  warm_cursor=0;
++  warm_pending=0;
++  memset(&warm_stats,0,sizeof(warm_stats));
++}
++
++// Entries are three words: address, length in bytes, checksum. Returns how many were new.
++int new_dynarec_warm_load(const unsigned int *entries, int count)
++{
++  int i,added=0;
++  for(i=0;i<count;i++) {
++    int known;
++    u_int addr=entries[i*3],len=entries[i*3+1];
++    if(len<4||(len&3)||len>MAXBLOCK*4) continue;
++    warm_add(addr,len,entries[i*3+2],&known);
++    if(!known) added++;
++  }
++  warm_stats.loaded+=added;
++  if(warm_active) warm_mark_all();
++  return added;
++}
++
++// Copies up to max entries out; returns how many there are.
++int new_dynarec_warm_read(unsigned int *entries, int max)
++{
++  int i;
++  for(i=0;i<warm_count&&i<max;i++) {
++    entries[i*3]=warm_list[i].addr;
++    entries[i*3+1]=warm_list[i].len;
++    entries[i*3+2]=warm_list[i].sum;
++  }
++  return warm_count;
++}
++
++void new_dynarec_warm_config(int flags)
++{
++  warm_flags=flags;
++}
++
++void new_dynarec_warm_stats(unsigned long long *stats)
++{
++  stats[0]=warm_stats.loaded;        // entries given to new_dynarec_warm_load
++  stats[1]=(unsigned long long)warm_count;   // entries now (loaded and recorded)
++  stats[2]=warm_stats.shadows;       // blocks compiled ahead
++  stats[3]=warm_stats.adopted;       // of those, asked for by the game since
++  stats[4]=warm_stats.full;          // blocks compiled in full when the game asked
++  stats[5]=warm_stats.full_known;    //   of those, blocks the list had
++  stats[6]=warm_stats.precompile_us; // time inside new_dynarec_warm_precompile
++  stats[7]=warm_stats.oversized;     // blocks compiled ahead that took longer than a budget (oversized_us)
++  stats[8]=(unsigned long long)warm_pending;   // entries that could be compiled ahead and were not in this session
++  stats[9]=warm_stats.code_bytes;    // code cache used (until it wraps)
++  stats[10]=(unsigned long long)warm_shadow_bytes; // shadow code waiting to be asked for
++  stats[11]=warm_stats.verify_bad;   // verify mode: shadows that differed from the compile
++  stats[12]=warm_stats.code_hash;    // flag 2: FNV-1a of every block entered in the cache, in order, without its literals
++  stats[13]=warm_stats.size_hash;    //   and of their sizes
++  stats[14]=warm_stats.verified;     // verify mode: shadows compared
++  stats[15]=warm_stats.analysis_hash; //   and of what passes 1 to 7 decided for every block compiled in full
++}
++
++// Compiles pending entries whose source is in RAM now, for at most budget_us microseconds: a
++// block is only started when the time it should take is left. A block that should take longer
++// than the whole budget (the largest are thousands of instructions) waits, its page staying
++// marked, for a call with more: a larger budget, or oversized_us, the time the caller is ready to
++// give to one such block compiled alone in a call (0: none). The caller chooses that when a late
++// frame costs least: the code has just been loaded, rather than when the game first runs it.
++// To be called on the emulation thread, between two blocks of the game: after a frame. Returns
++// the number of blocks compiled.
++int new_dynarec_warm_precompile(unsigned int budget_us, unsigned int oversized_us)
++{
++  uint64_t begin,now;
++  int compiled=0,since_clock=0;
++  u_int pages;
++  if(!budget_us||!warm_pending||!warm_active||warm_shadow_slen) return 0;
++  warm_stats.calls++;
++  {
++    // One page a call is looked at whatever else is known, in turn, for code that arrived without
++    // any of the events that mark a page.
++    u_int k;
++    for(k=0;k<WARM_PAGES&&!warm_page_head[warm_rotate];k++) warm_rotate=(warm_rotate+1)%WARM_PAGES;
++    warm_mark_page(warm_rotate);
++    warm_rotate=(warm_rotate+1)%WARM_PAGES;
++    if(!warm_q_count) return 0;
++  }
++  begin=now=recompile_now_us();
++  for(pages=warm_q_count;pages>0&&warm_q_count;pages--) { // each marked page once a call
++    u_int page=warm_queue[warm_q_head];
++    int index=warm_cursor?warm_cursor:warm_page_head[page];
++    int waiting=warm_cursor?warm_cursor_waiting:0;
++    warm_cursor=0;
++    while(index) {
++      struct warm_entry *e=&warm_list[index-1];
++      int next=e->page_next;
++      if(!e->done) {
++        const u_int *words=(const u_int *)((uintptr_t)g_dev.rdram.dram+(e->addr-0x80000000u));
++        u_int count=e->len>>2;
++        warm_stats.tests++;
++        if(++since_clock>=16) { since_clock=0; now=recompile_now_us(); }
++        if(now-begin>=budget_us) { warm_cursor=index; warm_cursor_waiting=waiting; goto done; }
++        if(warm_sum(words,count)==e->sum) {
++          const uint64_t before=now=recompile_now_us();
++          const double estimate=warm_us_per_word*count;
++          int oversized=0;
++          if(warm_shadow_bytes>=WARM_SHADOW_LIMIT) { warm_cursor=index; warm_cursor_waiting=waiting; goto done; }
++          if(estimate>(double)budget_us) {
++            // It fits in no call with this budget: alone and first in a call that allows it, or later.
++            if(estimate>(double)oversized_us||compiled||(before-begin)*4>=budget_us) { waiting=1; index=next; continue; }
++            oversized=1;
++          }
++          else if((double)(before-begin)+estimate*1.5>(double)budget_us&&(before-begin)*4>=budget_us) {
++            // Not enough of this call's time is left. (A call that has used under a quarter of its
++            // budget goes ahead: the next call would not have more for this block.)
++            warm_cursor=index;
++            warm_cursor_waiting=waiting;
++            goto done;
++          }
++          warm_set_done(e);
++          if(!warm_shadow_exists(e->addr,count,words)) {
++            warm_shadow_slen=count;
++            if(recompile_block_body((int)e->addr)==0) { warm_stats.shadows++; compiled++; warm_stats.oversized+=oversized; }
++            else warm_stats.shadow_failed++;
++            warm_shadow_slen=0;
++            now=recompile_now_us();
++            warm_us_per_word=warm_us_per_word*0.9+0.1*((double)(now-before)/count);
++          }
++          if(oversized) budget_us=1; // nothing more in this call
++        }
++      }
++      index=next;
++    }
++    warm_q_head=(warm_q_head+1)%WARM_PAGES;
++    if(waiting) warm_queue[(warm_q_head+warm_q_count-1)%WARM_PAGES]=page; // to the back, still marked
++    else { warm_page_dirty[page]=0; warm_q_count--; }
++  }
++done:
++  warm_stats.precompile_us+=recompile_now_us()-begin;
++  return compiled;
+ }
+ 
++// A session starts: nothing is compiled, every entry is pending again.
++static void warm_session_begin(void)
++{
++  int i;
++  uint64_t loaded=warm_stats.loaded;
++  warm_pending=0;
++  for(i=0;i<warm_count;i++) {
++    warm_list[i].done=0;
++    if(warm_can_precompile(warm_list[i].addr,warm_list[i].len)) warm_pending++;
++  }
++  memset(warm_page_dirty,0,sizeof(warm_page_dirty));
++  warm_q_head=warm_q_count=0;
++  warm_cursor=warm_cursor_waiting=0;
++  warm_rotate=0;
++  warm_shadow_slen=0;
++  warm_us_per_word=8.0;
++  memset(&warm_stats,0,sizeof(warm_stats));
++  warm_stats.loaded=loaded;
++  warm_active=1;
++}
++
++static void warm_session_end(void)
++{
++  warm_drop_shadows();
++  warm_active=0;
++}
++
+ /**** Recompiler ****/
+ void new_dynarec_init(void)
+ {
+@@ -8899,6 +9480,7 @@
+ 
+   tlb_speed_hacks();
+   arch_init();
++  warm_session_begin();
+ }
+ 
+ void new_dynarec_cleanup(void)
+@@ -8908,6 +9490,7 @@
+ #endif
+ 
+   int n;
++  warm_session_end();
+   for(n=0;n<4096;n++) ll_clear(jump_in+n);
+   for(n=0;n<4096;n++) ll_clear(jump_out+n);
+   for(n=0;n<4096;n++) ll_clear(jump_dirty+n);
+@@ -8952,10 +9535,24 @@
+ int new_recompile_block(int addr)
+ {
+   uint64_t recompile_begin __attribute__((cleanup(recompile_timer_stop))) = recompile_now_us();
++  rollback_stats.recompile_count++;
++  warm_shadow_slen=0;
++  return recompile_block_body(addr);
++}
++
++// The compiler itself. warm_shadow_slen = 0: a compile on demand (new_recompile_block). Otherwise
++// a compile ahead of need (new_dynarec_warm_precompile) of that many instructions: the code is
++// generated at `out`, kept as data and entered nowhere; see "warm list" above.
++static int recompile_block_body(int addr)
++{
++  struct warm_shadow *shadow=NULL;    // being compiled ahead
++  struct warm_shadow *verifying=NULL; // verify mode: the shadow this compile on demand should equal
++  int adopted=0;
++  const u_int saved_stop_after_jal=stop_after_jal;
++  u_char *warm_begin=out,*warm_lit=out,*warm_end=out;
+ #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
+   recomp_dbg_block(addr);
+ #endif
+-  rollback_stats.recompile_count++;
+ 
+   assem_debug("NOTCOMPILED: addr = %x -> %x", (int)addr, (intptr_t)out);
+ #if COUNT_NOTCOMPILEDS
+@@ -9025,6 +9622,7 @@
+   /* Pass 1 disassembly */
+ 
+   for(i=0;!done;i++) {
++    int warm_forced=0; // this instruction ends the block whatever else is compiled
+     bt[i]=0;likely[i]=0;ooo[i]=0;op2=0;
+     minimum_free_regs[i]=0;
+     opcode[i]=op=source[i]>>26;
+@@ -9527,7 +10125,8 @@
+         // Stop if we're compiling junk
+         if(type==UJUMP||type==CJUMP||type==SJUMP||type==RJUMP||type==FJUMP)
+         {
+-          done=stop_after_jal=1;
++          done=warm_forced=1;
++          if(!warm_shadow_slen) stop_after_jal=1;
+           itype[i]=NOP;
+           DebugMessage(M64MSG_VERBOSE, "Disabled speculative precompilation");
+         }
+@@ -9538,7 +10137,7 @@
+         if((source[i+1]&0xfc00003f)==0x0d) done=1;
+       }
+       // Don't recompile stuff that's already compiled
+-      if(check_addr(start+i*4+4)) done=1;
++      if(!warm_shadow_slen&&check_addr(start+i*4+4)) done=1;
+       // Don't get too close to the limit
+       if(i>MAXBLOCK/2) done=1;
+     }
+@@ -9549,8 +10148,15 @@
+     if (i==MAXBLOCK-1) done=1;
+     // Stop if we're compiling junk
+     if(itype[i]==NI&&opcode[i]==0x11) {
+-      done=stop_after_jal=1;
++      done=warm_forced=1;
++      if(!warm_shadow_slen) stop_after_jal=1;
+       DebugMessage(M64MSG_VERBOSE, "Disabled speculative precompilation");
++    }
++    if(warm_shadow_slen) {
++      // A shadow has the length the list gives: the one a compile on demand chose for these very
++      // words. Where a compile must stop whatever else exists, the list cannot say otherwise.
++      if((warm_forced||start+i*4==pagelimit-4||i==MAXBLOCK-1)&&(u_int)i!=warm_shadow_slen-1) return 2;
++      done=((u_int)i==warm_shadow_slen-1);
+     }
+   }
+   slen=i;
+@@ -9560,6 +10166,82 @@
+     }
+   }
+   assert(slen>0);
++
++  if(warm_shadow_slen) {
++    if(itype[slen-1]==SPAN) return 2;
++    shadow=(struct warm_shadow *)calloc(1,sizeof(struct warm_shadow));
++    assert(shadow!=NULL);
++    shadow->nodes=(struct warm_node *)malloc(slen*sizeof(struct warm_node));
++    assert(shadow->nodes!=NULL);
++    // delayslot_alloc may set stop_after_jal: a shadow only notes that, for its adoption
++    stop_after_jal=0;
++  }
++  else if(warm_shadow_count&&!((u_int)addr&3)&&start>=0x80000000u&&start<0x80800000u) {
++    // Compiled ahead? Pass 1 has just decided the block's extent as it always does.
++    struct warm_shadow *s=warm_shadow_take(start,slen,source);
++    if(s&&(warm_flags&1)) verifying=s; // verify mode: compile it all the same and compare
++    else if(s&&!warm_relocate(s,out,out)) warm_shadow_free(s,0);
++    else if(s) {
++      // The shadow's code is at `out` now. What is left is what a compile does after assembling.
++      const uint64_t adopt_begin=recompile_now_us();
++      int n;
++      for(n=0;n<s->nnodes;n++) {
++        const intptr_t delta=(intptr_t)out-(intptr_t)s->origin;
++        s->nodes[n].dirty->addr=(u_char *)s->nodes[n].dirty->addr+delta;
++        s->nodes[n].dirty->clean_addr=(u_char *)s->nodes[n].dirty->clean_addr+delta;
++        s->nodes[n].in->addr=(u_char *)s->nodes[n].in->addr+delta;
++        s->nodes[n].in->clean_addr=(u_char *)s->nodes[n].in->clean_addr+delta;
++      }
++      if(s->sets_saj) stop_after_jal=1;
++      /* Pass 9, for the exits a shadow leaves at their stubs */
++      for(n=0;n<s->nlinks;n++) {
++        const struct warm_link *l=&s->links[n];
++        void *stub=warm_begin+l->stub;
++        void *target;
++        out=(u_char *)stub; // where the compile stands when it looks this exit's target up
++        target=check_addr(l->target);
++#ifndef DISABLE_BLOCK_LINKING
++        if(target&&l->linkable) {
++          set_jump_target((intptr_t)(warm_begin+l->jump),(intptr_t)target);
++          add_link(l->target,stub);
++        }
++#else
++        (void)target;
++#endif
++      }
++      for(n=0;n<s->nnodes;n++) {
++        const struct warm_node *node=&s->nodes[n];
++        node->dirty->next=jump_dirty[node->vpage];
++        jump_dirty[node->vpage]=node->dirty;
++        node->in->next=jump_in[node->page];
++        jump_in[node->page]=node->in;
++        if(node->hash) {
++          const u_int vaddr=node->in->vaddr;
++          struct ll_entry **ht_bin=hash_table[((vaddr>>16)^vaddr)&0xFFFF];
++          if(ht_bin[0]&&ht_bin[0]->vaddr==vaddr) ht_bin[0]=node->in;
++          if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) ht_bin[1]=node->in;
++        }
++      }
++      warm_lit=warm_begin+s->lit;
++      out=warm_end=warm_begin+s->size;
++      warm_shadow_free(s,1);
++      adopted=1;
++      warm_stats.adopt_us+=recompile_now_us()-adopt_begin;
++      goto warm_finish;
++    }
++  }
++
++  // The passes below read entries of regs[] that this compile has not written yet (the register
++  // maps of instructions further on, and the entry after the last instruction). What they found
++  // there was left by whichever block was compiled before, so the code generated for a block
++  // depended on the order of compiles (about 2% of blocks got another register allocation).
++  // Start from the same state every time: the code is then a function of the block alone, which
++  // is what lets a block compiled ahead stand in for one compiled on demand.
++  memset(&regs[slen],0,sizeof(regs[slen]));
++  for(i=0;i<=slen;i++) {
++    memset(regs[i].regmap_entry,-1,sizeof(regs[i].regmap_entry));
++    memset(regs[i].regmap,-1,sizeof(regs[i].regmap));
++  }
+ 
+   /* Pass 2 - Register dependencies and branch targets */
+ 
+@@ -11674,6 +12356,8 @@
+     bt[slen-1]=1; // Mark as a branch target so instruction can restart after exception
+   }
+ 
++  if(warm_flags&2) warm_hash_analysis();
++
+   /* Pass 8 - Assembly */
+   linkcount=0;stubcount=0;
+   ds=0;is_delayslot=0;
+@@ -11898,6 +12582,10 @@
+   }
+ 
+   /* Pass 9 - Linker */
++  if(shadow) {
++    shadow->links=(struct warm_link *)malloc((linkcount+1)*sizeof(struct warm_link));
++    assert(shadow->links!=NULL);
++  }
+   for(i=0;i<linkcount;i++)
+   {
+     assem_debug("%8x -> %8x",link_addr[i][0],link_addr[i][1]);
+@@ -11905,8 +12593,20 @@
+     if(!link_addr[i][2])
+     {
+       void *stub=out;
+-      void *addr=check_addr(link_addr[i][1]);
++      // A shadow links to nothing: its exits go to their stubs until it is adopted
++      void *addr=shadow?NULL:check_addr(link_addr[i][1]);
+       emit_extjump(link_addr[i][0],link_addr[i][1]);
++      if(shadow) {
++        struct warm_link *l=&shadow->links[shadow->nlinks++];
++        l->jump=(u_int)(link_addr[i][0]-(uintptr_t)warm_begin);
++        l->stub=(u_int)((u_char *)stub-warm_begin);
++        l->target=link_addr[i][1];
++#if NEW_DYNAREC==NEW_DYNAREC_ARM64
++        l->linkable=(((u_char *)link_addr[i][0])[3]&0xfc)==0x14;
++#else
++        l->linkable=1;
++#endif
++      }
+ #ifndef DISABLE_BLOCK_LINKING
+ #if NEW_DYNAREC==NEW_DYNAREC_ARM64
+       //TODO: Avoid disabling link between blocks for conditional branches
+@@ -11955,10 +12655,18 @@
+         {
+           assem_debug("%8x (%d) <- %8x",instr_addr[i],i,start+i*4);
+           assem_debug("jump_in: %x",start+i*4);
+-          struct ll_entry *head=ll_add(jump_dirty+vpage,vaddr,(void *)out,NULL,start,copy,slen*4);
++          struct ll_entry *head=shadow?ll_new_32(vaddr,0,(void *)out,NULL,start,copy,slen*4)
++                                      :ll_add(jump_dirty+vpage,vaddr,(void *)out,NULL,start,copy,slen*4);
+           dirty_entry_count++;
+           intptr_t entry_point=do_dirty_stub(i,head);
+           head->clean_addr=(void*)entry_point;
++          if(shadow) {
++            // Entered in the lists and the hash table when the block is adopted
++            struct warm_node *node=&shadow->nodes[shadow->nnodes++];
++            node->dirty=head;
++            node->in=ll_new_32(vaddr,0,(void *)entry_point,(void *)entry_point,start,copy,slen*4);
++            node->page=page; node->vpage=vpage; node->hash=1;
++          } else {
+           head=ll_add(jump_in+page,vaddr,(void *)entry_point,(void *)entry_point,start,copy,slen*4);
+           // If there was an existing entry in the hash table,
+           // replace it with the new address.
+@@ -11971,6 +12679,7 @@
+           if(ht_bin[1]&&ht_bin[1]->vaddr==vaddr) {
+             ht_bin[1]=head;
+           }
++          }
+         }
+         else
+         {
+@@ -11985,30 +12694,63 @@
+           //else
+           //  emit_jmp(instr_addr[i]);
+           //struct ll_entry *head=ll_add_32(jump_dirty+vpage,vaddr,r,(void *)entry_point,NULL,start,copy,slen*4);
+-          struct ll_entry *head=ll_add_32(jump_dirty+vpage,vaddr,r,(void *)out,NULL,start,copy,slen*4);
++          struct ll_entry *head=shadow?ll_new_32(vaddr,r,(void *)out,NULL,start,copy,slen*4)
++                                      :ll_add_32(jump_dirty+vpage,vaddr,r,(void *)out,NULL,start,copy,slen*4);
+           dirty_entry_count++;
+           intptr_t entry_point=do_dirty_stub(i,head);
+           head->clean_addr=(void*)entry_point;
++          if(shadow) {
++            struct warm_node *node=&shadow->nodes[shadow->nnodes++];
++            node->dirty=head;
++            node->in=ll_new_32(vaddr,r,(void *)entry_point,(void *)entry_point,start,copy,slen*4);
++            node->page=page; node->vpage=vpage; node->hash=0;
++          } else
+           (void)ll_add_32(jump_in+page,vaddr,r,(void *)entry_point,(void *)entry_point,start,copy,slen*4);
+         }
+       }
+     }
+   }
+   // Write out the literal pool if necessary
++  warm_lit=out;
+   literal_pool(0);
+   #ifdef CORTEX_A8_BRANCH_PREDICTION_HACK
+   // Align code
+   if(((uintptr_t)out)&7) emit_addnop(13);
+   #endif
++  warm_end=out;
+   assert((uintptr_t)out-beginning<MAX_OUTPUT_BLOCK_SIZE);
+   memcpy(copy,(char*)source,slen*4);
+   u_int *ptr=(u_int*)copy;
+   ptr[slen]=dirty_entry_count;
+ 
++  if(shadow) {
++    // Compiled ahead: the code is kept as data and the cache is left as it was. Nothing below
++    // (flush, write protection, expiry) happens until the game asks for the block.
++    struct warm_shadow **bin=&warm_shadows[((start>>2)^(start>>14))&(WARM_SHADOW_BINS-1)];
++    shadow->addr=start;
++    shadow->slen=slen;
++    shadow->tlb=using_tlb;
++    shadow->sets_saj=stop_after_jal;
++    shadow->copy=copy;
++    shadow->origin=warm_begin;
++    shadow->size=(u_int)(warm_end-warm_begin);
++    shadow->lit=(u_int)(warm_lit-warm_begin);
++    shadow->code=(u_char *)malloc(shadow->size);
++    assert(shadow->code!=NULL);
++    memcpy(shadow->code,warm_begin,shadow->size);
++    shadow->next=*bin;
++    *bin=shadow;
++    warm_shadow_count++;
++    warm_shadow_bytes+=shadow->size;
++    stop_after_jal=saved_stop_after_jal;
++    out=warm_begin;
++    return 0;
++  }
++
++warm_finish:
+   #if NEW_DYNAREC >= NEW_DYNAREC_ARM
+-  intptr_t beginning_rx=((intptr_t)beginning-(intptr_t)base_addr)+(intptr_t)base_addr_rx;
+-  intptr_t out_rx=((intptr_t)out-(intptr_t)base_addr)+(intptr_t)base_addr_rx;
+-  cache_flush((char *)beginning_rx,(char *)out_rx);
++  cache_flush((char *)(((intptr_t)warm_begin-(intptr_t)base_addr)+(intptr_t)base_addr_rx),
++              (char *)(((intptr_t)out-(intptr_t)base_addr)+(intptr_t)base_addr_rx));
+   #endif
+ 
+   // If we're within 256K of the end of the buffer,
+@@ -12081,5 +12823,19 @@
+     }
+     expirep=(expirep+1)&65535;
+   }
++  if(warm_flags&2) {
++    // Every block as it enters the cache (its literal pool, which holds addresses of list nodes, left out)
++    const u_char *p;
++    uint64_t h=warm_stats.code_hash?warm_stats.code_hash:0xcbf29ce484222325ull;
++    for(p=warm_begin;p<warm_lit;p++) { h^=*p; h*=0x100000001b3ull; }
++    warm_stats.code_hash=h;
++    warm_stats.size_hash=(warm_stats.size_hash^(uint64_t)(warm_end-warm_begin))*0x100000001b3ull;
++  }
++  if(verifying) {
++    warm_stats.verified++;
++    if(!warm_same_code(verifying,warm_begin,warm_lit,warm_end)) warm_stats.verify_bad++;
++    warm_shadow_free(verifying,0);
++  }
++  warm_note_demand((u_int)addr,slen,source,!adopted);
+   return 0;
+ }
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.h
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.h
+@@ -112,6 +112,13 @@
+ void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t address, size_t size);
+ void new_dynarec_rollback_note_ram(const void* incoming_rdram);
+ int new_dynarec_rollback_invalidate_changed(void);
++/* Warm list: blocks compiled ahead of need (new_dynarec.c, "warm list"). Entries are three words. */
++void new_dynarec_warm_reset(void);
++int new_dynarec_warm_load(const unsigned int* entries, int count);
++int new_dynarec_warm_read(unsigned int* entries, int max);
++int new_dynarec_warm_precompile(unsigned int budget_us, unsigned int oversized_us);
++void new_dynarec_warm_stats(unsigned long long* stats);
++void new_dynarec_warm_config(int flags);
+ void new_dynarec_rollback_stats_reset(void);
+ void new_dynarec_rollback_stats_get(struct new_dynarec_rollback_stats* stats);
+ void new_dynarec_init(void);
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/arm64/assem_arm64.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/arm64/assem_arm64.c
+@@ -3173,18 +3173,11 @@
+ static intptr_t do_dirty_stub(int i, struct ll_entry * head)
+ {
+   assem_debug("do_dirty_stub %x",head->vaddr);
+-  intptr_t out_rx=((intptr_t)out-(intptr_t)base_addr)+(intptr_t)base_addr_rx;
+-  intptr_t offset=(((intptr_t)head&~0xfffLL)-((intptr_t)out_rx&~0xfffLL));
+-
+-  if((uintptr_t)head<4294967296LL){
+-    emit_movz_lsl16(((uintptr_t)head>>16)&0xffff,ARG1_REG);
+-    emit_movk(((uintptr_t)head)&0xffff,ARG1_REG);
+-  	}else if(offset>=-4294967296LL&&offset<4294967296LL){
+-    emit_adrp((intptr_t)head,ARG1_REG);
+-    emit_addimm64(ARG1_REG,((intptr_t)head&0xfffLL),ARG1_REG);
+-    }else{
+-      emit_loadlp((intptr_t)head,ARG1_REG);
+-  }
++  // Always from the literal pool. The shorter forms (movz/movk below 4 GB, adrp+add within 4 GB
++  // of the code) made a block's size depend on where malloc had put the node, so the layout of
++  // the code cache differed from run to run and a block could not be compared with another
++  // compile of itself.
++  emit_loadlp((intptr_t)head,ARG1_REG);
+ 
+   emit_call((intptr_t)verify_code);
+ 
+@@ -3198,18 +3191,7 @@
+ static void do_dirty_stub_ds(struct ll_entry *head)
+ {
+   assem_debug("do_dirty_stub_ds %x",head->vaddr);
+-  intptr_t out_rx=((intptr_t)out-(intptr_t)base_addr)+(intptr_t)base_addr_rx;
+-  intptr_t offset=(((intptr_t)head&~0xfffLL)-((intptr_t)out_rx&~0xfffLL));
+-
+-  if((uintptr_t)head<4294967296LL){
+-    emit_movz_lsl16(((uintptr_t)head>>16)&0xffff,ARG1_REG);
+-    emit_movk(((uintptr_t)head)&0xffff,ARG1_REG);
+-    }else if(offset>=-4294967296LL&&offset<4294967296LL){
+-    emit_adrp((intptr_t)head,ARG1_REG);
+-    emit_addimm64(ARG1_REG,((intptr_t)head&0xfffLL),ARG1_REG);
+-    }else{
+-      emit_loadlp((intptr_t)head,ARG1_REG);
+-  }
++  emit_loadlp((intptr_t)head,ARG1_REG); // as in do_dirty_stub
+ 
+   emit_call((intptr_t)verify_code);
+ }
+--- a/mupen64plus-core/src/api/debugger.c
++++ b/mupen64plus-core/src/api/debugger.c
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #define M64P_CORE_PROTOTYPES 1
+ #include "callbacks.h"
+@@ -240,9 +241,73 @@
+     out[1] = stats.recompile_us;
+     out[2] = stats.block_invalidate_count;
+     out[3] = stats.verify_dirty_count;
++#endif
++}
++
++/* Z-Cancel NX: the recompiler's warm list (new_dynarec.c, "warm list"). Every block the recompiler
++ * compiles is recorded as three words: its address, the length of its source in bytes and a
++ * checksum of the source words. No game code. A front end keeps the list per ROM:
++ *   DebugDynarecWarmReset()            forget everything (before another ROM)
++ *   DebugDynarecWarmLoad(entries, n)   add a saved list; returns how many entries were new
++ *   DebugDynarecWarmRead(entries, max) copy the list out (loaded and recorded); returns its size
++ *   DebugDynarecPrecompile(budget_us, oversized_us)
++ *                                      on the emulation thread, between two frames: compile listed
++ *                                      blocks whose source is in RAM now, for at most budget_us;
++ *                                      oversized_us > 0: a block that needs more than a whole budget
++ *                                      but not more than this may be compiled, alone in the call.
++ *                                      Returns the number compiled. Changes nothing the game can see.
++ *   DebugDynarecWarmStats(out[16])     counters of the running or the last session (new_dynarec_warm_stats)
++ *   DebugDynarecWarmConfig(flags)      1: verify mode, 2: hash the generated code
++ * All do nothing without the recompiler. */
++EXPORT void CALL DebugDynarecWarmReset(void)
++{
++#ifdef NEW_DYNAREC
++    new_dynarec_warm_reset();
+ #endif
+ }
+ 
++EXPORT int CALL DebugDynarecWarmLoad(const unsigned int* entries, int count)
++{
++#ifdef NEW_DYNAREC
++    return entries != NULL && count > 0 ? new_dynarec_warm_load(entries, count) : 0;
++#else
++    return 0;
++#endif
++}
++
++EXPORT int CALL DebugDynarecWarmRead(unsigned int* entries, int max)
++{
++#ifdef NEW_DYNAREC
++    return new_dynarec_warm_read(entries, entries != NULL ? max : 0);
++#else
++    return 0;
++#endif
++}
++
++EXPORT int CALL DebugDynarecPrecompile(unsigned int budget_us, unsigned int oversized_us)
++{
++#ifdef NEW_DYNAREC
++    return g_dev.r4300.emumode == EMUMODE_DYNAREC ? new_dynarec_warm_precompile(budget_us, oversized_us) : 0;
++#else
++    return 0;
++#endif
++}
++
++EXPORT void CALL DebugDynarecWarmStats(unsigned long long* out)
++{
++    memset(out, 0, 16 * sizeof(*out));
++#ifdef NEW_DYNAREC
++    new_dynarec_warm_stats(out);
++#endif
++}
++
++EXPORT void CALL DebugDynarecWarmConfig(int flags)
++{
++#ifdef NEW_DYNAREC
++    new_dynarec_warm_config(flags);
++#endif
++}
++
+ EXPORT void * CALL DebugMemGetPointer(m64p_dbg_memptr_type mem_ptr_type)
+ {
+     switch (mem_ptr_type)

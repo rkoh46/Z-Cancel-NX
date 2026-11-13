@@ -101,6 +101,9 @@ struct Options {
     bool pace = true;
     bool verbose = false;
     bool gekko_log = false;
+    int precompile_ms = 12;      /* the recompiler's warm list: znx_options.precompile_ms */
+    bool no_warm = false;
+    const char* warm = nullptr;
     bool bind_any = false;        /* listen on every interface (a LAN test against the Switch) */
     bool enlist = false;
     std::string nat, list;        /* host:port of the traversal and list servers (tests: a local mock) */
@@ -706,6 +709,8 @@ void usage()
         "  --ready-after S      press Ready S seconds after the peer arrived (the automatic delay needs ~5 s of pings)\n"
         "  --code-file F        host: keep the connect code between runs, as RMG-K keeps it in its settings\n"
         "  --no-pace            run as fast as possible instead of RMG-K's 60 Hz presentation pacer\n"
+        "  --precompile-ms N    compile the ROM's warm list ahead in the time the pacer leaves over (default 12; 0 = off);\n"
+        "                       --warm FILE: that list file; --no-warm: no list (see znx-bench)\n"
         "  --gekko-log          write RMG-K's verbose GekkoNet log to build/<arch>/profile/net-<side>/Logs\n"
         "  --fetch-list H:P     GET http://H:P/plist.txt and print the games with a connect code\n"
         "  --lobby URL          RMG-K's rollback lobby (ws://HOST:PORT/ws) instead of P2P; then:\n"
@@ -803,6 +808,9 @@ int main(int argc, char** argv)
         else if (!std::strcmp(a, "--lobby-timeout")) g_opt.lobby_timeout_s = std::atoi(next());
         else if (!std::strcmp(a, "--ready-after")) g_opt.ready_after_s = std::atoi(next());
         else if (!std::strcmp(a, "--gekko-log")) g_opt.gekko_log = true;
+        else if (!std::strcmp(a, "--precompile-ms") && i + 1 < argc) g_opt.precompile_ms = std::atoi(argv[++i]);
+        else if (!std::strcmp(a, "--no-warm")) g_opt.no_warm = true;
+        else if (!std::strcmp(a, "--warm") && i + 1 < argc) g_opt.warm = argv[++i];
         else if (!std::strcmp(a, "--verbose")) g_opt.verbose = true;
         else if (!std::strcmp(a, "--fetch-list")) return fetch_list(next());
         else if (!std::strcmp(a, "--lobby")) g_opt.lobby = next();
@@ -901,6 +909,9 @@ int main(int argc, char** argv)
     o.hash_every = 0;
     o.input_players = lobby ? znx_lobby_play_input_players() : 2;   /* what start_*_session sets too */
     o.verbose = g_opt.verbose ? 1 : 0;
+    o.precompile_ms = g_opt.precompile_ms;
+    o.warm_off = g_opt.no_warm ? 1 : 0;
+    o.warm_path = g_opt.warm;
 
     struct znx_host host;
     std::memset(&host, 0, sizeof(host));
@@ -920,6 +931,8 @@ int main(int argc, char** argv)
     host.print = print_line;
     host.data_dir = data_dir.c_str();
     host.user_dir = user_dir.c_str();
+    const std::string warm_dir = data_dir + "/warm";   /* the shipped warm lists (build-mac.sh copies assets/warm) */
+    host.warm_dir = warm_dir.c_str();
     host.session_run = run_session;
     if (lobby)
         host.session_prepare = prepare_core;

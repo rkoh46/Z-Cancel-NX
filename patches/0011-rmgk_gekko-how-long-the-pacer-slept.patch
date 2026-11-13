@@ -1,0 +1,86 @@
+rmgk_gekko: how long the presentation pacer slept
+
+pace_before_present() waits for the next frame's deadline. rmgk_gekko::last_present_sleep_us() says
+how long the last call waited (0 when the frame was late) and how many calls there have been: the
+time a frame had to spare, which Z-Cancel NX spends compiling ahead between frames (net/p2p/
+znx_p2p.cpp, bench/bench_core.c: znx_bench_idle) without delaying one. Nothing else changes.
+
+--- a/RMG-Core/rmgk_gekko.cpp
++++ b/RMG-Core/rmgk_gekko.cpp
+@@ -444,6 +444,10 @@
+ double g_RollbackPresentBaseHz = 60.0;
+ bool g_RollbackPresentBaseHzOverridden = false;
+ bool g_RollbackPresentPacerInitialized = false;
++// Z-Cancel NX: how long the last pace_before_present() slept (0 when the frame was late), and how
++// many times it has run: the time a frame had to spare (rmgk_gekko::last_present_sleep_us).
++std::atomic<long long> g_RollbackPresentLastSleepUs{0};
++std::atomic<unsigned long long> g_RollbackPresentCalls{0};
+ std::chrono::steady_clock::time_point g_RollbackPresentLastSwapTime;
+ std::chrono::steady_clock::time_point g_RollbackPresentTargetTime;
+ std::chrono::steady_clock::time_point g_RollbackPresentHookReturnTime;
+@@ -4488,6 +4492,7 @@
+ 
+     const auto deadline =
+         g_RollbackPresentTargetTime + period;
++    long long sleptUs = 0;
+ 
+     const long long intervalBeforeWaitUs =
+         std::chrono::duration_cast<
+@@ -4528,9 +4533,10 @@
+                     100)});
+ 
+         now = std::chrono::steady_clock::now();
+-        g_LagMeter.pacerSleepUs +=
++        sleptUs =
+             std::chrono::duration_cast<std::chrono::microseconds>(
+                 now - sleepBegin).count();
++        g_LagMeter.pacerSleepUs += sleptUs;
+ 
+         if (g_RmgkPacingTraceEnabled)
+         {
+@@ -4575,6 +4581,8 @@
+     }
+ 
+     g_RollbackPresentLastSwapTime = now;
++    g_RollbackPresentLastSleepUs.store(sleptUs, std::memory_order_relaxed);
++    g_RollbackPresentCalls.fetch_add(1, std::memory_order_relaxed);
+ 
+     record_rollback_present_pacing(
+         1,
+@@ -4592,6 +4600,23 @@
+ #endif
+ }
+ 
++CORE_EXPORT long long rmgk_gekko::last_present_sleep_us(unsigned long long* calls)
++{
++#ifdef RMGK_HAVE_GEKKONET
++    if (calls != nullptr)
++    {
++        *calls = g_RollbackPresentCalls.load(std::memory_order_relaxed);
++    }
++    return g_RollbackPresentLastSleepUs.load(std::memory_order_relaxed);
++#else
++    if (calls != nullptr)
++    {
++        *calls = 0;
++    }
++    return 0;
++#endif
++}
++
+ CORE_EXPORT void rmgk_gekko::trace_swap_duration(
+     long long swapUs,
+     long long makeCurrentUs,
+--- a/RMG-Core/rmgk_gekko.hpp
++++ b/RMG-Core/rmgk_gekko.hpp
+@@ -205,6 +205,10 @@
+     // Rollback presentation pacer. The core invokes this through the video
+     // plugin rendering callback immediately before OpenGL or Vulkan presents.
+     static void pace_before_present();
++    // Z-Cancel NX: microseconds the last pace_before_present() slept before its deadline (0 when the
++    // frame was late) and, in *calls, how many times it has waited or found itself late: what a
++    // front end may spend between frames without delaying one.
++    static long long last_present_sleep_us(unsigned long long* calls);
+ 
+     // Buffered rollback-pacing trace hook used by VidExt.cpp.
+     // No-op unless Rollback -> Logging -> Pacing Trace is enabled.

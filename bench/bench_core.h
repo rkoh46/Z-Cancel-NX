@@ -39,6 +39,18 @@ struct znx_options {
     int vs_level;              /* CPU level 1..9, 0 = 9 */
     int input_players;         /* controller ports the rollback session synchronizes (1-4); 0 = 4. The
                                 * rest read as unplugged (pif.c). RMG-K's P2P sessions use 2. */
+    /* The recompiler's warm list (docs/PLAN.md, "Compiling ahead of need"): the blocks compiled in earlier
+     * runs of this ROM, compiled again in the idle time after each frame before the game needs them. */
+    int precompile_ms;         /* a frame's work plus the compiling after it stays under this; 0 = no compiling
+                                * ahead (the list is still recorded and saved) */
+    int precompile_big;        /* 1 (default): a block too large for any frame's spare time is compiled ahead
+                                * all the same, alone, after a light frame: one late frame when its code has
+                                * just been loaded instead of one when the game first runs it; 0: such blocks
+                                * are left to be compiled on demand. A netplay session never does it. */
+    int warm_off;              /* 1: no list at all: nothing loaded, nothing saved */
+    const char* warm_path;     /* the list file to load and save, or NULL: warm-<ROM MD5>.bin in the user
+                                * directory, with the shipped one (znx_host.warm_dir) merged in */
+    int warm_flags;            /* DebugDynarecWarmConfig: 1 verify mode, 2 hash the generated code */
     struct znx_window windows[ZNX_MAX_WINDOWS];
     int window_count;
 };
@@ -73,6 +85,14 @@ struct znx_host {
     /* Live controllers: called on the emulation thread once per frame when no input script is
      * loaded; fills the four players' N64 BUTTONS words. NULL: no input. */
     void (*live_inputs)(uint32_t buttons[4]);
+
+    /* Shipped warm lists (warm-<ROM MD5>.bin), or NULL: romfs:/data/warm on the Switch. */
+    const char* warm_dir;
+    /* The work since the frame before last ended, when the frame's time is not it (part of it is
+     * waiting for the display in a buffer swap): the emulation thread's running time. It includes
+     * the compiling ahead done after the last frame, which bench_core takes off. Called after
+     * frame_done. NULL, or a result of 0: the frame's time. */
+    uint64_t (*frame_work_ns)(void);
 
     /* For a netplay session (net/znx-net.cpp); everything else leaves these zero. */
     /* An input plugin's handle, or NULL for the core's dummy (controller 1 present, no input). */
@@ -111,6 +131,14 @@ void znx_bench_stop(void);
 int znx_bench_stop_requested(void);
 
 uint64_t znx_now_ns(void);
+
+/* Compiling ahead in idle time, for a session_run that drives its own frames (znx_bench_run's own
+ * loop does this itself). Call on the emulation thread after each completed visible frame, never
+ * for a re-simulated one. work_ns: what the frame's work took, everything since the last call
+ * except waiting. spare_ns: the time that was left over in that frame (what the pacer slept), or
+ * UINT64_MAX when nothing paces the frames. It compiles for at most
+ * min(precompile_ms - the largest recent work, the smallest recent spare time - 2.5 ms). */
+void znx_bench_idle(uint64_t work_ns, uint64_t spare_ns);
 
 /* The two checksums of a "check" line: of the 8 MB RDRAM, whole, and without [skip_lo, skip_hi)
  * (multiples of 32; returns the whole checksum as rest when the range is empty). */

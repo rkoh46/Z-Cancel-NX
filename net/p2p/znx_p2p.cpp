@@ -23,6 +23,9 @@
 #include "rmgk_gekko.hpp"
 
 #include "../znx_net.h"
+extern "C" {
+#include "bench_core.h"
+}
 
 namespace
 {
@@ -732,9 +735,37 @@ bool begin_visible_hook(void*)
     return true;
 }
 
+/* The recompiler's warm list (bench/bench_core.h): after a visible frame, compile ahead for the time the
+ * pacer has been sleeping before each present. Never for a re-simulated frame: this hook is the
+ * visible one's. */
+std::chrono::steady_clock::time_point g_idle_mark;
+unsigned long long g_idle_presents = 0;
+bool g_idle_paced = false;
+
+void idle_compile()
+{
+    const auto now = std::chrono::steady_clock::now();
+    unsigned long long presents = 0;
+    const long long slept_us = rmgk_gekko::last_present_sleep_us(&presents);
+    uint64_t work = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_idle_mark).count();
+    uint64_t spare = UINT64_MAX;   /* nothing paces the frames (znx-net --no-pace): only the frame's own time counts */
+    if (presents != g_idle_presents) {
+        g_idle_paced = true;
+        spare = slept_us > 0 ? (uint64_t)slept_us * 1000u : 0;
+        work = work > spare ? work - spare : 0;
+    } else if (g_idle_paced) {
+        spare = 0;   /* a frame the pacer did not time (no picture): how much it had to spare is not known */
+    }
+    g_idle_presents = presents;
+    g_idle_mark = now;
+    if (g_visible.load() > 1)   /* the first interval is the wait for the match to start */
+        znx_bench_idle(work, spare);
+}
+
 bool end_visible_hook(void*)
 {
     const int visible = ++g_visible;
+    idle_compile();
     if (visible % 30 == 0) {
         RollbackLagStats lag;
         rmgk_gekko::lag_stats(lag);
@@ -1306,6 +1337,9 @@ int run_rmgk_session(void* core, const struct znx_p2p_session_hooks* hooks, int 
     g_end = ZNX_P2P_END_NONE;
     g_peer_dropped = false;
     g_visible = 0;
+    g_idle_mark = std::chrono::steady_clock::now();
+    g_idle_presents = 0;
+    g_idle_paced = false;
     g_rollbacks = 0;
     g_deepest = 0;
     g_live_ping = -1;

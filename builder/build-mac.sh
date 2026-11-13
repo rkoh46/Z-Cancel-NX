@@ -162,8 +162,9 @@ NET_OBJS=""
 # queue_cxx <source> <object> <flags>
 queue_cxx() {
     mkdir -p "$(dirname "$2")"
+    # (bench/bench_core.h: its structures are shared with bench_core.c; a stale object writes past them)
     if [ ! -f "$2" ] || [ "$1" -nt "$2" ] || [ "$0" -nt "$2" ] || [ -n "${REBUILD:-}" ] || \
-       { [ -n "${4:-}" ] && [ "$4" -nt "$2" ]; }; then
+       [ bench/bench_core.h -nt "$2" ] || { [ -n "${4:-}" ] && [ "$4" -nt "$2" ]; }; then
         echo "echo '  CXX $1' && clang++ $3 -c $1 -o $2" >> "$CMDS"
     fi
     NET_OBJS="$NET_OBJS $2"
@@ -229,6 +230,10 @@ clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -fvisibility=hidden -dyn
 # The core's ROM database and cheat list (settings per game), read from <program dir>/data.
 mkdir -p "$OUT/data"
 cp "$CORE"/data/mupen64plus.ini "$CORE"/data/mupencheat.txt "$OUT/data/"
+# The shipped warm lists (assets/warm, made by tools/make_warm_list.sh), where znx-bench and znx-net look for them.
+mkdir -p "$OUT/data/warm"
+find "$OUT/data/warm" -name 'warm-*.bin' -delete
+cp assets/warm/warm-*.bin "$OUT/data/warm/" 2>/dev/null || true
 echo "built $OUT/znx-bench $OUT/znx-net"
 
 if [ "${2:-}" = game ]; then

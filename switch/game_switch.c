@@ -33,6 +33,11 @@
  *                      verbose=1      the core's and the plugin's own messages too
  *                      sound=1, stick_range=84   (the start screen's Settings write these two)
  *                      menu=1         0: no start screen, straight into rom.z64 as before
+ *                      precompile_ms=12  compile the ROM's warm list (profile/warm-<MD5>.bin, romfs:/data/warm)
+ *                                     ahead of need while a frame's work plus the compiling stays under
+ *                                     this; 0 only records the list
+ *                      precompile_big=1  0: blocks too large for a frame's spare time are compiled when the
+ *                                     game first runs them, not ahead (either way one late frame each)
  *   latest.log       every line of output, flushed line by line
  *
  * Lines also go to a PC running nxlink (-s). */
@@ -98,6 +103,8 @@ static bool ini_key(const char* key, const char* value, void* user)
     else if (!strcmp(key, "matrix")) snprintf(s->matrix, sizeof(s->matrix), "%s", value);
     else if (!strcmp(key, "net_overlay")) s->net_overlay = atoi(value) != 0;
     else if (!strcmp(key, "net_vsync")) s->net_vsync = atoi(value) != 0;
+    else if (!strcmp(key, "precompile_ms")) s->options.precompile_ms = atoi(value);   /* 0: no compiling ahead */
+    else if (!strcmp(key, "precompile_big")) s->options.precompile_big = atoi(value) != 0;
     /* the online settings the start screen keeps (menu/settings.h): read there */
     else if (!strcmp(key, "name") || !strcmp(key, "input_delay") || !strcmp(key, "public_list") ||
              !strcmp(key, "p2p_port") || !strcmp(key, "p2p_code") || !strcmp(key, "p2p_token") ||
@@ -240,11 +247,50 @@ static int net_begin(void* user)
     return 1;
 }
 
+/* Frame times of an online match, for the log: the emulation thread's CPU time from one shown frame to the
+ * next (the game, its picture, and any frames re-run after a rollback), and the time between two shown
+ * frames on the clock. "late" is a frame shown more than 25 ms after the one before it. */
+static struct {
+    uint64_t last_cpu, last_wall, sum, worst;
+    uint32_t count, over16, over33, late;
+    uint32_t all_count, all_over16, all_over33, all_late;
+    uint64_t all_worst;
+} l_nt;
+
+static void net_time_frame(void)
+{
+    const uint64_t cpu = thread_cpu_ns(), wall = armTicksToNs(armGetSystemTick());
+    if (l_nt.last_cpu != 0) {
+        const uint64_t ns = cpu > l_nt.last_cpu ? cpu - l_nt.last_cpu : 0;
+        l_nt.count++;
+        l_nt.sum += ns;
+        if (ns > l_nt.worst) l_nt.worst = ns;
+        if (ns > 16666667ull) l_nt.over16++;
+        if (ns > 33333333ull) l_nt.over33++;
+        if (wall - l_nt.last_wall > 25000000ull) l_nt.late++;
+    }
+    l_nt.last_cpu = cpu;
+    l_nt.last_wall = wall;
+}
+
+static void net_time_report(int frames)
+{
+    if (l_nt.count == 0) return;
+    znx_log("online timing %d: %u frames, %.2f ms/frame, worst %.2f, over 16.7 ms %u, over 33 ms %u, shown late %u",
+            frames, l_nt.count, l_nt.sum / 1e6 / l_nt.count, l_nt.worst / 1e6, l_nt.over16, l_nt.over33, l_nt.late);
+    l_nt.all_count += l_nt.count; l_nt.all_over16 += l_nt.over16; l_nt.all_over33 += l_nt.over33;
+    l_nt.all_late += l_nt.late;
+    if (l_nt.worst > l_nt.all_worst) l_nt.all_worst = l_nt.worst;
+    l_nt.count = l_nt.over16 = l_nt.over33 = l_nt.late = 0;
+    l_nt.sum = l_nt.worst = 0;
+}
+
 static int net_end(void* user)
 {
     const int frames = znx_p2p_visible_frames();
     (void)user;
     znx_vidext_net_frame_end();
+    net_time_frame();
     if (frames % 30 == 0) {
         struct znx_p2p_live live;
         znx_p2p_live(&live);
@@ -258,6 +304,8 @@ static int net_end(void* user)
             snprintf(rollbacks, sizeof(rollbacks), "%d", live.rollbacks);
             znx_vidext_set_overlay(labels, values, 3);
         }
+        if (frames % 600 == 0)
+            net_time_report(frames);
         if (frames % 600 == 0)
             znx_log("online %d: ping %d ms, rollbacks %d (deepest %d), %.2f frames ahead, speed %.4f", frames, live.ping,
                     live.rollbacks, live.deepest, live.frames_ahead, live.speed);
@@ -335,7 +383,12 @@ static int net_session_run(void)
     l_net_leaving = 0;
     /* peer to peer (znx_p2p_run_session) or a lobby match (net/lobby_play.h): the same hooks, pacing,
      * overlay, quit hold and checkpoints */
-    return znx_online_run_session(l_core_lib, &hooks);
+    memset(&l_nt, 0, sizeof(l_nt));
+    const int result = znx_online_run_session(l_core_lib, &hooks);
+    net_time_report(znx_p2p_visible_frames());
+    znx_log("online timing, whole match: %u frames, worst %.2f ms, over 16.7 ms %u, over 33 ms %u, shown late %u",
+            l_nt.all_count, l_nt.all_worst / 1e6, l_nt.all_over16, l_nt.all_over33, l_nt.all_late);
+    return result;
 }
 
 static int net_session_prepare(void* core)
@@ -425,6 +478,8 @@ static int play(const char* rom_path, bool have_romfs, bool online)
     host.print = znx_front_print;
     host.data_dir = "romfs:/data";
     host.user_dir = ZNX_BASE_DIR "/profile";
+    host.warm_dir = "romfs:/data/warm";              /* the shipped warm lists; this console's go to profile/ */
+    host.frame_work_ns = znx_game_last_frame_work_ns; /* compiling ahead fits itself around the frame's work */
     host.vidext = znx_vidext_functions();
     host.video_config = znx_game_video_config;
     host.frame_done = frame_done;

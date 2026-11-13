@@ -1,0 +1,128 @@
+Recompiler: cheaper culling of host registers (pass 4)
+
+Where a compile's time goes (Mac, 3,163 blocks of a match, 82 us a block): pass 4 "cull unused host
+registers" 29%, pass 8 assembly 26%, pass 3 allocation 15%, pass 6 8%, pass 5 7%, the stubs 6%,
+pass 7 4%; the cache flush, the linker, the list entries and the expiry together under 4%. There
+are no large memsets, no repeated flushes and no debug bookkeeping to remove: the time is in loops
+over the 29 host registers, per instruction.
+
+Three of those loops in pass 4 did work that cannot change their result:
+- which host register holds the upper half of the instruction's target was searched for (get_reg,
+  29 compares) once per host register; the answer only changes when the loop empties the register
+  found, so it is searched again only then;
+- the tests on a host register that holds nothing before, at the entry of and after the instruction
+  cannot match (-1 is no register, and neither is -1 & 63): such registers, most of the 29, are
+  skipped;
+- four tests that can only clear a register's bit ran a search even when the bit was already clear.
+
+The generated code is the same: with DebugDynarecWarmConfig(2) the core hashes everything passes 1
+to 7 decide for each block (all the assembler goes by); that hash and the hash of the block sizes
+are equal before and after this patch for a 17,000-frame match and for a forced four-CPU match, as
+are the RDRAM hashes. Mac: 0.074 -> 0.064 ms per block.
+
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
+@@ -11269,6 +11269,7 @@
+           nr|=needed_reg[i+2];
+           for(hr=0;hr<HOST_REGS;hr++)
+           {
++            if(!((nr>>hr)&1)) continue; // nothing to clear: spare the search
+             if(regmap_pre[i+2][hr]>=0&&get_reg(regs[i+2].regmap_entry,regmap_pre[i+2][hr])<0) nr&=~(1LL<<hr);
+             //if((regmap_entry[i+2][hr])>=0) if(!((nr>>hr)&1)) DebugMessage(M64MSG_VERBOSE, "%x-bogus(%d=%d)",start+i*4,hr,regmap_entry[i+2][hr]);
+           }
+@@ -11281,6 +11282,10 @@
+       // Merge in delay slot
+       for(hr=0;hr<HOST_REGS;hr++)
+       {
++        // A host register that holds nothing before, at the entry of and after this instruction
++        // matches none of the tests below (-1 is no register, and -1&63 is none either). Most of
++        // the 29 are in that state, and this loop and the next were a quarter of a compile.
++        if(regs[i].regmap[hr]==-1&&regmap_pre[i][hr]==-1&&regs[i].regmap_entry[hr]==-1) continue;
+         if(!likely[i]) {
+           // These are overwritten unless the branch is "likely"
+           // and the delay slot is nullified if not taken
+@@ -11323,15 +11328,17 @@
+     {
+       if(i<slen-1) {
+         for(hr=0;hr<HOST_REGS;hr++) {
++          // The four tests only ever clear this register's bit: the cheap ones first, the search
++          // (get_reg) only when the bit is still set.
++          if(!((nr>>hr)&1)) continue;
++          if(regs[i].regmap[hr]<0||regs[i].regmap[hr]!=regmap_pre[i+1][hr]||regs[i].regmap[hr]!=regmap_pre[i][hr]) { nr&=~(1LL<<hr); continue; }
+           if(regmap_pre[i+1][hr]>=0&&get_reg(regs[i+1].regmap_entry,regmap_pre[i+1][hr])<0) nr&=~(1LL<<hr);
+-          if(regs[i].regmap[hr]!=regmap_pre[i+1][hr]) nr&=~(1LL<<hr);
+-          if(regs[i].regmap[hr]!=regmap_pre[i][hr]) nr&=~(1LL<<hr);
+-          if(regs[i].regmap[hr]<0) nr&=~(1LL<<hr);
+         }
+       }
+     }
+     for(hr=0;hr<HOST_REGS;hr++)
+     {
++      if(regs[i].regmap[hr]==-1&&regmap_pre[i][hr]==-1&&regs[i].regmap_entry[hr]==-1) continue; // as above
+       // Overwritten registers are not needed
+       if(rt1[i]&&rt1[i]==(regs[i].regmap[hr]&63)) nr&=~(1LL<<hr);
+       if(rt2[i]&&rt2[i]==(regs[i].regmap[hr]&63)) nr&=~(1LL<<hr);
+@@ -11383,6 +11390,10 @@
+     needed_reg[i]=nr;
+ 
+     // Deallocate unneeded registers
++    // Which host register holds the upper half of this instruction's (or, at a branch, its delay
++    // slot's) target was searched for again for each of the 29 host registers. The answer only
++    // changes when the loop empties the register that was found: -2 = search again.
++    int upper_reg=-2,upper_branch_reg=-2;
+     for(hr=0;hr<HOST_REGS;hr++)
+     {
+       if(!((nr>>hr)&1)) {
+@@ -11395,6 +11406,7 @@
+           {
+             if(likely[i]) {
+               regs[i].regmap[hr]=-1;
++              if(hr==upper_reg) upper_reg=-2;
+               regs[i].isconst&=~(1<<hr);
+               if(i<slen-2) {
+                 regmap_pre[i+2][hr]=-1;
+@@ -11406,7 +11418,9 @@
+         if(itype[i]==RJUMP||itype[i]==UJUMP||itype[i]==CJUMP||itype[i]==SJUMP||itype[i]==FJUMP)
+         {
+           int d1=0,d2=0,map=0,temp=0;
+-          if(get_reg(regs[i].regmap,rt1[i+1]|64)>=0||get_reg(branch_regs[i].regmap,rt1[i+1]|64)>=0)
++          if(upper_reg==-2) upper_reg=get_reg(regs[i].regmap,rt1[i+1]|64);
++          if(upper_reg<0&&upper_branch_reg==-2) upper_branch_reg=get_reg(branch_regs[i].regmap,rt1[i+1]|64);
++          if(upper_reg>=0||upper_branch_reg>=0)
+           {
+             d1=dep1[i+1];
+             d2=dep2[i+1];
+@@ -11435,6 +11449,7 @@
+              regs[i].regmap[hr]!=map )
+           {
+             regs[i].regmap[hr]=-1;
++            if(hr==upper_reg) upper_reg=-2;
+             regs[i].isconst&=~(1<<hr);
+             if((branch_regs[i].regmap[hr]&63)!=rs1[i] && (branch_regs[i].regmap[hr]&63)!=rs2[i] &&
+                (branch_regs[i].regmap[hr]&63)!=rt1[i] && (branch_regs[i].regmap[hr]&63)!=rt2[i] &&
+@@ -11448,6 +11463,7 @@
+                branch_regs[i].regmap[hr]!=map)
+             {
+               branch_regs[i].regmap[hr]=-1;
++              if(hr==upper_branch_reg) upper_branch_reg=-2;
+               branch_regs[i].regmap_entry[hr]=-1;
+               if(itype[i]!=RJUMP&&itype[i]!=UJUMP&&(source[i]>>16)!=0x1000)
+               {
+@@ -11465,7 +11481,8 @@
+           if(i>0)
+           {
+             int d1=0,d2=0,map=-1,temp=-1;
+-            if(get_reg(regs[i].regmap,rt1[i]|64)>=0)
++            if(upper_reg==-2) upper_reg=get_reg(regs[i].regmap,rt1[i]|64);
++            if(upper_reg>=0)
+             {
+               d1=dep1[i];
+               d2=dep2[i];
+@@ -11501,6 +11518,7 @@
+                 regs[i+1].wasconst&=~(1<<hr);
+               }
+               regs[i].regmap[hr]=-1;
++              if(hr==upper_reg) upper_reg=-2;
+               regs[i].isconst&=~(1<<hr);
+             }
+           }

@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 #include "m64p_types.h"
@@ -87,6 +88,29 @@ static uint64_t l_emu_ns;      /* sum of all frame times */
 static uint64_t l_progress_ns; /* frame time since the last progress line */
 static volatile uint64_t l_alive_ns; /* start of the frame or replayed frame in flight, 0 = idle */
 
+/* The recompiler's warm list (the core's DebugDynarecWarm* functions; bench_core.h, znx_options). */
+#define WARM_STATS 16
+#define IDLE_RING 16
+#define IDLE_RESERVE_NS 2500000ull
+#define IDLE_OVERSIZED_US 50000u   /* the most one block compiled ahead may take (znx_options.precompile_big) */
+static void (*l_warm_reset)(void);
+static int (*l_warm_load)(const unsigned int*, int);
+static int (*l_warm_read)(unsigned int*, int);
+static int (*l_warm_precompile)(unsigned int, unsigned int);
+static void (*l_warm_stats)(unsigned long long*);
+static void (*l_warm_config)(int);
+static int l_warm_on;             /* the core records a list for this run */
+static int l_warm_file_count;     /* entries the file to save to already holds */
+static int l_warm_start_count;    /* entries when the run started */
+static char l_warm_file[4400];
+static uint64_t l_idle_work[IDLE_RING], l_idle_spare[IDLE_RING];
+static int l_idle_count;
+static uint64_t l_idle_last_ns, l_idle_ns, l_idle_worst_ns;   /* worst: a frame's work plus the compiling after it */
+static int l_idle_calls, l_idle_blocks, l_idle_empty;   /* empty: calls that found nothing to compile */
+static uint64_t l_idle_empty_ns;
+static uint16_t* l_frame_full;    /* per frame: blocks compiled in full when the game asked for them */
+static unsigned long long l_full_last;
+
 uint64_t znx_now_ns(void)
 {
     struct timespec ts;
@@ -116,6 +140,8 @@ void znx_options_defaults(struct znx_options* o)
     o->dump_frame = -1;
     o->vs_stage = -1;
     o->vs_fighters[0] = o->vs_fighters[1] = o->vs_fighters[2] = o->vs_fighters[3] = -1;
+    o->precompile_ms = 12;
+    o->precompile_big = 1;
     /* Vanilla Super Smash Bros. (U) without input: logo and intro, title at 4313, then the
      * CPU demo fight from 4983. Windows that the run does not reach are not printed. */
     o->windows[0] = (struct znx_window){ "intro", 0, 4300 };
@@ -190,6 +216,221 @@ void znx_check_rdram(const uint8_t* rdram, long skip_lo, long skip_hi, uint64_t*
     *whole = checksum_range(rdram, 0, RDRAM_SIZE, 0);
     *rest = hi > lo && hi <= RDRAM_SIZE
         ? checksum_range(rdram, 0, lo, 1) ^ (checksum_range(rdram, hi, RDRAM_SIZE, 2) * 11) : *whole;
+}
+
+/* ---- the recompiler's warm list ----
+ *
+ * A list file: "ZNXWARM1", version (1), entry count, the ROM's MD5 as 32 characters, then per entry
+ * address, source length in bytes and checksum, then an FNV-1a of the entry bytes; every number a
+ * little-endian 32-bit word. It holds no game code, only where code was and a checksum of it, so
+ * the lists for the known ROMs ship with the program. */
+
+static uint32_t get_le32(const uint8_t* p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static void put_le32(uint8_t* p, uint32_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static uint32_t fnv32(const uint8_t* p, size_t size)
+{
+    uint32_t h = 0x811c9dc5u;
+    for (size_t i = 0; i < size; ++i) { h ^= p[i]; h *= 0x01000193u; }
+    return h;
+}
+
+/* Gives a list file to the core. Returns how many entries it holds, 0 when it is missing, for
+ * another ROM or damaged (a damaged file is simply written anew at the end). */
+static int warm_load_file(const char* path, const char* md5)
+{
+    FILE* f = fopen(path, "rb");
+    uint8_t header[48];
+    uint8_t* body = NULL;
+    unsigned int* entries = NULL;
+    int count = 0, ok = 0;
+    if (f == NULL)
+        return 0;
+    if (fread(header, 1, sizeof(header), f) == sizeof(header) && !memcmp(header, "ZNXWARM1", 8) &&
+        get_le32(header + 8) == 1 && !strncasecmp((const char*)header + 16, md5, 32)) {
+        count = (int)get_le32(header + 12);
+        if (count > 0 && count <= 4000000) {
+            const size_t size = (size_t)count * 12;
+            body = malloc(size + 4);
+            entries = malloc((size_t)count * 3 * sizeof(*entries));
+            if (body != NULL && entries != NULL && fread(body, 1, size + 4, f) == size + 4 &&
+                get_le32(body + size) == fnv32(body, size)) {
+                for (int i = 0; i < count * 3; ++i)
+                    entries[i] = get_le32(body + (size_t)i * 4);
+                l_warm_load(entries, count);
+                ok = 1;
+            }
+        }
+    }
+    fclose(f);
+    free(body);
+    free(entries);
+    if (!ok && count != 0)
+        err("%s: %s is damaged; it will be written anew", l_name, path);
+    return ok ? count : 0;
+}
+
+static int warm_save_file(const char* path, const char* md5, const unsigned int* entries, int count)
+{
+    char temp[4500];
+    const size_t size = (size_t)count * 12;
+    uint8_t* data = malloc(48 + size + 4);
+    FILE* f;
+    int ok;
+    if (data == NULL)
+        return 0;
+    memcpy(data, "ZNXWARM1", 8);
+    put_le32(data + 8, 1);
+    put_le32(data + 12, (uint32_t)count);
+    memcpy(data + 16, md5, 32);
+    for (int i = 0; i < count * 3; ++i)
+        put_le32(data + 48 + (size_t)i * 4, entries[i]);
+    put_le32(data + 48 + size, fnv32(data + 48, size));
+    snprintf(temp, sizeof(temp), "%s.new", path);
+    f = fopen(temp, "wb");
+    ok = f != NULL && fwrite(data, 1, 48 + size + 4, f) == 48 + size + 4;
+    if (f != NULL && fclose(f) != 0)
+        ok = 0;
+    free(data);
+    if (ok) {
+        remove(path);   /* rename does not replace a file on the Switch's SD card */
+        ok = rename(temp, path) == 0;
+    }
+    if (!ok)
+        remove(temp);
+    return ok;
+}
+
+/* The ROM is open: the list of this ROM goes into the core. */
+static void warm_begin(const char* md5)
+{
+    char shipped[4400];
+    int user = 0, extra = 0;
+    l_warm_on = 0;
+    l_idle_count = 0;
+    l_idle_last_ns = l_idle_ns = l_idle_worst_ns = 0;
+    l_idle_calls = l_idle_blocks = l_idle_empty = 0;
+    l_idle_empty_ns = 0;
+    l_full_last = 0;
+    l_warm_reset = l_host->sym(l_host->core, "DebugDynarecWarmReset");
+    l_warm_load = l_host->sym(l_host->core, "DebugDynarecWarmLoad");
+    l_warm_read = l_host->sym(l_host->core, "DebugDynarecWarmRead");
+    l_warm_precompile = l_host->sym(l_host->core, "DebugDynarecPrecompile");
+    l_warm_stats = l_host->sym(l_host->core, "DebugDynarecWarmStats");
+    l_warm_config = l_host->sym(l_host->core, "DebugDynarecWarmConfig");
+    if (!l_warm_reset || !l_warm_load || !l_warm_read || !l_warm_precompile || !l_warm_stats || !l_warm_config)
+        return;
+    l_warm_reset();
+    l_warm_config(l_opt.warm_flags);
+    if (l_opt.warm_off || l_opt.emumode < 2 || strlen(md5) != 32)
+        return;
+    l_warm_on = 1;
+    if (l_opt.warm_path != NULL)
+        snprintf(l_warm_file, sizeof(l_warm_file), "%s", l_opt.warm_path);
+    else
+        snprintf(l_warm_file, sizeof(l_warm_file), "%s/warm-%s.bin", l_host->user_dir, md5);
+    user = warm_load_file(l_warm_file, md5);
+    l_warm_file_count = user;
+    if (l_opt.warm_path == NULL && l_host->warm_dir != NULL) {
+        snprintf(shipped, sizeof(shipped), "%s/warm-%s.bin", l_host->warm_dir, md5);
+        extra = warm_load_file(shipped, md5);
+    }
+    l_warm_start_count = l_warm_read(NULL, 0);
+    out("warm list: %d entries (%d in this console's file, %d in the shipped one), compiling ahead %s", l_warm_start_count,
+        user, extra, l_opt.precompile_ms > 0 ? "on" : "off");
+}
+
+/* The run is over: what the list did, and the list with this run's blocks back into its file. */
+static void warm_end(const char* md5)
+{
+    unsigned long long s[WARM_STATS];
+    unsigned int* entries;
+    int count;
+    if (!l_warm_on)
+        return;
+    l_warm_on = 0;
+    l_warm_stats(s);
+    out("warm list: %llu loaded, %llu compiled ahead in %.1f ms (%llu of them used, %llu larger than a frame's spare time), "
+        "%llu compiled on demand (%llu of them listed), %llu listed but never in memory, code cache %.1f MB",
+        s[0], s[2], l_idle_ns / 1e6, s[3], s[7], s[4], s[5], s[8], s[9] / 1048576.0);
+    if (l_idle_calls > 0)
+        out("warm timing: %d calls after frames, %.1f ms in all; %d of them found nothing to compile (%.2f us each); "
+            "a frame's work plus the compiling after it took at most %.3f ms", l_idle_calls, l_idle_ns / 1e6,
+            l_idle_empty, l_idle_empty ? l_idle_empty_ns / 1e3 / l_idle_empty : 0.0, l_idle_worst_ns / 1e6);
+    if (l_opt.warm_flags & 1)
+        out("warm verify: %llu blocks compiled ahead; %llu of them were asked for, compiled again and compared: %llu differ",
+            s[2], s[14], s[11]);
+    if (l_opt.warm_flags & 2)
+        out("code hash %016llx sizes %016llx analysis %016llx bytes %llu", s[12], s[13], s[15], s[9]);
+    count = l_warm_read(NULL, 0);
+    if (count <= l_warm_file_count)
+        return;   /* nothing the file does not have */
+    entries = malloc((size_t)count * 3 * sizeof(*entries));
+    if (entries != NULL && l_warm_read(entries, count) == count && warm_save_file(l_warm_file, md5, entries, count))
+        out("warm list: %d entries (%d new in this run) saved to %s", count, count - l_warm_start_count, l_warm_file);
+    else
+        err("%s: cannot write %s", l_name, l_warm_file);
+    free(entries);
+}
+
+/* After a completed visible frame: compile ahead for the time that can be given away. work_ns is the
+ * frame's work, slack_ns what was left over in it (UINT64_MAX: nothing paces the frames). */
+static void warm_idle(uint64_t work_ns, uint64_t slack_ns)
+{
+    uint64_t worst_work = 0, least_slack = UINT64_MAX, budget, begin, took;
+    const uint64_t target = (uint64_t)(l_opt.precompile_ms > 0 ? l_opt.precompile_ms : 0) * 1000000ull;
+    unsigned int oversized_us = 0;
+    int blocks;
+    l_idle_last_ns = 0;
+    if (!l_warm_on || target == 0)
+        return;
+    l_idle_work[l_idle_count % IDLE_RING] = work_ns;
+    l_idle_spare[l_idle_count % IDLE_RING] = slack_ns;
+    l_idle_count++;
+    for (int i = 0; i < IDLE_RING && i < l_idle_count; ++i) {
+        if (l_idle_work[i] > worst_work) worst_work = l_idle_work[i];
+        if (l_idle_spare[i] < least_slack) least_slack = l_idle_spare[i];
+    }
+    budget = target > worst_work ? target - worst_work : 0;
+    if (least_slack != UINT64_MAX) {
+        const uint64_t spare = least_slack > IDLE_RESERVE_NS ? least_slack - IDLE_RESERVE_NS : 0;
+        if (spare < budget) budget = spare;
+    }
+    if (budget < 100000ull)
+        return;
+    /* A block too large for any frame's spare time (the lists have a few of thousands of instructions) costs
+     * one late frame whenever it is compiled. Better now, when its code has just been loaded and the frame is
+     * a light one, than when the game first runs it; never in a session paced by RMG-K's timer. */
+    if (l_opt.precompile_big && slack_ns == UINT64_MAX && budget * 2 >= target)
+        oversized_us = IDLE_OVERSIZED_US;
+    begin = znx_now_ns();
+    blocks = l_warm_precompile((unsigned int)(budget / 1000), oversized_us);
+    took = znx_now_ns() - begin;
+    l_idle_last_ns = took;
+    l_idle_ns += took;
+    l_idle_calls++;
+    l_idle_blocks += blocks;
+    if (blocks == 0) {
+        l_idle_empty++;
+        l_idle_empty_ns += took;
+    }
+    if (work_ns + took > l_idle_worst_ns)
+        l_idle_worst_ns = work_ns + took;
+}
+
+void znx_bench_idle(uint64_t work_ns, uint64_t spare_ns)
+{
+    /* The caller's numbers include the compiling done in the last call: as work, and missing from
+     * the time that was left over. */
+    const uint64_t last = l_idle_last_ns;
+    warm_idle(work_ns > last ? work_ns - last : 0, spare_ns == UINT64_MAX ? spare_ns : spare_ns + last);
 }
 
 /* ---- callbacks from the core ---- */
@@ -404,6 +645,12 @@ static void frame_timer_stop(void)
         l_frame_blocks[l_frame] = now[0] - l_dyn_last[0] > 65535 ? 65535 : (uint16_t)(now[0] - l_dyn_last[0]);
         l_frame_compile_us10[l_frame] = (uint32_t)((now[1] - l_dyn_last[1]) * 10);
         memcpy(l_dyn_last, now, sizeof(now));
+        if (l_warm_stats != NULL && l_frame_full != NULL) {
+            unsigned long long warm[WARM_STATS];
+            l_warm_stats(warm);
+            l_frame_full[l_frame] = warm[4] - l_full_last > 65535 ? 65535 : (uint16_t)(warm[4] - l_full_last);
+            l_full_last = warm[4];
+        }
     }
 }
 
@@ -481,6 +728,13 @@ static int end_frame(void* user)
     (void)user;
     frame_timer_stop();
     frame_done();
+    /* The frame is complete and nothing of the game is running: the time left over goes to compiling
+     * ahead. Re-simulated frames (rollback_replay, inside begin_frame) never come here. */
+    {
+        const uint64_t cpu_ns = l_host->frame_work_ns != NULL ? l_host->frame_work_ns() : 0;
+        const uint64_t last = l_idle_last_ns;
+        warm_idle(cpu_ns == 0 ? l_frame_ns : cpu_ns > last ? cpu_ns - last : 0, UINT64_MAX);
+    }
     return 1;
 }
 
@@ -658,6 +912,14 @@ static void print_windows(void)
         if (l_frame_blocks != NULL)
             out("vs compiling 0x%02x: %llu blocks, %.1f ms in all from frame 660 (%.3f ms per block)", l_opt.vs_stage,
                 (unsigned long long)blocks, compile / 1e4, blocks ? compile / 1e4 / blocks : 0.0);
+        if (l_frame_full != NULL) {
+            /* blocks: every block the game asked for; of those, compiled in full then and there (the rest
+             * had been compiled ahead and were only linked in) */
+            unsigned long long full = 0;
+            for (int f = 660; f < l_frame; ++f) full += l_frame_full[f];
+            out("vs timing 0x%02x: %d frames from 660, %.3f ms/frame, over 16.7 ms %d, over 33 ms %d, compiled on demand %llu",
+                l_opt.vs_stage, l_frame - 660, total / 1e4 / (l_frame - 660), over16, over33, full);
+        } else
         out("vs timing 0x%02x: %d frames from 660, %.3f ms/frame, over 16.7 ms %d, over 33 ms %d", l_opt.vs_stage,
             l_frame - 660, total / 1e4 / (l_frame - 660), over16, over33);
         if (listed)
@@ -667,7 +929,7 @@ static void print_windows(void)
 
 int znx_bench_run(const struct znx_host* host, const struct znx_options* options)
 {
-    char user_dir[4200];
+    char user_dir[4200], rom_md5[40] = "";
     m64p_error error;
     m64p_handle core_cfg;
     ptr_PluginStartup rsp_startup, video_startup;
@@ -714,6 +976,7 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         l_frame_us10 = calloc((size_t)l_opt.frames, sizeof(*l_frame_us10));
         l_dynarec_stats = l_host->sym(host->core, "DebugDynarecStats");
         if (l_dynarec_stats != NULL) {
+            l_frame_full = calloc((size_t)l_opt.frames, sizeof(*l_frame_full));
             l_frame_blocks = calloc((size_t)l_opt.frames, sizeof(*l_frame_blocks));
             l_frame_compile_us10 = calloc((size_t)l_opt.frames, sizeof(*l_frame_compile_us10));
             memset(l_dyn_last, 0, sizeof(l_dyn_last));
@@ -790,9 +1053,12 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
 
     {
         m64p_rom_settings rom_settings;
-        if (CoreDoCommand(M64CMD_ROM_GET_SETTINGS, sizeof(rom_settings), &rom_settings) == M64ERR_SUCCESS)
+        if (CoreDoCommand(M64CMD_ROM_GET_SETTINGS, sizeof(rom_settings), &rom_settings) == M64ERR_SUCCESS) {
             out("rom \"%s\" md5 %s countperop %u sidmaduration %u savetype %u", rom_settings.goodname,
                 rom_settings.MD5, rom_settings.countperop, rom_settings.sidmaduration, rom_settings.savetype);
+            snprintf(rom_md5, sizeof(rom_md5), "%s", rom_settings.MD5);
+        }
+        warm_begin(rom_md5);
     }
 
     /* Video: znx-video-null, which draws nothing but tells the core each display list is
@@ -941,6 +1207,23 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
                 (l_st_load_ns + l_st_replay_ns) / 1e6 / l_st_count, l_st_total_worst / 1e6);
         }
         print_windows();
+        if (l_frame_full != NULL && l_warm_on) {
+            /* where the game still had to wait for the compiler: the frames with blocks compiled in full */
+            char line[400];
+            int used = 0, listed = 0, frames = 0;
+            unsigned long long full = 0;
+            line[0] = '\0';
+            for (int f = 0; f < l_frame; ++f) {
+                if (l_frame_full[f] == 0) continue;
+                frames++;
+                full += l_frame_full[f];
+                if (listed < 20) {
+                    used += snprintf(line + used, sizeof(line) - (size_t)used, " %d:%u", f, l_frame_full[f]);
+                    listed++;
+                }
+            }
+            out("compiled on demand: %llu blocks in %d frames (frame:blocks)%s%s", full, frames, line, frames > listed ? " ..." : "");
+        }
         if (l_opt.frames > 0 && l_frame < l_opt.frames) {
             err("%s: stopped after %d of %d frames", l_name, l_frame, l_opt.frames);
             l_failed = 1;
@@ -948,6 +1231,7 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
     }
 
 shutdown:
+    warm_end(rom_md5);
     CoreDoCommand(M64CMD_ROLLBACK_SET_INPUT_CALLBACK, 0, NULL);
     CoreDoCommand(M64CMD_ROLLBACK_SET_SAVE_DATA, 0, NULL);
     if (input_attached)
@@ -980,5 +1264,7 @@ shutdown:
     l_event_count = 0;
     free(l_frame_us10);
     l_frame_us10 = NULL;
+    free(l_frame_full);
+    l_frame_full = NULL;
     return l_failed ? 1 : 0;
 }

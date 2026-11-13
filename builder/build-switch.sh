@@ -45,7 +45,7 @@
 # texture-pack library (TxFilterStub.cpp) and without on-screen text (TextDrawerStub.cpp).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-IMAGE="${ZNX_DOCKER_IMAGE:-melee-nx-netplay-build:latest}"
+IMAGE="${ZNX_DOCKER_IMAGE:-z-cancel-nx-build:latest}"
 
 if [ "${1:-}" != "--in-container" ]; then
     cd "$ROOT"
@@ -205,10 +205,12 @@ CORE_OBJS=""
 RSP_OBJS=""
 GLN_OBJS=""
 # queue <source> <object> <flags> [compiler]: compiled only when the source, this script or
-# the flags' inputs are newer
+# the flags' inputs are newer; or bench/bench_core.h, whose structures the fronts, the netplay
+# glue and bench_core.c itself must agree on (a stale object writes past them)
 queue() {
     mkdir -p "$(dirname "$2")"
-    if [ ! -f "$2" ] || [ "$1" -nt "$2" ] || [ "$0" -nt "$2" ] || [ "$SRC/.stamp" -nt "$2" ] || [ -n "${REBUILD:-}" ]; then
+    if [ ! -f "$2" ] || [ "$1" -nt "$2" ] || [ "$0" -nt "$2" ] || [ "$SRC/.stamp" -nt "$2" ] || [ -n "${REBUILD:-}" ] ||
+       [ bench/bench_core.h -nt "$2" ] || [ game/game_core.h -nt "$2" ]; then
         printf '%s\n' "echo '  CC $1' && ${P}${4:-gcc} $3 -c $1 -o $2" >> "$CMDS"
     fi
 }
@@ -487,14 +489,20 @@ if [ "$TARGET" = selftest ]; then
         $NET_OBJS "$OBJ/front/dynlib_static.o" "$OBJ/front/bench_core.o" "$OBJ/front/static_libs_selftestnet.o" \
         "$OBJ/lib_core.o" "$OBJ/lib_rsp_hle.o" "$OBJ/lib_video_null.o" "$OBJ/lib_input_net.o" "$OBJ/front/jit_memory.o" \
         /usr/lib/aarch64-linux-gnu/libz.so.1 -lpthread -lm -o "$OUT/znx-net-linux"
-    mkdir -p "$OUT/data" "$OUT/profile"
+    mkdir -p "$OUT/data/warm" "$OUT/profile"
     cp "$CORE"/data/mupen64plus.ini "$CORE"/data/mupencheat.txt "$OUT/data/"
+    cp assets/warm/warm-*.bin "$OUT/data/warm/" 2>/dev/null || true
     echo "built $OUT/znx-selftest $OUT/znx-net-linux"
     exit 0
 fi
 
 # The core's ROM database and cheat list (settings per game) travel inside the NRO as romfs:/data.
 cp "$CORE"/data/mupen64plus.ini "$CORE"/data/mupencheat.txt "$OUT/romfs/data/"
+# The recompiler's warm lists for the known ROMs (tools/make_warm_list.sh; addresses, lengths and
+# checksums of blocks, no game code) as romfs:/data/warm: compiled ahead of need from the first start.
+mkdir -p "$OUT/romfs/data/warm"
+rm -f "$OUT"/romfs/data/warm/warm-*.bin
+cp assets/warm/warm-*.bin "$OUT/romfs/data/warm/" 2>/dev/null || echo "note: no warm lists in assets/warm (tools/make_warm_list.sh makes them)"
 # The start screen's font (SIL OFL 1.1) as romfs:/fonts; the licences of what the start screen adds as
 # romfs:/licenses (THIRD_PARTY_NOTICES.md).
 mkdir -p "$OUT/romfs/fonts"

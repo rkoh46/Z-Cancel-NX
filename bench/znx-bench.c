@@ -14,11 +14,13 @@
 #include <dlfcn.h>
 #include <libgen.h>
 #include <mach-o/dyld.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include "bench_core.h"
 
@@ -57,17 +59,25 @@ static void usage(void)
         "                       game data: keep the file out of the repository\n"
         "  --watch ADDR         print \"watch <frame> <addr> <byte>\" when that RDRAM byte changes (hex address)\n"
         "  --input-players N    controller ports the session synchronizes, default 4; the others read as\n"
-        "                       unplugged (RMG-K's P2P sessions use 2: compare with znx-net)\n");
+        "                       unplugged (RMG-K's P2P sessions use 2: compare with znx-net)\n"
+        "  --precompile-ms N    compile the ROM's warm list ahead of need in the idle time after each frame, while\n"
+        "                       the frame and the compiling stay under N ms; default 12, 0 = only record the list\n"
+        "  --no-precompile-big  leave blocks that take longer than a frame's spare time to be compiled on demand\n"
+        "  --warm FILE          the warm list to load and save, instead of profile/warm-<MD5>.bin (and data/warm/)\n"
+        "  --no-warm            no warm list: nothing loaded, nothing saved\n"
+        "  --warm-verify        compile every block on demand all the same and compare it with the one compiled ahead\n"
+        "  --code-hash          print a hash of the generated code at the end (to compare two runs or two builds)\n"
+        "  --no-aslr            run with address randomization off, so that --code-hash is the same in every run\n");
     exit(2);
 }
 
 int main(int argc, char** argv)
 {
-    char exe[4096], dir[4096], data_dir[4200], user_dir[4200];
+    char exe[4096], dir[4096], data_dir[4200], user_dir[4200], warm_dir[4200];
     uint32_t exe_size = sizeof(exe);
     struct znx_options o;
     struct znx_host host;
-    int result;
+    int result, no_aslr = 0;
 
     znx_options_defaults(&o);
     for (int i = 1; i < argc; ++i) {
@@ -93,12 +103,37 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--watch") && i + 1 < argc) o.watch = strtol(argv[++i], NULL, 16) & 0x7fffff;
         else if (!strcmp(a, "--dump-ram") && i + 2 < argc) { o.dump_frame = atoi(argv[++i]); o.dump_path = argv[++i]; }
         else if (!strcmp(a, "--input-players") && i + 1 < argc) o.input_players = atoi(argv[++i]);
+        else if (!strcmp(a, "--precompile-ms") && i + 1 < argc) o.precompile_ms = atoi(argv[++i]);
+        else if (!strcmp(a, "--no-warm")) o.warm_off = 1;
+        else if (!strcmp(a, "--no-precompile-big")) o.precompile_big = 0;
+        else if (!strcmp(a, "--warm") && i + 1 < argc) o.warm_path = argv[++i];
+        else if (!strcmp(a, "--warm-verify")) o.warm_flags |= 1;
+        else if (!strcmp(a, "--code-hash")) o.warm_flags |= 2;
+        else if (!strcmp(a, "--no-aslr")) no_aslr = 1;
         else if (!strcmp(a, "--verbose")) o.verbose = 1;
         else usage();
     }
     if (o.rom_path == NULL || o.frames <= 0)
         usage();
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if (no_aslr && getenv("ZNX_NO_ASLR") == NULL) {
+        /* The generated code holds host addresses; --code-hash of two runs is comparable only when the
+         * libraries and RDRAM are at the same addresses in both. Start again with the address layout fixed. */
+        extern char** environ;
+        posix_spawnattr_t attr;
+        pid_t pid;
+        int status = 0;
+        uint32_t size = sizeof(exe);
+        setenv("ZNX_NO_ASLR", "1", 1);
+        posix_spawnattr_init(&attr);
+        posix_spawnattr_setflags(&attr, 0x0100 /* _POSIX_SPAWN_DISABLE_ASLR */);
+        if (_NSGetExecutablePath(exe, &size) != 0 || posix_spawn(&pid, exe, NULL, &attr, argv, environ) != 0) {
+            fprintf(stderr, "znx-bench: cannot start again without address randomization\n");
+            return 1;
+        }
+        waitpid(pid, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    }
 
     /* The libraries, the core's data files and a scratch profile all sit next to the program. */
     if (_NSGetExecutablePath(exe, &exe_size) != 0 || realpath(exe, dir) == NULL) {
@@ -120,6 +155,8 @@ int main(int argc, char** argv)
     host.print = print_line;
     host.data_dir = data_dir;
     host.user_dir = user_dir;
+    snprintf(warm_dir, sizeof(warm_dir), "%s/data/warm", dir);
+    host.warm_dir = warm_dir;
 
     result = znx_bench_run(&host, &o);
 

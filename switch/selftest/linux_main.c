@@ -108,12 +108,14 @@ int main(int argc, char** argv)
 {
     struct znx_options options;
     struct znx_host host;
-    char exe[4096], data_dir[4200], user_dir[4200];
+    char exe[4096], data_dir[4200], user_dir[4200], warm_dir[4200];
+    int args = 1;
     ssize_t length = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     char* slash;
 
     if (argc < 2 || length <= 0) {
-        fprintf(stderr, "usage: znx-selftest ROM [FRAMES[xRUNS] [ROLLBACK_A ROLLBACK_B]]\n");
+        fprintf(stderr, "usage: znx-selftest ROM [FRAMES[xRUNS] [ROLLBACK_A ROLLBACK_B]] [key=value ...]\n"
+                        "  precompile_ms=N warm=0 warm_flags=N vs=STAGE:F1,F2,F3,F4 stress=K,D hash_every=K\n");
         return 2;
     }
     exe[length] = '\0';
@@ -125,10 +127,31 @@ int main(int argc, char** argv)
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     znx_options_defaults(&options);
-    options.rom_path = argv[1];
-    options.frames = argc > 2 ? atoi(argv[2]) : 3600;
     options.hash_every = 600;
     options.progress_every = 600;
+    /* key=value arguments (the warm list and what exercises it) are taken out; the rest is positional */
+    for (int i = 1; i < argc; ++i) {
+        const char* value = strchr(argv[i], '=');
+        if (i == 1 || value == NULL) { argv[args++] = argv[i]; continue; }
+        value++;
+        if (!strncmp(argv[i], "precompile_ms=", 14)) options.precompile_ms = atoi(value);
+        else if (!strncmp(argv[i], "precompile_big=", 15)) options.precompile_big = atoi(value);
+        else if (!strncmp(argv[i], "warm=", 5)) options.warm_off = atoi(value) == 0;
+        else if (!strncmp(argv[i], "warm_flags=", 11)) options.warm_flags = atoi(value);
+        else if (!strncmp(argv[i], "hash_every=", 11)) options.hash_every = atoi(value);
+        else if (!strncmp(argv[i], "stress=", 7)) sscanf(value, "%d,%d", &options.stress_every, &options.stress_depth);
+        else if (!strncmp(argv[i], "vs=", 3)) {
+            const char* list = strchr(value, ':');
+            options.vs_stage = (int)strtol(value, NULL, 0);
+            for (int port = 0; port < 4 && list != NULL; ++port) {
+                options.vs_fighters[port] = (int)strtol(list + 1, NULL, 0);
+                list = strchr(list + 1, ',');
+            }
+        }
+    }
+    argc = args;
+    options.rom_path = argv[1];
+    options.frames = argc > 2 ? atoi(argv[2]) : 3600;
     if (argc > 4) {
         options.rb_a = atoi(argv[3]);
         options.rb_b = atoi(argv[4]);
@@ -142,6 +165,8 @@ int main(int argc, char** argv)
     host.print = print_line;
     host.data_dir = data_dir;
     host.user_dir = user_dir;
+    snprintf(warm_dir, sizeof(warm_dir), "%s/data/warm", exe);
+    host.warm_dir = warm_dir;
     if (host.core == NULL || host.video == NULL || host.rsp == NULL) {
         fprintf(stderr, "znx-selftest: a linked library is missing\n");
         return 1;

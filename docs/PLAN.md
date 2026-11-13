@@ -1099,3 +1099,109 @@ Next: compile ahead of need from a saved list of blocks, and make a compile chea
 The console's menus were restyled after the system's own (Basic White and Basic Black from the console's
 setting, the shared system font and button glyphs loaded at run time, System Settings' layout); checked
 on the console in both themes.
+
+### Compiling ahead of need: warm lists, 2026-11-13: built and tested on the Mac and in the container, not yet run on a console
+
+The recompiler now records every block it compiles (address, length of its source, checksum of the source
+words; no game code), the front keeps that list per ROM, and in the time left over after each frame the
+listed blocks whose code is in RAM are compiled before the game asks for them (`patches/0009`). A compile
+itself got 13% cheaper (`patches/0010`).
+
+**How it works.** A block compiled ahead (a "shadow") goes through the compiler's own passes at the place
+in the code cache where the next block would go; its code is then copied to the heap as data and the cache
+pointer is put back. Nothing the running game can reach has changed: not the cache, not the block tables,
+not the write protection of pages, not the expiry pointer. When the game asks for an address,
+`new_recompile_block` runs its first pass as always, so the block's extent is decided exactly as without a
+list. If a shadow with that start, that length and those source words exists (compared with `memcmp`), its
+code is copied into the cache with its references to the outside (helpers, device state) re-encoded for the
+new address, and the compile carries on from its linker pass: exits linked, entry points entered, cache
+flushed, pages protected, old blocks expired. The cache then holds what a full compile at that moment would
+have put there. A run with a list goes through the same blocks, of the same shape, at the same cache
+positions as a run without one, across cache wraps too; only the time at which passes 2 to 8 ran differs.
+The patch description gives the argument point by point (where the call may be made, why no emulated state
+changes, write protection and guest timing, rollback loads).
+
+For that the compiler had to be a function of the block alone, which it was not: about 2% of blocks got a
+different register allocation depending on which block had been compiled before (passes read entries of
+`regs[]` they had not written yet), and block sizes depended on where `malloc` had put a list node (three
+ways to load its address). Both are fixed in 0009; they change generated host code against the unpatched
+core, and every RDRAM hash and check line of the harness is unchanged.
+
+**What decides when a page is looked at.** Entries are indexed by the RDRAM page they start in and tested
+(checksum of the current words) only after something that can have brought code: a DMA into the page, a
+write to a page with compiled code (also a rollback load's changed pages), a state load, a compile on
+demand (every page if the list knew that block: code came by a CPU copy), and one page per call in turn.
+A call with nothing to do costs 0.3 us on the Mac (0.8 us in the ARM64 container).
+
+**The front** (`bench/bench_core.c`, shared by the bench, the game and netplay): the list is
+`warm-<ROM MD5>.bin` in the profile folder (`sdmc:/switch/z-cancel-nx/profile/`), merged at start with the
+shipped one (`romfs:/data/warm/`, from `assets/warm/`); what a run adds is saved to the profile's file when
+the game closes; a missing or damaged file is ignored and written anew. After each completed visible frame
+it calls `DebugDynarecPrecompile(budget, oversized)`: budget = `precompile_ms` (ini and `--precompile-ms`,
+default 12, 0 = only record) minus the largest work of the last 16 frames; on the Switch the work is the
+emulation thread's running time (the frame's time contains the wait for the display). A block is only
+started when its estimated time fits. About thirty blocks per list are too large for any frame's spare time
+on a Cortex-A57 (over 430 instructions, up to 2,728: 4 to 25 ms); each costs one late frame whenever it is
+compiled, so after a light frame one of them at a time is compiled ahead all the same (`precompile_big=1`,
+the default; at most 50 ms; 0 leaves them to be compiled when the game first runs them), which puts the late
+frame where the code was loaded instead of where it is first used. In a netplay session (`net/p2p/znx_p2p.cpp`, end of a visible frame, never a
+re-simulated one) the budget is also at most the least time RMG-K's pacer slept in the last 16 frames minus
+2.5 ms (`patches/0011` exposes the sleep) and no oversized block is compiled, so a frame is never delayed;
+with the vsync presenter (`net_vsync=1`) the pacer does not run and nothing is compiled ahead in a match. Each run prints `warm
+list: N loaded, N compiled ahead ..., N compiled on demand ...`, `warm timing: ...`, `compiled on demand:
+... (frame:blocks)` and, for a forced match, `vs timing ... compiled on demand N` (blocks compiled in full
+after frame 660).
+
+**Lists.** `tools/make_warm_list.py ROM` runs the Mac harness over a forced four-CPU match on every working
+stage, three rounds with different fighter groups (every fighter plays), the ROM's input scripts and a run
+without input, records only, and merges: vanilla 5,102 entries (61 KB) from 51 runs in 5 s; Remix 2.0.1
+7,979 entries (96 KB) from 439 runs in 31 s; +EXTRA 0.6.0 8,796 entries (106 KB) from 489 runs in 36 s (a
+30-core Mac). Entries are guest addresses and guest words: the Mac's lists give the same counts in the
+Linux ARM64 build of the Switch's code (and the x86-64 back end, which only records, lists 1,937 of its
+1,938 blocks of the intro in the ARM64-made list). `builder/build-switch.sh` puts `assets/warm/*.bin` into
+the romfs. Both build scripts now recompile what includes `bench/bench_core.h` when it changes: a stale
+object and a new `bench_core.c` disagreed about `struct znx_options` and wrote past it.
+
+**Results** (Mac M5; forced matches not among the list's own runs, the shipped list only):
+
+| | blocks compiled in full after frame 660 | ms compiling after 660 | worst frame of the fight |
+|---|---|---|---|
+| vanilla, Congo Jungle, fighters 0,1,2,3: without / with list | 1,366 / 5 | 88.5 / 7.3 | 0.94 / 0.23 ms |
+| Remix, Poke Floats, 1D 1E 34 3B | 1,861 / 3 | 95.3 / 8.3 | 1.18 / 0.37 ms |
+| +EXTRA, Battle Harbor, four Clouds | 1,320 / 0 | 64.0 / 5.9 | 0.46 / 0.25 ms |
+| +EXTRA, Halberd, 64 6F 70 6D | 1,461 / 0 | 74.8 / 7.5 | 0.43 / 0.42 ms |
+
+A block the game asks for that was compiled ahead costs 0.005 ms instead of 0.065 (pass 1, the copy, the
+linker pass, the flush). What is still compiled in the frame that needs it: the 150 blocks of the first
+two frames after power-on, and 2 to 4 blocks in a frame that loads code and runs it at once (seven such
+frames on the way into a match).
+
+**Checks, all with compiling ahead on and the full list:** `hash 3600 1499ebb25c8606c4`; the forced match's
+twelve hashes to 7,200 equal to a run without a list and to the unpatched core's; the mash script's `check
+17000 2c0196363c2d2922 976c1aa7e40df3c7`; `--rollback-stress 10 7` over 9,000 frames, 900 of 900 exact;
+two Mac processes over the simulated bad network (60 ms +- 20, 2% loss), 284 of 284 check lines identical
+on both sides and equal to the bench's, 59.83 fps; both Remix ROMs' forced matches, hashes equal with and
+without. In the Linux ARM64 container (the Switch's code paths, GCC): the same hashes, the stress test, and
+verify mode (`warm_flags=1`: every shadow asked for is compiled in full as well and compared word for
+word): 0 of 2,358 differ. On the Mac with address randomization off (`znx-bench --no-aslr --code-hash`) the
+hash of every block entering the cache is the same with and without compiling ahead, also when the
+compiler's 37 scratch arrays are overwritten with junk before every compile.
+
+**A compile, cheaper** (`patches/0010`). Where a compile's 82 us go on the Mac: pass 4 (culling host
+registers) 29%, assembly 26%, allocation 15%, passes 5 to 7 19%, the stubs 6%; flushing, linking, the list
+entries and expiry together under 4%. There are no big memsets, repeated flushes or debug bookkeeping to
+remove: the time is in loops over the 29 host registers per instruction. Three of them in pass 4 did work
+that cannot change their result; without it a block costs 0.064 ms instead of 0.074 on the Mac, and the
+hash of everything passes 1 to 7 decide (all the assembler goes by) is the same before and after.
+
+**To measure on the console:** the matrix again with the shipped lists (frames over 16.7 ms and `vs timing
+... compiled on demand N` per stage; the target is none after frame 660); how long after power-on and
+after the battle loads the pending count takes to reach its floor (`warm list:` lines; a Cortex-A57 needs
+about 0.4 ms a block, so 8,000 blocks are about 3.5 s of spare time spread over the frames); `warm timing`'s
+"a frame's work plus the compiling after it took at most" against 16.7 ms with the picture on, and whether
+`precompile_ms=12` leaves the display alone (lower it if a frame is dropped while the list is being
+worked off) and what the oversized blocks do to the first seconds (`N larger than a frame's spare time`
+in the `warm list:` line; `precompile_big=0` to compare); the cost of adopting a block (`vs compiling ...
+ms per block` with a list); an online match
+with the timer presenter (rollbacks, late frames) with and without `precompile_ms=0`; memory (up to 64 MB
+of shadow code is kept).

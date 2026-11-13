@@ -17,6 +17,7 @@ static uint64_t l_emu_ns, l_swap_ns, l_frame_ns;
 static uint64_t l_emu_worst, l_swap_worst, l_frame_worst;
 static int l_emu_worst_frame, l_last_swaps;
 static uint64_t l_cpu_last, l_cpu_ns, l_cpu_worst;
+static uint64_t l_last_cpu_ns;   /* the last frame's, for znx_game_last_frame_work_ns */
 static int l_cpu_late, l_cpu_worst_frame;
 
 static void out(const char* format, ...)
@@ -112,6 +113,7 @@ int znx_game_video_config(const struct znx_config* config)
 }
 
 int znx_game_last_frame_swaps(void) { return l_last_swaps; }
+uint64_t znx_game_last_frame_work_ns(void) { return l_last_cpu_ns; }
 
 void znx_game_frame_done(int frames, uint64_t frame_ns)
 {
@@ -124,6 +126,7 @@ void znx_game_frame_done(int frames, uint64_t frame_ns)
         const uint64_t now = l_video.thread_cpu_ns();
         const uint64_t cpu = l_cpu_last != 0 && now > l_cpu_last ? now - l_cpu_last : 0;
         l_cpu_last = now;
+        l_last_cpu_ns = cpu;
         l_cpu_ns += cpu;
         if (cpu > 16666667ull) l_cpu_late++;
         if (cpu > l_cpu_worst) { l_cpu_worst = cpu; l_cpu_worst_frame = frames - 1; }

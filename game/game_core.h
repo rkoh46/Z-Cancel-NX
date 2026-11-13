@@ -46,4 +46,9 @@ void znx_game_frame_done(int frames, uint64_t frame_ns);
  * znx_game_frame_done). */
 int znx_game_last_frame_swaps(void);
 
+/* znx_host.frame_work_ns: the emulation thread's running time between the last two calls of
+ * znx_game_frame_done (the frame's work without the wait for the display), or 0 when the platform
+ * has no thread clock. */
+uint64_t znx_game_last_frame_work_ns(void);
+
 #endif
