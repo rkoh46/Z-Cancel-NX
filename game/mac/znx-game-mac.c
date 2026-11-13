@@ -86,6 +86,16 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--shot") && i + 2 < argc) { int frame = atoi(argv[++i]); znx_cgl_shot(frame, argv[++i]); }
         else if (!strcmp(a, "--repeat") && i + 1 < argc) repeat = atoi(argv[++i]);
         else if (!strcmp(a, "--verbose")) o.verbose = 1;
+        else if (!strcmp(a, "--vs") && i + 2 < argc) {   /* --vs STAGE F1,F2[,F3,F4]: a forced VS match of level 9 CPUs */
+            char* list = argv[i + 2];
+            o.vs_stage = (int)strtol(argv[i + 1], NULL, 0);
+            for (int port = 0; port < 4; ++port) {
+                o.vs_fighters[port] = (*list && *list != '-') ? (int)strtol(list, &list, 0) : -1;
+                while (*list && *list != ',') ++list;
+                if (*list == ',') ++list;
+            }
+            i += 2;
+        }
         else usage();
     }
     if (o.rom_path == NULL || o.frames <= 0)

@@ -347,8 +347,9 @@ static int build_font(int index, char* error, size_t error_size)
             }
     }
     {
-        /* Tabular figures for hex and times: the widest of 0-9, A-F. */
-        static const char tab[] = "0123456789ABCDEF";
+        /* Tabular figures: the widest of 0-9. Letters keep their own widths (padding every digit to a
+         * letter's width left visible gaps between digits). */
+        static const char tab[] = "0123456789";
         for (const char* c = tab; *c; ++c) {
             const struct glyph* gl = &font->glyphs[*c - FIRST_CHAR];
             if (gl->advance > font->tabular_advance) font->tabular_advance = gl->advance;
@@ -651,7 +652,7 @@ static unsigned next_code(const char** text)
 
 static int tabular_char(unsigned code)
 {
-    return (code >= '0' && code <= '9') || (code >= 'A' && code <= 'F');
+    return code >= '0' && code <= '9';
 }
 
 static const struct glyph* find_glyph(const struct font* font, unsigned code)

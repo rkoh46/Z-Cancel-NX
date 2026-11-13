@@ -15,7 +15,7 @@
 enum znx_font { ZNX_FONT_SMALL, ZNX_FONT_BODY, ZNX_FONT_ROW, ZNX_FONT_TITLE, ZNX_FONT_BIG, ZNX_FONT_COUNT };
 
 /* Text flags. */
-#define ZNX_TEXT_TABULAR 1   /* every glyph in a run of digits, A-F and ':' gets the same width */
+#define ZNX_TEXT_TABULAR 1   /* every digit 0-9 gets the same width (for counts and times); letters keep their own */
 #define ZNX_TEXT_RIGHT   2   /* x is the right edge */
 #define ZNX_TEXT_CENTER  4   /* x is the middle */
 

@@ -629,8 +629,9 @@ float znx_ui_panel_ex(float y, const struct field* fields, int count, const char
             znx_draw_text(ZNX_FONT_SMALL, value_x, base + 24, fitted, C_TEXT1, ZNX_TEXT_TABULAR);
             cursor += FIELD_STEP + 24;
         } else if (fields[i].mono) {
-            znx_text_fit_flags(ZNX_FONT_SMALL, fields[i].value, value_w, fitted, sizeof(fitted), ZNX_TEXT_TABULAR);
-            znx_draw_text(ZNX_FONT_SMALL, value_x, base, fitted, C_TEXT1, ZNX_TEXT_TABULAR);
+            /* an address, port, code or server: one line, cut to fit rather than wrapped, in plain figures */
+            znx_text_fit_flags(ZNX_FONT_BODY, fields[i].value, value_w, fitted, sizeof(fitted), 0);
+            znx_draw_text(ZNX_FONT_BODY, value_x, base, fitted, C_TEXT1, 0);
             cursor += FIELD_STEP;
         } else {
             const int lines = znx_draw_wrapped(ZNX_FONT_BODY, value_x, base, value_w, fields[i].value, C_TEXT1);
@@ -725,7 +726,7 @@ static void draw_home(struct znx_menu* m)
         znx_ui_row(y, m->home_row == g, znx_game_info(g)->title, C_TEXT1, status, color, dot);
         y += ROW_H;
     }
-    y += 32;
+    /* Settings follows straight on: a gap between two rules read as an empty row */
     znx_ui_row(y, m->home_row == ZNX_GAME_COUNT, "Settings", C_TEXT1, NULL, 0, 0);
 
     /* The pane: what the selected row is and what A does. */
