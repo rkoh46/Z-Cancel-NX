@@ -60,6 +60,11 @@ struct znx_host {
     /* Called on the emulation thread after every completed frame with the number of frames
      * completed and the time the frame took (begin_frame to end_frame), before hashing. */
     void (*frame_done)(int frames, uint64_t frame_ns);
+    /* An audio plugin's handle, or NULL for the core's silent dummy. */
+    void* audio;
+    /* Live controllers: called on the emulation thread once per frame when no input script is
+     * loaded; fills the four players' N64 BUTTONS words. NULL: no input. */
+    void (*live_inputs)(uint32_t buttons[4]);
 };
 
 /* The core's configuration, for znx_host.video_config. Each returns 0 on success. */

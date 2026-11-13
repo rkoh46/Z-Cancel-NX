@@ -11,7 +11,9 @@ void znx_input_init(int stick_range);
 /* Reads every controller once. Call at the start of each frame that takes live input, on one thread. */
 void znx_input_poll(void);
 
-/* The N64 BUTTONS word of player 0..3 from the last poll (0 when that controller is not connected). */
+/* Player 0..3's input from the last poll as the core's rollback input word (the controller's reply bytes,
+ * first byte highest: buttons, buttons, stick x, stick y; the format of the files in bench/inputs). 0 when that
+ * controller is not connected. */
 uint32_t znx_input_buttons(int player);
 int znx_input_connected(int player);
 

@@ -31,7 +31,7 @@
 #define OUT_FRAMES 240                 /* 5 ms per audout buffer */
 #define OUT_BUFFERS 4
 #define RING_FRAMES 16384              /* about half a second at 32 kHz */
-#define TARGET_MS 32                   /* samples kept waiting in the ring */
+#define TARGET_MS 40                   /* samples kept waiting in the ring */
 
 static AUDIO_INFO l_info;
 static int l_rate = 32000;             /* the game's sample rate */
@@ -42,6 +42,8 @@ static Mutex l_lock;
 static int16_t l_ring[RING_FRAMES * 2];
 static uint32_t l_read, l_fill;        /* frames; l_read is the oldest frame's index */
 static double l_phase;                 /* position between l_read and l_read + 1, 0..1 */
+static int l_starved = 1;              /* the ring ran dry (or has not filled yet): silence until it is back at
+                                          its target, so one stall is one gap and not a run of crackles */
 
 static Thread l_thread;
 static atomic_int l_running;
@@ -51,8 +53,8 @@ static void* l_memory[OUT_BUFFERS];
 
 static atomic_uint l_underruns, l_overruns;
 
-/* Counters for the frame log: buffers that ran dry and blocks that had to drop old samples. */
-void znx_audio_stats(unsigned* underruns, unsigned* overruns, unsigned* fill_ms)
+/* Counters for the frame log: times the output ran dry and blocks that had to drop old samples. */
+EXPORT void CALL znx_audio_stats(unsigned* underruns, unsigned* overruns, unsigned* fill_ms)
 {
     if (underruns) *underruns = atomic_load(&l_underruns);
     if (overruns) *overruns = atomic_load(&l_overruns);
@@ -74,8 +76,9 @@ static void render(int16_t* out)
     const double step = (double)l_rate / OUT_RATE * (1.0 + lean);
     const int volume = l_muted ? 0 : l_volume;
     int produced = 0;
-    for (; produced < OUT_FRAMES; ++produced) {
-        if (l_fill < 2) break;         /* interpolation needs this frame and the next */
+    if (l_starved && (double)l_fill >= target) l_starved = 0;
+    for (; !l_starved && produced < OUT_FRAMES; ++produced) {
+        if (l_fill < 2) { l_starved = 1; break; }   /* interpolation needs this frame and the next */
         const uint32_t a = l_read % RING_FRAMES, b = (l_read + 1) % RING_FRAMES;
         for (int c = 0; c < 2; ++c) {
             const double s = l_ring[a * 2 + c] + (l_ring[b * 2 + c] - l_ring[a * 2 + c]) * l_phase;
@@ -101,7 +104,7 @@ static void render(int16_t* out)
             out[(produced + i) * 2] = (int16_t)(last_l * (rest - 1 - i) / rest);
             out[(produced + i) * 2 + 1] = (int16_t)(last_r * (rest - 1 - i) / rest);
         }
-        if (l_started > 1) atomic_fetch_add(&l_underruns, 1);
+        if (l_started > 1 && produced > 0) atomic_fetch_add(&l_underruns, 1);   /* counts dry spells, not buffers */
     }
 }
 
@@ -136,11 +139,17 @@ static int start_output(void)
         audoutAppendAudioOutBuffer(&l_buffers[i]);
     }
     atomic_store(&l_running, 1);
-    /* Above the emulation thread's priority (0x1C; a lower number runs first) so a busy frame never starves
-     * the output; it wakes for a few microseconds every 5 ms. Core -2: wherever the system puts it. */
-    if (R_FAILED(threadCreate(&l_thread, feeder, NULL, NULL, 0x8000, 0x1A, -2)) || R_FAILED(threadStart(&l_thread))) {
-        znx_log("audio: could not start the feeder thread");
+    /* The emulation thread's priority (0x1C, the highest a homebrew application may ask for) on another
+     * core (the emulation thread owns core 2), so a busy frame never starves the output; it wakes for a
+     * few microseconds every 5 ms. */
+    Result rc = threadCreate(&l_thread, feeder, NULL, NULL, 0x8000, 0x1C, 1);
+    if (R_SUCCEEDED(rc) && R_FAILED(rc = threadStart(&l_thread)))
+        threadClose(&l_thread);
+    if (R_FAILED(rc)) {
+        znx_log("audio: could not start the feeder thread: 0x%08x", rc);
         atomic_store(&l_running, 0);
+        audoutStopAudioOut();
+        audoutExit();
         return 0;
     }
     l_started = 1;
@@ -236,7 +245,9 @@ EXPORT void CALL ProcessAList(void) {}
 
 EXPORT int CALL RomOpen(void)
 {
-    return start_output();
+    if (!start_output())
+        znx_log("audio: no sound output; the game runs silent");
+    return 1;
 }
 
 EXPORT void CALL RomClosed(void)

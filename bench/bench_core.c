@@ -74,7 +74,6 @@ static m64p_rollback_state l_rb_state;
 /* Rollback stress totals. */
 static int l_st_count, l_st_failed, l_st_first_bad = -1;
 static uint64_t l_st_save_ns, l_st_load_ns, l_st_replay_ns, l_st_save_worst, l_st_load_worst, l_st_total_worst;
-static uint64_t l_st_begin;
 
 static uint32_t* l_frame_us10; /* time of every frame in units of 0.1 us */
 static uint64_t l_frame_begin; /* when the frame in flight started, 0 between frames */
@@ -188,6 +187,13 @@ static int input_callback(void* values, int size, int players)
         return 0;
     for (int p = 0; p < players && p < MAX_PLAYERS; ++p)
         result[p] = 0;
+    if (l_event_count == 0 && l_host->live_inputs != NULL) {
+        uint32_t live[4] = { 0, 0, 0, 0 };
+        l_host->live_inputs(live);
+        for (int p = 0; p < players && p < MAX_PLAYERS && p < 4; ++p)
+            result[p] = live[p];
+        return 1;
+    }
     for (int i = 0; i < l_event_count && l_events[i].frame <= l_frame; ++i) {
         if (l_events[i].player < players)
             result[l_events[i].player] = l_events[i].value;
@@ -566,6 +572,7 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
     ptr_PluginStartup rsp_startup, video_startup;
     ptr_PluginShutdown rsp_shutdown, video_shutdown;
     int rom_open = 0, video_attached = 0, rsp_attached = 0, rsp_started = 0, video_started = 0;
+    int audio_started = 0, audio_attached = 0;
 
     l_host = host;
     l_name = host->name != NULL ? host->name : "znx-bench";
@@ -693,6 +700,20 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         goto shutdown;
     }
     video_attached = 1;
+    if (host->audio != NULL) {
+        ptr_PluginStartup audio_startup = sym(host->audio, "PluginStartup");
+        if (audio_startup == NULL || (error = audio_startup(host->core, "audio", debug_callback)) != M64ERR_SUCCESS) {
+            l_failed = fail("audio PluginStartup", audio_startup == NULL ? M64ERR_INPUT_NOT_FOUND : error);
+            goto shutdown;
+        }
+        audio_started = 1;
+        error = CoreAttachPlugin(M64PLUGIN_AUDIO, host->audio);
+        if (error != M64ERR_SUCCESS) {
+            l_failed = fail("CoreAttachPlugin(audio)", error);
+            goto shutdown;
+        }
+        audio_attached = 1;
+    }
     error = rsp_startup(host->core, "rsp-hle", debug_callback);
     if (error != M64ERR_SUCCESS) {
         l_failed = fail("RSP PluginStartup", error);
@@ -784,6 +805,12 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
 shutdown:
     CoreDoCommand(M64CMD_ROLLBACK_SET_INPUT_CALLBACK, 0, NULL);
     CoreDoCommand(M64CMD_ROLLBACK_SET_SAVE_DATA, 0, NULL);
+    if (audio_attached)
+        CoreDetachPlugin(M64PLUGIN_AUDIO);
+    if (audio_started) {
+        ptr_PluginShutdown audio_shutdown = sym(host->audio, "PluginShutdown");
+        if (audio_shutdown != NULL) audio_shutdown();
+    }
     if (video_attached)
         CoreDetachPlugin(M64PLUGIN_GFX);
     if (rsp_attached)

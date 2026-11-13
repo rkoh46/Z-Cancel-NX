@@ -4,5 +4,6 @@
 #ifndef ZNX_AUDIO_SWITCH_H
 #define ZNX_AUDIO_SWITCH_H
 /* Output buffers that ran dry, sample blocks that dropped old audio, and how much is waiting (ms). */
+/* Exported from the plugin like its API: look it up as "znx_audio_stats" in the static table. */
 void znx_audio_stats(unsigned* underruns, unsigned* overruns, unsigned* fill_ms);
 #endif

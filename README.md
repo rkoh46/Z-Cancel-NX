@@ -6,7 +6,7 @@ Super Smash Bros. (N64) and Smash Remix with rollback netplay on a Nintendo Swit
 against the PC players who use [RMG-K](https://github.com/Jay-Day/RMG-K). You bring your own ROM;
 nothing from a game is in this repository.
 
-Status: early. The emulator core runs headless on a Switch and on a Mac with working, exact rollback and identical results on both; there is no picture, sound or netplay yet. The plan, what was learned from RMG-K's source and the
+Status: early. On a Switch it shows the game, plays sound and takes controllers, with exact rollback underneath and the same emulated state as the Mac build; there is no netplay or menu yet. The plan, what was learned from RMG-K's source and the
 order things get tested in are in [docs/PLAN.md](docs/PLAN.md).
 
 | Step | State |

@@ -24,7 +24,7 @@
 
 #define PLAYERS 4
 
-/* BUTTONS.Value bits (m64p_plugin.h). */
+/* The N64 controller's button bits: the low byte is the reply's first byte, the next its second. */
 #define N64_R_DPAD 0x0001u
 #define N64_L_DPAD 0x0002u
 #define N64_D_DPAD 0x0004u
@@ -94,9 +94,9 @@ void znx_input_poll(void)
         if (right.y < -13000) b |= N64_D_C;
         if (right.x < -13000) b |= N64_L_C;
         if (right.x > 13000) b |= N64_R_C;
-        b |= axis(left.x) << 16;
-        b |= axis(left.y) << 24;
-        l_buttons[i] = b;
+        /* The core's rollback input word is the controller's four reply bytes in order, first byte
+         * highest (pif.c, rollback_write_controller_input): buttons, buttons, stick x, stick y. */
+        l_buttons[i] = ((b & 0xFFu) << 24) | ((b & 0xFF00u) << 8) | (axis(left.x) << 8) | axis(left.y);
         const u64 combo = HidNpadButton_ZL | HidNpadButton_ZR | HidNpadButton_R | HidNpadButton_Plus;
         if ((held & HidNpadButton_Minus) || (held & combo) == combo) quit = 1;
     }

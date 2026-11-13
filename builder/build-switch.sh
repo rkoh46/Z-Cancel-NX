@@ -119,7 +119,7 @@ PORT_INC="-isystem $DEVKITPRO/portlibs/switch/include"
 # The console around a run, shared by both programs; then what each adds.
 FRONT_COMMON="switch/front_switch.c switch/jit_switch.c switch/dynlib_static.c switch/clocks_switch.c switch/libc_switch.c bench/bench_core.c"
 FRONT_BENCH="switch/main_switch.c"
-FRONT_GAME="switch/game_switch.c switch/vidext_switch.c game/game_core.c"
+FRONT_GAME="switch/game_switch.c switch/vidext_switch.c switch/input_switch.c game/game_core.c"
 if [ "$TARGET" = selftest ]; then
     ARCH="-fPIE"
     # zlib: Debian's runtime library with devkitPro's copy of the two headers.
@@ -257,6 +257,9 @@ if [ -n "$WITH_GAME" ]; then
         GLN_OBJS="$GLN_OBJS $o"
     done
     LIBS="$LIBS gliden64"
+    # The audio plugin is this project's own (switch/audio_switch.c), linked like the others.
+    queue switch/audio_switch.c "$OBJ/audio-switch.o" "$COMMON -I$CORE/src/api -Iswitch -isystem $DEVKITPRO/libnx/include"
+    LIBS="$LIBS audio"
 fi
 FRONT_COMMON_OBJS="$(front_objects "$FRONT_COMMON")"
 FRONT_BENCH_OBJS=""; FRONT_GAME_OBJS=""
@@ -272,6 +275,7 @@ ${P}ld -r -o "$OBJ/lib_core.o" $CORE_OBJS
 ${P}ld -r -o "$OBJ/lib_rsp_hle.o" $RSP_OBJS
 [ -n "$WITH_BENCH" ] && ${P}ld -r -o "$OBJ/lib_video_null.o" "$OBJ/video-null.o"
 [ -n "$WITH_GAME" ] && ${P}ld -r --force-group-allocation -o "$OBJ/lib_gliden64.o" $GLN_OBJS
+[ -n "$WITH_GAME" ] && ${P}ld -r -o "$OBJ/lib_audio.o" "$OBJ/audio-switch.o"
 for lib in $LIBS; do
     ${P}objcopy --localize-hidden "$OBJ/lib_$lib.o"
 done
@@ -329,7 +333,8 @@ if [ -n "$WITH_BENCH" ]; then
 fi
 if [ -n "$WITH_GAME" ]; then
     needs gliden64 PluginStartup PluginGetVersion InitiateGFX ProcessDList UpdateScreen RomOpen RomClosed
-    tables game "core rsp_hle gliden64"
+    needs audio PluginStartup PluginGetVersion InitiateAudio AiDacrateChanged AiLenChanged RomOpen RomClosed
+    tables game "core rsp_hle gliden64 audio"
     # Nothing of the plugin may stay visible under a name the core, another plugin or the
     # front could also define: only its API (renamed above) and C++ library templates (weak).
     stray="$(${P}nm -g --defined-only "$OBJ/lib_gliden64.o" | awk '$2 != "W" && $2 != "V" && $2 != "u" && $3 !~ /^znxp_gliden64_/ { print $3 }')"
@@ -406,7 +411,7 @@ if [ -n "$WITH_GAME" ]; then
     ${P}g++ -specs="$DEVKITPRO/libnx/switch.specs" $ARCH -g \
         -Wl,-Map,"$OUT/z-cancel-nx.map" -Wl,--wrap=abort -Wl,--wrap=__assert_func \
         $FRONT_COMMON_OBJS $FRONT_GAME_OBJS "$OBJ/front/static_libs_game.o" \
-        "$OBJ/lib_core.o" "$OBJ/lib_rsp_hle.o" "$OBJ/front/jit_memory.o" "$OBJ/lib_gliden64.o" \
+        "$OBJ/lib_core.o" "$OBJ/lib_rsp_hle.o" "$OBJ/front/jit_memory.o" "$OBJ/lib_gliden64.o" "$OBJ/lib_audio.o" \
         -L"$DEVKITPRO/portlibs/switch/lib" -L"$DEVKITPRO/libnx/lib" -lEGL -lglapi -ldrm_nouveau -lz -lnx -lm \
         -o "$OUT/z-cancel-nx.elf"
     # GLideN64's global constructors must be among those libnx runs before main().

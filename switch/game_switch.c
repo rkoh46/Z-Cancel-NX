@@ -37,6 +37,7 @@
 #include "bench_core.h"
 #include "front_switch.h"
 #include "game_core.h"
+#include "input_switch.h"
 #include "vidext_switch.h"
 #include "znx_switch.h"
 
@@ -49,6 +50,8 @@ struct settings {
     bool inputs_set;
     int rdram_check;
     uint32_t cpu_mhz;
+    int sound;                 /* 1: the audio plugin; 0: silent */
+    int stick_range;           /* what a fully tilted stick reads on the N64 axis; 0 = 84 */
 };
 
 static bool ini_key(const char* key, const char* value, void* user)
@@ -65,6 +68,8 @@ static bool ini_key(const char* key, const char* value, void* user)
         else snprintf(s->inputs_path, sizeof(s->inputs_path), ZNX_BASE_DIR "/%s", value);
     }
     else if (!strcmp(key, "cpu_mhz")) s->cpu_mhz = (uint32_t)atoi(value);
+    else if (!strcmp(key, "sound")) s->sound = atoi(value) != 0;
+    else if (!strcmp(key, "stick_range")) s->stick_range = atoi(value);
     else if (!strcmp(key, "verbose")) s->options.verbose = atoi(value);
     else return false;
     return true;
@@ -74,6 +79,21 @@ static bool ini_key(const char* key, const char* value, void* user)
 static void frame_done(int frames, uint64_t frame_ns)
 {
     znx_game_frame_done(frames, frame_ns);
+    if (frames % 600 == 0) {
+        /* The audio plugin's own counters, through the same table its API is looked up in. */
+        static void (*stats)(unsigned*, unsigned*, unsigned*);
+        static bool looked;
+        if (!looked) {
+            void* audio = znx_static_lib("audio");
+            stats = audio != NULL ? (void (*)(unsigned*, unsigned*, unsigned*))osal_dynlib_getproc(audio, "znx_audio_stats") : NULL;
+            looked = true;
+        }
+        if (stats != NULL) {
+            unsigned underruns = 0, overruns = 0, fill = 0;
+            stats(&underruns, &overruns, &fill);
+            znx_log("sound %d: %u ms waiting, ran dry %u times and dropped %u blocks so far", frames, fill, underruns, overruns);
+        }
+    }
     /* The plugin swaps when the game has drawn something. A frame without a swap (a scene
      * loading) would otherwise not wait for the display at all. */
     if (znx_game_last_frame_swaps() == 0)
@@ -87,6 +107,20 @@ static uint64_t thread_cpu_ns(void)
     if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, (u64)-1)))
         return 0;
     return armTicksToNs(ticks);
+}
+
+/* The four controllers for this frame. Holding the quit combination (input_switch.h) ends the run. */
+static void live_inputs(uint32_t buttons[4])
+{
+    static bool quitting;
+    znx_input_poll();
+    for (int p = 0; p < 4; ++p)
+        buttons[p] = znx_input_buttons(p);
+    if (!quitting && znx_input_quit_requested()) {
+        quitting = true;
+        znx_log(PROGRAM ": quit combination held at frame %d", znx_bench_frame());
+        znx_bench_stop();
+    }
 }
 
 int main(int argc, char** argv)
@@ -111,6 +145,7 @@ int main(int argc, char** argv)
     settings.game.scale = 0;
     settings.game.report_every = 600;
     settings.cpu_mhz = 1785; /* the highest stock CPU clock of the first Switch model */
+    settings.sound = 1;
     znx_front_read_ini(PROGRAM ".ini", ini_key, &settings);
     if (settings.options.frames < 0)
         settings.options.frames = 0;
@@ -140,6 +175,15 @@ int main(int argc, char** argv)
     host.vidext = znx_vidext_functions();
     host.video_config = znx_game_video_config;
     host.frame_done = frame_done;
+    host.audio = settings.sound ? znx_static_lib("audio") : NULL;
+    if (settings.options.inputs_path == NULL) {
+        /* Played with controllers: Plus is the N64's Start, so it no longer stops the run. */
+        znx_input_init(settings.stick_range);
+        host.live_inputs = live_inputs;
+        znx_front_plus_stops(false);
+        znx_log("input: controllers (hold Minus, or L + R + Z + Start on a GameCube controller, to quit); full stick tilt reads %d",
+                settings.stick_range > 0 ? settings.stick_range : 84);
+    }
 
     if (settings.options.rom_path == NULL)
         ;

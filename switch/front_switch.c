@@ -285,6 +285,9 @@ static void emulation_thread(void* arg)
     run->done = 1;
 }
 
+static bool l_plus_stops = true;
+void znx_front_plus_stops(bool on) { l_plus_stops = on; }
+
 int znx_front_run(const struct znx_host* host, const struct znx_options* options, void (*tick)(void))
 {
     static struct run run;
@@ -320,7 +323,7 @@ int znx_front_run(const struct znx_host* host, const struct znx_options* options
     while (!run.done) {
         svcSleepThread(50000000ll);
         padUpdate(&l_pad);
-        if (!stopping && (!appletMainLoop() || (padGetButtonsDown(&l_pad) & HidNpadButton_Plus))) {
+        if (!stopping && (!appletMainLoop() || (l_plus_stops && (padGetButtonsDown(&l_pad) & HidNpadButton_Plus)))) {
             znx_log("%s: stop requested at frame %d", l_program, znx_bench_frame());
             znx_bench_stop();
             stopping = true;

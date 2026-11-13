@@ -250,5 +250,23 @@ vanilla US ROM (MD5 F7C52568A31AADF26E14DC2B6416B2ED). On the console, 9,000 fra
 rollback every 10 frames: 900 of 900 exact for each, load + 7 frames 8.6 and 8.7 ms (vanilla 8.6), and
 the hashes equal the Mac's. Their intro/demo frames cost about 1.25 ms without a picture (vanilla 1.0).
 
-Written but not yet linked in: `switch/audio_switch.c` (audio plugin: ring, resampling to 48 kHz,
-audout) and `switch/input_switch.c` (controllers as N64 BUTTONS; GameCube and Pro layouts).
+
+### Sound and controllers, 2026-11-12
+
+Both are in `z-cancel-nx.nro` and checked on the console.
+
+- Sound (`switch/audio_switch.c`, an audio plugin linked like the others): the game's 32 kHz blocks go
+  into a ring; a feeder thread on core 1 resamples to 48 kHz into 5 ms audout buffers and leans the rate
+  up to 1% to hold 40 ms in the ring. After the ring runs dry it stays silent until it is back at the
+  target. The feeder's priority must be within what hbloader allows an application (0x1C; 0x1A was
+  refused). In the intro's first minute the output ran dry 21 times, at the frames where new shaders
+  compile; that goes away with the shader hitches.
+- Controllers (`switch/input_switch.c`): polled once a frame on the emulation thread and handed to the
+  core's rollback input callback. The callback's word is the controller's reply bytes with the first
+  byte highest (buttons, buttons, stick x, stick y), not `BUTTONS.Value`. GameCube and Pro layouts share
+  one table (the system reports GameCube L/R as ZL/ZR and Z as R); full tilt reads 84 (`stick_range`).
+  Plus is Start, so quitting is Minus, or L + R + Z + Start held half a second.
+- Checked with sys-botbase: Start at the title opens Mode Select, A enters 1P Mode; the quit hold returns
+  to the Homebrew Menu. The bot's first press after its controller detaches is lost: send a throwaway
+  press first, and never send presses after the program has exited (a stray Minus opened hbmenu's theme
+  menu).

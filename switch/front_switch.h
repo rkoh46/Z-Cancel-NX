@@ -41,6 +41,10 @@ void znx_front_power_begin(uint32_t cpu_mhz);
  * at the next frame; a frame that takes more than ten seconds ends the program with a line
  * in the log. tick, if not NULL, is called about twenty times a second on this thread.
  * Returns znx_bench_run's result, or 1 if the thread could not be started. */
+/* Plus on any controller stops a run by default. A program whose player uses Plus (the N64's Start) turns
+ * that off and stops the run itself (znx_bench_stop). */
+void znx_front_plus_stops(bool on);
+
 int znx_front_run(const struct znx_host* host, const struct znx_options* options, void (*tick)(void));
 
 /* End of main(): puts the clock back, prints "<program>: done" or "finished with errors",
