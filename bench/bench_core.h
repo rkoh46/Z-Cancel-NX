@@ -31,6 +31,8 @@ struct znx_options {
     int dump_frame;            /* write RDRAM to dump_path after this many frames, or -1 */
     const char* dump_path;
     int progress_every;        /* "progress" line every K frames, 0 = never */
+    int input_players;         /* controller ports the rollback session synchronizes (1-4); 0 = 4. The
+                                * rest read as unplugged (pif.c). RMG-K's P2P sessions use 2. */
     struct znx_window windows[ZNX_MAX_WINDOWS];
     int window_count;
 };
@@ -65,6 +67,15 @@ struct znx_host {
     /* Live controllers: called on the emulation thread once per frame when no input script is
      * loaded; fills the four players' N64 BUTTONS words. NULL: no input. */
     void (*live_inputs)(uint32_t buttons[4]);
+
+    /* For a netplay session (net/znx-net.cpp); everything else leaves these zero. */
+    /* An input plugin's handle, or NULL for the core's dummy (controller 1 present, no input). */
+    void* input;
+    /* Replaces the frame loop: called once the core, the ROM, the plugins and the saves are set
+     * up as for any session, it runs the session (M64CMD_ROLLBACK_EXECUTE through its own
+     * callbacks) and returns 0 on success. The bench's own frame callbacks, hash/check lines
+     * and summary are then not used. */
+    int (*session_run)(void);
 };
 
 /* The core's configuration, for znx_host.video_config. Each returns 0 on success. */
@@ -88,5 +99,9 @@ int znx_bench_frame(void);
 void znx_bench_stop(void);
 
 uint64_t znx_now_ns(void);
+
+/* The two checksums of a "check" line: of the 8 MB RDRAM, whole, and without [skip_lo, skip_hi)
+ * (multiples of 32; returns the whole checksum as rest when the range is empty). */
+void znx_check_rdram(const uint8_t* rdram, long skip_lo, long skip_hi, uint64_t* whole, uint64_t* rest);
 
 #endif

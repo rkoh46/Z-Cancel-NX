@@ -14,7 +14,13 @@
  * core's execute loop). Nothing here is called from the main thread.
  *
  * GLideN64 finds its OpenGL functions itself with eglGetProcAddress (it is built with
- * -DEGL), so GL_GetProcAddress below is only there for completeness. */
+ * -DEGL), so GL_GetProcAddress below is only there for completeness.
+ *
+ * When the program has opened the shared screen (screen_switch.c: the start screen and the game
+ * take turns on one EGL display and window surface), the plugin's window is that surface: only its
+ * OpenGL context is created here and destroyed again when the plugin closes its window, which
+ * releases the surface for the start screen. Without it (no start screen) this makes and destroys
+ * its own display and surface as before. */
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -27,6 +33,7 @@
 
 #include "m64p_types.h"
 #include "bench_core.h"
+#include "screen_switch.h"
 #include "vidext_switch.h"
 #include "znx_switch.h"
 
@@ -36,6 +43,7 @@ static EGLDisplay l_display = EGL_NO_DISPLAY;
 static EGLSurface l_surface = EGL_NO_SURFACE;
 static EGLContext l_context = EGL_NO_CONTEXT;
 static bool l_initialized;
+static bool l_shared;        /* the display and surface belong to screen_switch.c */
 static int l_width, l_height;
 
 /* What the plugin asked for with GL_SetAttribute. */
@@ -74,6 +82,14 @@ static const char* egl_error(void)
 
 static void destroy_context(void)
 {
+    if (l_shared) {
+        eglMakeCurrent(l_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (l_context != EGL_NO_CONTEXT)
+            eglDestroyContext(l_display, l_context);
+        l_context = EGL_NO_CONTEXT;
+        l_surface = EGL_NO_SURFACE;   /* not ours to destroy */
+        return;
+    }
     if (l_display != EGL_NO_DISPLAY) {
         eglMakeCurrent(l_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (l_context != EGL_NO_CONTEXT)
@@ -91,6 +107,17 @@ static m64p_error vidext_init_with_render_mode(m64p_render_mode mode)
         return M64ERR_UNSUPPORTED;
     if (l_initialized)
         return M64ERR_SUCCESS;
+    if (znx_screen_is_open()) {
+        /* The bound API is per thread: this (emulation) thread has not bound desktop OpenGL yet. */
+        if (!eglBindAPI(EGL_OPENGL_API)) {
+            znx_log("video: this EGL has no desktop OpenGL: %s", egl_error());
+            return M64ERR_SYSTEM_FAIL;
+        }
+        l_display = znx_screen_display();
+        l_shared = true;
+        l_initialized = true;
+        return M64ERR_SUCCESS;
+    }
     l_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (l_display == EGL_NO_DISPLAY || !eglInitialize(l_display, NULL, NULL)) {
         znx_log("video: cannot open the display: %s", egl_error());
@@ -118,8 +145,10 @@ static m64p_error vidext_quit(void)
     if (!l_initialized)
         return M64ERR_NOT_INIT;
     destroy_context();
-    eglTerminate(l_display);
+    if (!l_shared)
+        eglTerminate(l_display);
     l_display = EGL_NO_DISPLAY;
+    l_shared = false;
     l_initialized = false;
     znx_log("video: closed");
     return M64ERR_SUCCESS;
@@ -184,19 +213,28 @@ static m64p_error vidext_set_mode(int width, int height, int bits_per_pixel, int
         znx_log("video: %dx multisampling was asked for and is not given", l_samples);
     destroy_context(); /* a second call replaces the first window */
 
-    /* The size of the buffers the screen is fed from; the system scales them to the panel
-     * or the television. */
-    rc = nwindowSetDimensions(window, (u32)width, (u32)height);
-    if (R_FAILED(rc))
-        znx_log("video: the screen refuses %dx%d (0x%08x); its own size stays", width, height, rc);
-    if (!eglChooseConfig(l_display, config_attributes, &config, 1, &config_count) || config_count < 1) {
-        znx_log("video: no matching framebuffer format: %s", egl_error());
-        return M64ERR_SYSTEM_FAIL;
-    }
-    l_surface = eglCreateWindowSurface(l_display, config, window, NULL);
-    if (l_surface == EGL_NO_SURFACE) {
-        znx_log("video: cannot create the window surface: %s", egl_error());
-        return M64ERR_SYSTEM_FAIL;
+    if (l_shared) {
+        /* The shared screen: 1280x720 with the same framebuffer format as below. */
+        config = znx_screen_config();
+        l_surface = znx_screen_surface();
+        if (width != 1280 || height != 720)
+            znx_log("video: the plugin asked for %dx%d; the shared screen is 1280x720", width, height);
+        (void)window; (void)rc; (void)config_attributes; (void)config_count;
+    } else {
+        /* The size of the buffers the screen is fed from; the system scales them to the panel
+         * or the television. */
+        rc = nwindowSetDimensions(window, (u32)width, (u32)height);
+        if (R_FAILED(rc))
+            znx_log("video: the screen refuses %dx%d (0x%08x); its own size stays", width, height, rc);
+        if (!eglChooseConfig(l_display, config_attributes, &config, 1, &config_count) || config_count < 1) {
+            znx_log("video: no matching framebuffer format: %s", egl_error());
+            return M64ERR_SYSTEM_FAIL;
+        }
+        l_surface = eglCreateWindowSurface(l_display, config, window, NULL);
+        if (l_surface == EGL_NO_SURFACE) {
+            znx_log("video: cannot create the window surface: %s", egl_error());
+            return M64ERR_SYSTEM_FAIL;
+        }
     }
     /* What the plugin asked for; Mesa answers with the newest version that is compatible
      * with it. If it refuses, the version the Switch examples ask for. */

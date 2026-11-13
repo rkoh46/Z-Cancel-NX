@@ -13,7 +13,11 @@
  *   - posix_memalign: with ZNX_COMPACT=1 in the environment it refuses the core's 512 MB
  *     block, as the console does when the program runs as an applet, so the core's compact
  *     memory layout is exercised too.
- * It cannot test Horizon itself (svcMapProcessMemory, threads, clocks, files). */
+ * It cannot test Horizon itself (svcMapProcessMemory, threads, clocks, files).
+ *
+ * FRAMES may be written NxR ("3600x2"): the whole run R times in this process, core shut down and
+ * started again each time, as the console program does when it returns to its start screen after a
+ * game; every run must print the same hashes. */
 
 #include <errno.h>
 #include <malloc.h>
@@ -109,7 +113,7 @@ int main(int argc, char** argv)
     char* slash;
 
     if (argc < 2 || length <= 0) {
-        fprintf(stderr, "usage: znx-selftest ROM [FRAMES [ROLLBACK_A ROLLBACK_B]]\n");
+        fprintf(stderr, "usage: znx-selftest ROM [FRAMES[xRUNS] [ROLLBACK_A ROLLBACK_B]]\n");
         return 2;
     }
     exe[length] = '\0';
@@ -142,5 +146,14 @@ int main(int argc, char** argv)
         fprintf(stderr, "znx-selftest: a linked library is missing\n");
         return 1;
     }
-    return znx_bench_run(&host, &options);
+    {
+        const char* runs_text = argc > 2 ? strchr(argv[2], 'x') : NULL;
+        int runs = runs_text != NULL ? atoi(runs_text + 1) : 1, result = 0;
+        for (int run = 0; run < runs && result == 0; ++run) {
+            if (runs > 1)
+                printf("run %d of %d\n", run + 1, runs);
+            result = znx_bench_run(&host, &options);
+        }
+        return result;
+    }
 }

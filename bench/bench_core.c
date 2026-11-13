@@ -152,11 +152,9 @@ static uint64_t hash_rdram(void)
 /* A much faster checksum of RDRAM for comparing a re-run with its first pass (four independent
  * 64-bit lanes over 8-byte words). Not printed: the "hash" lines stay FNV-1a so they compare
  * across builds and with earlier logs. */
-static uint64_t check_rdram_range(uint32_t from, uint32_t to, uint64_t seed)
+static uint64_t checksum_range(const uint8_t* p, uint32_t from, uint32_t to, uint64_t seed)
 {
-    uint64_t begin = znx_now_ns();
     uint64_t a = 0x9e3779b97f4a7c15ull ^ seed, b = 0xc2b2ae3d27d4eb4full, c = 0x165667b19e3779f9ull, d = 0x27d4eb2f165667c5ull;
-    const uint8_t* p = l_rdram;
     for (uint32_t i = from; i < to; i += 32) {
         uint64_t w[4];
         memcpy(w, p + i, 32);
@@ -165,11 +163,26 @@ static uint64_t check_rdram_range(uint32_t from, uint32_t to, uint64_t seed)
         c = (c ^ w[2]) * 0xff51afd7ed558ccdull; c ^= c >> 33;
         d = (d ^ w[3]) * 0xc4ceb9fe1a85ec53ull; d ^= d >> 27;
     }
-    l_hash_ns += znx_now_ns() - begin;
     return a ^ (b * 3) ^ (c * 5) ^ (d * 7);
 }
 
+static uint64_t check_rdram_range(uint32_t from, uint32_t to, uint64_t seed)
+{
+    uint64_t begin = znx_now_ns();
+    uint64_t result = checksum_range(l_rdram, from, to, seed);
+    l_hash_ns += znx_now_ns() - begin;
+    return result;
+}
+
 static uint64_t check_rdram(void) { return check_rdram_range(0, RDRAM_SIZE, 0); }
+
+void znx_check_rdram(const uint8_t* rdram, long skip_lo, long skip_hi, uint64_t* whole, uint64_t* rest)
+{
+    uint32_t lo = (uint32_t)skip_lo & ~31u, hi = (uint32_t)skip_hi & ~31u;
+    *whole = checksum_range(rdram, 0, RDRAM_SIZE, 0);
+    *rest = hi > lo && hi <= RDRAM_SIZE
+        ? checksum_range(rdram, 0, lo, 1) ^ (checksum_range(rdram, hi, RDRAM_SIZE, 2) * 11) : *whole;
+}
 
 /* ---- callbacks from the core ---- */
 
@@ -376,10 +389,9 @@ static void frame_done(void)
         out("hash %d %016llx", l_frame, (unsigned long long)hash_rdram());
     if (l_opt.check_every > 0 && l_frame % l_opt.check_every == 0) {
         /* check <frame> <whole RDRAM> <RDRAM without [skip_lo, skip_hi)> */
-        uint32_t lo = (uint32_t)l_opt.check_skip_lo & ~31u, hi = (uint32_t)l_opt.check_skip_hi & ~31u;
-        uint64_t whole = check_rdram();
-        uint64_t rest = hi > lo && hi <= RDRAM_SIZE
-            ? check_rdram_range(0, lo, 1) ^ (check_rdram_range(hi, RDRAM_SIZE, 2) * 11) : whole;
+        uint64_t whole, rest, begin = znx_now_ns();
+        znx_check_rdram(l_rdram, l_opt.check_skip_lo, l_opt.check_skip_hi, &whole, &rest);
+        l_hash_ns += znx_now_ns() - begin;
         out("check %d %016llx %016llx", l_frame, (unsigned long long)whole, (unsigned long long)rest);
     }
     if (l_opt.progress_every > 0 && l_frame % l_opt.progress_every == 0 && l_opt.frames > 0) {
@@ -572,7 +584,7 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
     ptr_PluginStartup rsp_startup, video_startup;
     ptr_PluginShutdown rsp_shutdown, video_shutdown;
     int rom_open = 0, video_attached = 0, rsp_attached = 0, rsp_started = 0, video_started = 0;
-    int audio_started = 0, audio_attached = 0;
+    int audio_started = 0, audio_attached = 0, input_started = 0, input_attached = 0;
 
     l_host = host;
     l_name = host->name != NULL ? host->name : "znx-bench";
@@ -581,6 +593,14 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
     l_failed = 0;
     l_stop = 0;
     l_watch_last = -1;
+    /* A second run in the same process (the Switch program returns to its start screen after a
+     * game): RDRAM is allocated anew, and first_frame_setup must run again, or the core keeps its
+     * speed limiter and the old RDRAM pointer is hashed. */
+    l_rdram = NULL;
+    l_rb_done = 0;
+    l_hash_ns = l_emu_ns = l_progress_ns = 0;
+    l_frame_begin = 0;
+    l_alive_ns = 0;
 
     if (l_opt.rom_path == NULL || l_opt.frames < 0) {
         err("%s: a ROM and a frame count are needed", l_name);
@@ -714,6 +734,20 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         }
         audio_attached = 1;
     }
+    if (host->input != NULL) {
+        ptr_PluginStartup input_startup = sym(host->input, "PluginStartup");
+        if (input_startup == NULL || (error = input_startup(host->core, "input", debug_callback)) != M64ERR_SUCCESS) {
+            l_failed = fail("input PluginStartup", input_startup == NULL ? M64ERR_INPUT_NOT_FOUND : error);
+            goto shutdown;
+        }
+        input_started = 1;
+        error = CoreAttachPlugin(M64PLUGIN_INPUT, host->input);
+        if (error != M64ERR_SUCCESS) {
+            l_failed = fail("CoreAttachPlugin(input)", error);
+            goto shutdown;
+        }
+        input_attached = 1;
+    }
     error = rsp_startup(host->core, "rsp-hle", debug_callback);
     if (error != M64ERR_SUCCESS) {
         l_failed = fail("RSP PluginStartup", error);
@@ -747,8 +781,16 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         l_failed = fail("M64CMD_ROLLBACK_SET_DETERMINISTIC", error);
         goto shutdown;
     }
-    CoreDoCommand(M64CMD_ROLLBACK_SET_INPUT_PLAYERS, MAX_PLAYERS, NULL);
+    CoreDoCommand(M64CMD_ROLLBACK_SET_INPUT_PLAYERS,
+        l_opt.input_players > 0 && l_opt.input_players <= MAX_PLAYERS ? l_opt.input_players : MAX_PLAYERS, NULL);
     CoreDoCommand(M64CMD_ROLLBACK_SET_INPUT_CALLBACK, 0, (void*)input_callback);
+
+    if (host->session_run != NULL) {
+        /* A netplay session drives the frames itself (net/znx-net.cpp). */
+        if (host->session_run() != 0)
+            l_failed = 1;
+        goto shutdown;
+    }
 
     {
         m64p_rollback_execute_callbacks callbacks;
@@ -805,6 +847,12 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
 shutdown:
     CoreDoCommand(M64CMD_ROLLBACK_SET_INPUT_CALLBACK, 0, NULL);
     CoreDoCommand(M64CMD_ROLLBACK_SET_SAVE_DATA, 0, NULL);
+    if (input_attached)
+        CoreDetachPlugin(M64PLUGIN_INPUT);
+    if (input_started) {
+        ptr_PluginShutdown input_shutdown = sym(host->input, "PluginShutdown");
+        if (input_shutdown != NULL) input_shutdown();
+    }
     if (audio_attached)
         CoreDetachPlugin(M64PLUGIN_AUDIO);
     if (audio_started) {

@@ -55,7 +55,9 @@ static void usage(void)
         "                       0 pure or 1 cached interpreter, run without the rollback session\n"
         "  --dump-ram FRAME FILE  write the 8 MB RDRAM after FRAME frames (host word order). It holds\n"
         "                       game data: keep the file out of the repository\n"
-        "  --watch ADDR         print \"watch <frame> <addr> <byte>\" when that RDRAM byte changes (hex address)\n");
+        "  --watch ADDR         print \"watch <frame> <addr> <byte>\" when that RDRAM byte changes (hex address)\n"
+        "  --input-players N    controller ports the session synchronizes, default 4; the others read as\n"
+        "                       unplugged (RMG-K's P2P sessions use 2: compare with znx-net)\n");
     exit(2);
 }
 
@@ -81,6 +83,7 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--rollback-stress") && i + 2 < argc) { o.stress_every = atoi(argv[++i]); o.stress_depth = atoi(argv[++i]); }
         else if (!strcmp(a, "--watch") && i + 1 < argc) o.watch = strtol(argv[++i], NULL, 16) & 0x7fffff;
         else if (!strcmp(a, "--dump-ram") && i + 2 < argc) { o.dump_frame = atoi(argv[++i]); o.dump_path = argv[++i]; }
+        else if (!strcmp(a, "--input-players") && i + 1 < argc) o.input_players = atoi(argv[++i]);
         else if (!strcmp(a, "--verbose")) o.verbose = 1;
         else usage();
     }

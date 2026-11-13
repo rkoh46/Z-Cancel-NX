@@ -50,6 +50,12 @@ void znx_cgl_shot(int frame, const char* path)
     }
 }
 
+void znx_cgl_shots_again(void)
+{
+    for (int i = 0; i < l_shot_count; ++i)
+        l_shots[i].done = 0;
+}
+
 /* ---- a PNG of the framebuffer object: 8-bit RGB, rows top to bottom ---- */
 
 static void chunk(FILE* f, const char* type, const unsigned char* data, uint32_t size)

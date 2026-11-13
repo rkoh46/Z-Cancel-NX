@@ -50,6 +50,7 @@ IMAGE="${ZNX_DOCKER_IMAGE:-melee-nx-netplay-build:latest}"
 if [ "${1:-}" != "--in-container" ]; then
     cd "$ROOT"
     builder/prepare-src.sh
+    builder/fetch-menu-deps.sh   # xdelta3 into ref/xdelta for the start screen (git, on the host)
     command -v docker >/dev/null || { echo "docker not found (start Colima)" >&2; exit 69; }
     docker image inspect "$IMAGE" >/dev/null 2>&1 || {
         echo "Docker image $IMAGE not found: build it with Melee-NX-NetPlay's builder/docker.sh image" >&2; exit 69; }
@@ -120,6 +121,10 @@ PORT_INC="-isystem $DEVKITPRO/portlibs/switch/include"
 FRONT_COMMON="switch/front_switch.c switch/jit_switch.c switch/dynlib_static.c switch/clocks_switch.c switch/libc_switch.c bench/bench_core.c"
 FRONT_BENCH="switch/main_switch.c"
 FRONT_GAME="switch/game_switch.c switch/vidext_switch.c switch/input_switch.c game/game_core.c"
+# The start screen (menu/): the menu itself, its EGL screen shared with the game, ROM detection, the
+# Remix builder (libcurl with the system's TLS service, minizip and md5.c from the core's tree, the
+# xdelta3 decoder from ref/xdelta) and the online hook.
+FRONT_GAME="$FRONT_GAME switch/screen_switch.c switch/menu_switch.c menu/menu.c menu/draw.c menu/catalog.c menu/patcher.c menu/settings.c menu/online.c"
 if [ "$TARGET" = selftest ]; then
     ARCH="-fPIE"
     # zlib: Debian's runtime library with devkitPro's copy of the two headers.
@@ -137,6 +142,8 @@ COMMON="$ARCH -O3 -g -ffp-contract=off -fno-strict-aliasing -ffunction-sections 
 CORE_FLAGS="$COMMON -I$CORE/src -I$GEN -I$CORE/subprojects/md5 -I$CORE/subprojects/xxhash -I$CORE/subprojects/minizip -I$OUT/include $ZLIB_INC -DM64P_PARALLEL -DUSE_SDL3 -DNOCRYPT -DNOUNCRYPT -DDYNAREC -DNEW_DYNAREC=4 -DNO_KEYBINDINGS -DACCURATE_FPU_BEHAVIOR -DIOAPI_NO_64"
 RSP_FLAGS="$COMMON -I$RSP/src -I$CORE/src/api"
 FRONT_FLAGS="$ARCH -O2 -g -Wall -ffunction-sections -D__SWITCH__ -I$CORE/src/api -I$GEN -Ibench -Igame -Iswitch $FRONT_INC $PORT_INC"
+MENU_DEPS="-I$CORE/subprojects/md5 -I$CORE/subprojects/minizip -Iref/xdelta/xdelta3"
+[ "$TARGET" = selftest ] || FRONT_FLAGS="$FRONT_FLAGS -Imenu $MENU_DEPS -isystem $DEVKITPRO/portlibs/switch/include/freetype2"
 # GLideN64: RMG-K's CMake options that matter (MUPENPLUSAPI, TXFILTER_LIB) plus EGL on a
 # "Linux" as far as its #ifdefs go. gnu++17 as its CMakeLists asks; the ARMv8 CRC32
 # instructions for its texture checksums (-march has +crc).
@@ -266,6 +273,18 @@ FRONT_BENCH_OBJS=""; FRONT_GAME_OBJS=""
 [ -n "$WITH_BENCH" ] && FRONT_BENCH_OBJS="$(front_objects "$FRONT_BENCH")"
 [ -n "$WITH_GAME" ] && FRONT_GAME_OBJS="$(front_objects "$FRONT_GAME")"
 queue switch/jit_memory.S "$OBJ/front/jit_memory.o" "$ARCH"
+MENU_LIB_OBJS=""
+if [ -n "$WITH_GAME" ]; then
+    # Code from elsewhere that the start screen compiles as it is, without warnings: md5.c and minizip
+    # (the core's own copies, built again here because the core's are hidden inside lib_core.o) and
+    # xdelta3 (menu/xdelta_apply.c includes ref/xdelta/xdelta3/xdelta3.c).
+    MENU_LIB_FLAGS="$ARCH -O2 -g -w -ffunction-sections -D__SWITCH__ -DIOAPI_NO_64 -DNOCRYPT -DNOUNCRYPT $MENU_DEPS -Imenu $PORT_INC"
+    for f in "$CORE/subprojects/md5/md5.c" "$CORE/subprojects/minizip/unzip.c" "$CORE/subprojects/minizip/ioapi.c" menu/xdelta_apply.c; do
+        o="$OBJ/menu/$(basename "${f%.c}").o"
+        queue "$f" "$o" "$MENU_LIB_FLAGS"
+        MENU_LIB_OBJS="$MENU_LIB_OBJS $o"
+    done
+fi
 
 tr '\n' '\0' < "$CMDS" | xargs -0 -r -n 1 -P "$JOBS" sh -c
 
@@ -356,6 +375,12 @@ fi
 
 # The core's ROM database and cheat list (settings per game) travel inside the NRO as romfs:/data.
 cp "$CORE"/data/mupen64plus.ini "$CORE"/data/mupencheat.txt "$OUT/romfs/data/"
+# The start screen's font (SIL OFL 1.1) as romfs:/fonts; the licences of what the start screen adds as
+# romfs:/licenses (THIRD_PARTY_NOTICES.md).
+mkdir -p "$OUT/romfs/fonts"
+cp assets/fonts/BarlowSemiCondensed-Medium.ttf assets/fonts/OFL.txt "$OUT/romfs/fonts/"
+mkdir -p "$OUT/romfs/licenses"
+cp assets/licenses/xdelta3-Apache-2.0.txt THIRD_PARTY_NOTICES.md "$OUT/romfs/licenses/"
 
 # finish <name> <title> <author>: checks on the linked program build/switch/<name>.elf, then the NRO
 finish() {
@@ -412,7 +437,9 @@ if [ -n "$WITH_GAME" ]; then
         -Wl,-Map,"$OUT/z-cancel-nx.map" -Wl,--wrap=abort -Wl,--wrap=__assert_func \
         $FRONT_COMMON_OBJS $FRONT_GAME_OBJS "$OBJ/front/static_libs_game.o" \
         "$OBJ/lib_core.o" "$OBJ/lib_rsp_hle.o" "$OBJ/front/jit_memory.o" "$OBJ/lib_gliden64.o" "$OBJ/lib_audio.o" \
-        -L"$DEVKITPRO/portlibs/switch/lib" -L"$DEVKITPRO/libnx/lib" -lEGL -lglapi -ldrm_nouveau -lz -lnx -lm \
+        $MENU_LIB_OBJS \
+        -L"$DEVKITPRO/portlibs/switch/lib" -L"$DEVKITPRO/libnx/lib" -lEGL -lglapi -ldrm_nouveau \
+        -lcurl -Wl,--start-group -lfreetype -lharfbuzz -lpng16 -lbz2 -Wl,--end-group -lz -lnx -lm \
         -o "$OUT/z-cancel-nx.elf"
     # GLideN64's global constructors must be among those libnx runs before main().
     grep -q "^ \.init_array.*lib_gliden64\.o" "$OUT/z-cancel-nx.map" \

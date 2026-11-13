@@ -8,7 +8,12 @@
  * must equal znx-bench's).
  *
  *   znx-game --rom FILE --frames N [--inputs FILE] [--hash-every K] [--scale S]
- *            [--shot FRAME FILE.png]... [--verbose]
+ *            [--shot FRAME FILE.png]... [--repeat R] [--verbose]
+ *   znx-game --menu-shot FILE.png ...   the start screen instead (menu_mac.c)
+ *
+ * --repeat R runs the whole thing R times in this process (core started and shut down, GLideN64
+ * started, its context made and destroyed, each time), the way the Switch program returns to its
+ * start screen after a game and can start another: every run must print the same hashes.
  */
 
 #include <dlfcn.h>
@@ -22,6 +27,7 @@
 
 #include "bench_core.h"
 #include "game_core.h"
+#include "menu_mac.h"
 #include "vidext_cgl.h"
 
 static void print_line(int is_error, const char* line)
@@ -44,7 +50,8 @@ static void usage(void)
 {
     fprintf(stderr,
         "usage: znx-game --rom FILE --frames N [--inputs FILE] [--hash-every K] [--scale S]\n"
-        "                [--shot FRAME FILE.png]... [--verbose]\n"
+        "                [--shot FRAME FILE.png]... [--repeat R] [--verbose]\n"
+        "       znx-game --menu-shot FILE.png [--menu-keys K,K,...] [--menu-base DIR] (the start screen; see menu_mac.c)\n"
         "  --hash-every K   \"hash <frame> <fnv1a64 of RDRAM>\" every K frames (default 600), as znx-bench prints\n"
         "  --scale S        0 (default): no frame buffer emulation; 1, 2: on, at that multiple of the N64's resolution\n"
         "  --shot FRAME F   save the picture shown after FRAME frames as a PNG. It is the game's\n"
@@ -60,7 +67,11 @@ int main(int argc, char** argv)
     struct znx_host host;
     struct znx_game_settings game = { 1280, 720, 0, 0, 600 };
     static const struct znx_game_video video = { znx_cgl_take_swap_ns, znx_cgl_take_swaps };
-    int result;
+    int result = 0, repeat = 1;
+
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--menu-shot"))
+            return znx_menu_mac_main(argc, argv);
 
     znx_options_defaults(&o);
     o.hash_every = 600;
@@ -73,6 +84,7 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--hash-every") && i + 1 < argc) o.hash_every = atoi(argv[++i]);
         else if (!strcmp(a, "--scale") && i + 1 < argc) game.scale = atoi(argv[++i]);
         else if (!strcmp(a, "--shot") && i + 2 < argc) { int frame = atoi(argv[++i]); znx_cgl_shot(frame, argv[++i]); }
+        else if (!strcmp(a, "--repeat") && i + 1 < argc) repeat = atoi(argv[++i]);
         else if (!strcmp(a, "--verbose")) o.verbose = 1;
         else usage();
     }
@@ -106,8 +118,13 @@ int main(int argc, char** argv)
     host.frame_done = znx_game_frame_done;
 
     znx_cgl_begin(print_line);
-    znx_game_begin(&game, &video, print_line);
-    result = znx_bench_run(&host, &o);
+    for (int run = 0; run < repeat && result == 0; ++run) {
+        if (repeat > 1)
+            printf("run %d of %d\n", run + 1, repeat);
+        znx_cgl_shots_again();
+        znx_game_begin(&game, &video, print_line);
+        result = znx_bench_run(&host, &o);
+    }
 
     dlclose(host.rsp);
     dlclose(host.video);

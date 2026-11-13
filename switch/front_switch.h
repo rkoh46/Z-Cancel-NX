@@ -6,6 +6,7 @@
 #define ZNX_FRONT_SWITCH_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "bench_core.h"
@@ -35,6 +36,13 @@ const char* znx_front_find_rom(int argc, char** argv);
 
 /* Keeps the console awake, asks for the CPU clock (0 leaves it alone) and reports it. */
 void znx_front_power_begin(uint32_t cpu_mhz);
+
+/* After a run, when the program goes back to its start screen: the clock back to what the system
+ * had, auto-sleep allowed again. znx_front_end does the same at the end of the program. */
+void znx_front_power_end(void);
+
+/* The last `lines` lines of output (at most 40), one per line, into out. Returns the length. */
+size_t znx_front_tail(char* out, size_t size, unsigned lines);
 
 /* Runs znx_bench_run(host, options) on the emulation thread (core 2) and watches it from
  * this one: Plus on any controller or the system asking the program to close stops the run

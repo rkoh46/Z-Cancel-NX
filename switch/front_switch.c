@@ -261,6 +261,29 @@ void znx_front_power_begin(uint32_t cpu_mhz)
                 clock.request_ok ? "accepted" : "refused", (unsigned)(clock.after_hz / 1000000u));
 }
 
+void znx_front_power_end(void)
+{
+    restore_clock();
+    appletSetMediaPlaybackState(false);
+    appletSetAutoSleepDisabled(false);
+}
+
+size_t znx_front_tail(char* out, size_t size, unsigned lines)
+{
+    size_t used = 0;
+    bool locked = lock_log();
+    unsigned count = l_tail_count < TAIL_LINES ? l_tail_count : TAIL_LINES;
+    if (lines < count)
+        count = lines;
+    if (size > 0)
+        out[0] = '\0';
+    for (unsigned i = l_tail_count - count; i != l_tail_count && used + 1 < size; ++i)
+        used += (size_t)snprintf(out + used, size - used, "%s%s", used ? "\n" : "", l_tail[i % TAIL_LINES]);
+    if (locked)
+        mutexUnlock(&l_log_lock);
+    return used < size ? used : size - 1;
+}
+
 /* ---- the emulation thread ---- */
 
 struct run {

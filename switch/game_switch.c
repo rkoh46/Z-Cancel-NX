@@ -9,8 +9,16 @@
  * no controller input yet: input comes from a script, or there is none and the game shows
  * its intro and a demo fight.
  *
+ * It opens on the start screen (menu/, switch/menu_switch.c): Super Smash Bros., Smash Remix 2.0.1
+ * or Remix +EXTRA 0.6.0, the vanilla ROM found by its MD5 and the Remix ROMs built from it on the
+ * console; then Play (this) or Online play (menu/online.c). Quitting a game (the quit combination)
+ * comes back to the start screen: the core, GLideN64 and the audio plugin are shut down and started
+ * again for the next game, on the one EGL window surface the program keeps (screen_switch.c).
+ *
  * Files, all under sdmc:/switch/z-cancel-nx/:
- *   rom.z64          the ROM (or pass a path as the NRO's first argument)
+ *   *.z64|n64|v64    the vanilla US ROM, any name, here or in roms/ (a ROM path as the NRO's first
+ *                    argument, or menu=0, skips the start screen and plays rom.z64 or that file)
+ *   roms/, patches/  the built Remix ROMs and their xdelta patches; rom-cache.txt remembers MD5s
  *   inputs.txt       optional input script, the format of bench/inputs/ (frame player buttons_hex)
  *   z-cancel-nx.ini  optional:
  *                      scale=0        0 draws at the screen's 1280x720 (default); 1 or 2 turns
@@ -23,9 +31,11 @@
  *                      inputs=<file>  another script; "inputs=" for none
  *                      cpu_mhz=1785   0 leaves the clock alone
  *                      verbose=1      the core's and the plugin's own messages too
+ *                      sound=1, stick_range=84   (the start screen's Settings write these two)
+ *                      menu=1         0: no start screen, straight into rom.z64 as before
  *   latest.log       every line of output, flushed line by line
  *
- * Lines also go to a PC running nxlink (-s). Plus on any controller leaves. */
+ * Lines also go to a PC running nxlink (-s). */
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -38,7 +48,11 @@
 #include "front_switch.h"
 #include "game_core.h"
 #include "input_switch.h"
+#include "menu.h"
+#include "menu_switch.h"
+#include "screen_switch.h"
 #include "vidext_switch.h"
+#include "znx_version.h"
 #include "znx_switch.h"
 
 #define PROGRAM "z-cancel-nx"
@@ -52,6 +66,7 @@ struct settings {
     uint32_t cpu_mhz;
     int sound;                 /* 1: the audio plugin; 0: silent */
     int stick_range;           /* what a fully tilted stick reads on the N64 axis; 0 = 84 */
+    int menu;                  /* 1: the start screen */
 };
 
 static bool ini_key(const char* key, const char* value, void* user)
@@ -71,6 +86,7 @@ static bool ini_key(const char* key, const char* value, void* user)
     else if (!strcmp(key, "sound")) s->sound = atoi(value) != 0;
     else if (!strcmp(key, "stick_range")) s->stick_range = atoi(value);
     else if (!strcmp(key, "verbose")) s->options.verbose = atoi(value);
+    else if (!strcmp(key, "menu")) s->menu = atoi(value) != 0;
     else return false;
     return true;
 }
@@ -110,60 +126,69 @@ static uint64_t thread_cpu_ns(void)
 }
 
 /* The four controllers for this frame. Holding the quit combination (input_switch.h) ends the run. */
+static bool l_quitting;
+
 static void live_inputs(uint32_t buttons[4])
 {
-    static bool quitting;
     znx_input_poll();
     for (int p = 0; p < 4; ++p)
         buttons[p] = znx_input_buttons(p);
-    if (!quitting && znx_input_quit_requested()) {
-        quitting = true;
+    if (!l_quitting && znx_input_quit_requested()) {
+        l_quitting = true;
         znx_log(PROGRAM ": quit combination held at frame %d", znx_bench_frame());
         znx_bench_stop();
     }
 }
 
-int main(int argc, char** argv)
+/* The settings file, read again before every game (the start screen may have changed it). */
+static void read_settings(struct settings* settings)
+{
+    memset(settings, 0, sizeof(*settings));
+    znx_options_defaults(&settings->options);
+    settings->options.frames = 0;          /* until the quit combination */
+    settings->options.hash_every = 0;
+    settings->options.progress_every = 0;
+    settings->options.window_count = 0;
+    settings->game.width = 1280;
+    settings->game.height = 720;
+    settings->game.vsync = 1;
+    settings->game.scale = 0;
+    settings->game.report_every = 600;
+    settings->cpu_mhz = 1785; /* the highest stock CPU clock of the first Switch model */
+    settings->sound = 1;
+    settings->menu = 1;
+    znx_front_read_ini(PROGRAM ".ini", ini_key, settings);
+    if (settings->options.frames < 0)
+        settings->options.frames = 0;
+    if (settings->game.scale < 0 || settings->game.scale > 4)
+        settings->game.scale = 0;
+    if (settings->rdram_check)
+        settings->options.hash_every = 600;
+    if (!settings->inputs_set && znx_file_exists(ZNX_BASE_DIR "/inputs.txt"))
+        snprintf(settings->inputs_path, sizeof(settings->inputs_path), ZNX_BASE_DIR "/inputs.txt");
+    settings->options.inputs_path = settings->inputs_path[0] ? settings->inputs_path : NULL;
+    znx_log("settings: scale %d, vsync %d, rdram_check %d, frames %d, inputs %s, cpu_mhz %u, sound %d, stick_range %d",
+            settings->game.scale, settings->game.vsync, settings->rdram_check, settings->options.frames,
+            settings->options.inputs_path ? settings->options.inputs_path : "none", (unsigned)settings->cpu_mhz,
+            settings->sound, settings->stick_range);
+}
+
+/* One game, as the program ran before it had a start screen. Returns znx_front_run's result. */
+static int play(const char* rom_path, bool have_romfs)
 {
     static struct settings settings;
     static struct znx_host host;
     static const struct znx_game_video video = { znx_vidext_take_swap_ns, znx_vidext_take_swaps, thread_cpu_ns };
-    bool have_romfs;
     int exit_code = 1;
 
-    znx_front_begin(PROGRAM, "latest.log", false);
-    have_romfs = znx_front_romfs();
-
-    znx_options_defaults(&settings.options);
-    settings.options.frames = 0;          /* until Plus */
-    settings.options.hash_every = 0;
-    settings.options.progress_every = 0;
-    settings.options.window_count = 0;
-    settings.game.width = 1280;
-    settings.game.height = 720;
-    settings.game.vsync = 1;
-    settings.game.scale = 0;
-    settings.game.report_every = 600;
-    settings.cpu_mhz = 1785; /* the highest stock CPU clock of the first Switch model */
-    settings.sound = 1;
-    znx_front_read_ini(PROGRAM ".ini", ini_key, &settings);
-    if (settings.options.frames < 0)
-        settings.options.frames = 0;
-    if (settings.game.scale < 0 || settings.game.scale > 4)
-        settings.game.scale = 0;
-    if (settings.rdram_check)
-        settings.options.hash_every = 600;
-    if (!settings.inputs_set && znx_file_exists(ZNX_BASE_DIR "/inputs.txt"))
-        snprintf(settings.inputs_path, sizeof(settings.inputs_path), ZNX_BASE_DIR "/inputs.txt");
-    settings.options.inputs_path = settings.inputs_path[0] ? settings.inputs_path : NULL;
-    znx_log("settings: scale %d, vsync %d, rdram_check %d, frames %d, inputs %s, cpu_mhz %u",
-            settings.game.scale, settings.game.vsync, settings.rdram_check, settings.options.frames,
-            settings.options.inputs_path ? settings.options.inputs_path : "none", (unsigned)settings.cpu_mhz);
-    settings.options.rom_path = znx_front_find_rom(argc, argv);
+    read_settings(&settings);
+    settings.options.rom_path = rom_path;
+    znx_log("rom: %s", rom_path);
 
     znx_front_power_begin(settings.cpu_mhz);
     znx_game_begin(&settings.game, &video, znx_front_print);
 
+    memset(&host, 0, sizeof(host));
     host.name = PROGRAM;
     host.core = znx_static_lib("core");
     host.video = znx_static_lib("gliden64");
@@ -176,6 +201,7 @@ int main(int argc, char** argv)
     host.video_config = znx_game_video_config;
     host.frame_done = frame_done;
     host.audio = settings.sound ? znx_static_lib("audio") : NULL;
+    l_quitting = false;
     if (settings.options.inputs_path == NULL) {
         /* Played with controllers: Plus is the N64's Start, so it no longer stops the run. */
         znx_input_init(settings.stick_range);
@@ -183,17 +209,67 @@ int main(int argc, char** argv)
         znx_front_plus_stops(false);
         znx_log("input: controllers (hold Minus, or L + R + Z + Start on a GameCube controller, to quit); full stick tilt reads %d",
                 settings.stick_range > 0 ? settings.stick_range : 84);
+    } else {
+        znx_front_plus_stops(true);
     }
 
-    if (settings.options.rom_path == NULL)
-        ;
-    else if (host.core == NULL || host.video == NULL || host.rsp == NULL || !have_romfs)
+    if (host.core == NULL || host.video == NULL || host.rsp == NULL || !have_romfs)
         znx_log(PROGRAM ": this build is incomplete (a linked library or the romfs is missing)");
     else
         exit_code = znx_front_run(&host, &settings.options, NULL);
+    znx_front_power_end();
+    return exit_code;
+}
 
-    /* Without a PC listening, a run that ended by itself (an error, or frames=N) leaves its
-     * last lines on the screen; Plus during the picture goes straight back to the menu. */
-    znx_front_end(exit_code, exit_code != 0 || settings.options.frames > 0);
+int main(int argc, char** argv)
+{
+    static struct settings settings;
+    struct znx_menu* menu = NULL;
+    struct znx_menu_config config;
+    bool have_romfs;
+    int exit_code = 0;
+
+    znx_front_begin(PROGRAM, "latest.log", false);
+    have_romfs = znx_front_romfs();
+    read_settings(&settings);
+
+    if (!settings.menu || (argc > 1 && znx_file_exists(argv[1]))) {
+        /* No start screen: one game, then back to the Homebrew Menu (scripted runs, nxlink). */
+        const char* rom = znx_front_find_rom(argc, argv);
+        exit_code = rom != NULL ? play(rom, have_romfs) : 1;
+        znx_front_end(exit_code, exit_code != 0 || settings.options.frames > 0);
+        return 0;
+    }
+
+    config.base_dir = ZNX_BASE_DIR;
+    config.version = ZNX_VERSION;
+    menu = znx_menu_create(&config);
+    if (menu == NULL) {
+        znx_log(PROGRAM ": no memory for the start screen");
+        znx_front_end(1, true);
+        return 0;
+    }
+    for (;;) {
+        enum znx_menu_action action = znx_menu_switch_run(menu);
+        int result;
+        if (action != ZNX_MENU_PLAY) {
+            exit_code = znx_menu_switch_failed() ? 1 : 0;
+            break;
+        }
+        result = play(znx_menu_rom_path(menu), have_romfs);
+        if (result != 0) {
+            char tail[1200];
+            znx_front_tail(tail, sizeof(tail), 8);
+            znx_menu_notice(menu, "The game stopped with an error",
+                            "The last lines of the log are below; all of it is in latest.log.", tail);
+        }
+        if (!appletMainLoop())
+            break;
+    }
+    znx_menu_destroy(menu);
+    znx_screen_close();
+    /* Leaving from the start screen goes straight back to the Homebrew Menu; if the screen could
+     * not be drawn at all, the log's last lines are shown on the text console instead. */
+    znx_front_end(exit_code, exit_code != 0);
     return 0;
 }
