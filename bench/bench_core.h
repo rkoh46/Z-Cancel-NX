@@ -23,6 +23,8 @@ struct znx_options {
     int emumode;               /* 2 recompiler in a rollback session; 0/1 interpreters */
     int verbose;               /* also pass the core's info and verbose messages on */
     int rb_a, rb_b;            /* rollback test: save at A, rewind at B; -1 = none */
+    int stress_every;          /* rollback stress: every K frames rewind the last D and re-run them */
+    int stress_depth;          /*   (0 = off); each re-run is compared frame by frame with the first pass */
     long watch;                /* RDRAM offset of a byte to report, or -1 */
     int dump_frame;            /* write RDRAM to dump_path after this many frames, or -1 */
     const char* dump_path;

@@ -1,0 +1,100 @@
+Rollback load: keep compiled code on pages the load did not change
+
+Every rollback load called invalidate_all_pages(): all compiled blocks discarded, two sweeps over
+the million-entry page tables, then the re-run pays for recompiling. On a Switch that was about
+9 ms of an 11 ms load. A rollback goes back a few frames and the game code in RAM has almost never
+changed, so the load now notes, before RDRAM is overwritten, which pages holding compiled code
+differ from the incoming state, and afterwards invalidates only those (invalidate_block, what a
+guest write to the page does). Code from outside RDRAM is always dropped. Used only for rollback
+buffer loads whose TLB entries are unchanged; everything else takes the full path as before.
+The re-run after a load is verified exact (RDRAM hash of every frame) by znx-bench.
+
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
+@@ -2994,6 +2994,48 @@
+     if(page==0x80000) page=0xC0000;
+   }
+   tlb_speed_hacks();
++}
++
++// Rollback loads. A rollback puts RAM back a few frames; the code the game runs has almost never
++// changed in that time, yet invalidate_all_pages() throws every compiled block away and walks two
++// million page-table entries (about 9 ms on a Cortex-A57, on every load, plus the recompiling
++// after it). Instead: before the load overwrites RAM, note which pages that hold compiled code
++// differ from the incoming state; afterwards invalidate just those, exactly as a guest write to
++// them would. Blocks on untouched pages stay valid because the bytes they were compiled from are
++// the same. Only used when the TLB did not change (the caller checks).
++static unsigned char rollback_changed_page[2048];
++static int rollback_changed_noted;
++
++void new_dynarec_rollback_note_ram(const void* incoming_rdram)
++{
++  const unsigned char* now=(const unsigned char*)g_dev.rdram.dram;
++  const unsigned char* then=(const unsigned char*)incoming_rdram;
++  u_int page;
++  for(page=0;page<2048;page++)
++    rollback_changed_page[page]=(jump_in[page]||jump_out[page])&&memcmp(now+page*4096,then+page*4096,4096)!=0;
++  rollback_changed_noted=1;
++}
++
++int new_dynarec_rollback_invalidate_changed(void)
++{
++  u_int page;
++  int outside=0;
++  if(!rollback_changed_noted) return 0;
++  rollback_changed_noted=0;
++  for(page=0;page<2048;page++)
++    if(rollback_changed_page[page]) invalidate_block(0x80000+page);
++  // Code compiled from outside RDRAM (SP memory, PIF): the load replaces those too.
++  for(page=2048;page<4096;page++)
++    if(jump_in[page]||jump_out[page]) { invalidate_page(page); outside=1; }
++  if(outside) {
++    #if NEW_DYNAREC >= NEW_DYNAREC_ARM
++    do_clear_cache();
++    #endif
++    #ifdef USE_MINI_HT
++    memset(g_dev.r4300.new_dynarec_hot_state.mini_ht,-1,sizeof(g_dev.r4300.new_dynarec_hot_state.mini_ht));
++    #endif
++  }
++  return 1;
+ }
+ 
+ void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t address, size_t size)
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.h
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.h
+@@ -110,6 +110,8 @@
+ extern unsigned int using_tlb;
+ 
+ void invalidate_cached_code_new_dynarec(struct r4300_core* r4300, uint32_t address, size_t size);
++void new_dynarec_rollback_note_ram(const void* incoming_rdram);
++int new_dynarec_rollback_invalidate_changed(void);
+ void new_dynarec_rollback_stats_reset(void);
+ void new_dynarec_rollback_stats_get(struct new_dynarec_rollback_stats* stats);
+ void new_dynarec_init(void);
+--- a/mupen64plus-core/src/main/savestates.c
++++ b/mupen64plus-core/src/main/savestates.c
+@@ -825,6 +825,10 @@
+         rollback_fixed_end = SDL_GetPerformanceCounter();
+         rollback_rdram_start = rollback_fixed_end;
+     }
++#ifdef NEW_DYNAREC
++    if (rollback_buffer_load && dev->r4300.emumode == EMUMODE_DYNAREC)
++        new_dynarec_rollback_note_ram(curr);   /* which code pages this load changes */
++#endif
+     COPYARRAY(dev->rdram.dram, curr, uint32_t, RDRAM_MAX_SIZE/4);
+     if (memory_data != NULL && rollback_verbose_stats)
+         rollback_rdram_end = SDL_GetPerformanceCounter();
+@@ -935,6 +939,13 @@
+     /* RAM was replaced directly, so compiled instructions can still reflect the
+      * discarded timeline, including for this machine's own rollback buffers.
+      * Invalidation also rebuilds dynarec address mappings from the restored TLB. */
++#ifdef NEW_DYNAREC
++    /* A rollback load with the same TLB: only the code on pages whose RAM changed is discarded. */
++    if (rollback_buffer_load && rollback_tlb_lut_skipped && dev->r4300.emumode == EMUMODE_DYNAREC &&
++        new_dynarec_rollback_invalidate_changed())
++        savestates_load_set_pc(&dev->r4300, GETDATA(curr, uint32_t), 0);
++    else
++#endif
+     savestates_load_set_pc(&dev->r4300, GETDATA(curr, uint32_t), 1);
+ 
+     *r4300_cp0_next_interrupt(&dev->r4300.cp0) = GETDATA(curr, uint32_t);

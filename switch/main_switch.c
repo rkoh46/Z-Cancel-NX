@@ -182,6 +182,10 @@ static void read_ini(struct settings* s)
             else snprintf(s->inputs_path, sizeof(s->inputs_path), BASE_DIR "/%s", value);
         }
         else if (!strcmp(key, "cpu_mhz")) s->cpu_mhz = (uint32_t)atoi(value);
+        else if (!strcmp(key, "rollback_stress")) {   /* rollback_stress=K,D */
+            int k, d;
+            if (sscanf(value, "%d ,%d", &k, &d) == 2 && k > d && d > 0) { s->options.stress_every = k; s->options.stress_depth = d; s->options.rb_a = s->options.rb_b = -1; }
+        }
         else if (!strcmp(key, "verbose")) s->options.verbose = atoi(value);
         else znx_log("settings: unknown key \"%s\" in bench.ini", key);
     }

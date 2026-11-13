@@ -70,6 +70,10 @@ static int l_watch_last;
 static uint64_t* l_rb_hashes;  /* l_rb_hashes[i]: RDRAM hash after i frames past A */
 static int l_rb_done;
 static m64p_rollback_state l_rb_state;
+/* Rollback stress totals. */
+static int l_st_count, l_st_failed, l_st_first_bad = -1;
+static uint64_t l_st_save_ns, l_st_load_ns, l_st_replay_ns, l_st_save_worst, l_st_load_worst, l_st_total_worst;
+static uint64_t l_st_begin;
 
 static uint32_t* l_frame_us10; /* time of every frame in units of 0.1 us */
 static uint64_t l_frame_begin; /* when the frame in flight started, 0 between frames */
@@ -144,6 +148,26 @@ static uint64_t hash_rdram(void)
     return h;
 }
 
+/* A much faster checksum of RDRAM for comparing a re-run with its first pass (four independent
+ * 64-bit lanes over 8-byte words). Not printed: the "hash" lines stay FNV-1a so they compare
+ * across builds and with earlier logs. */
+static uint64_t check_rdram(void)
+{
+    uint64_t begin = znx_now_ns();
+    uint64_t a = 0x9e3779b97f4a7c15ull, b = 0xc2b2ae3d27d4eb4full, c = 0x165667b19e3779f9ull, d = 0x27d4eb2f165667c5ull;
+    const uint8_t* p = l_rdram;
+    for (uint32_t i = 0; i < RDRAM_SIZE; i += 32) {
+        uint64_t w[4];
+        memcpy(w, p + i, 32);
+        a = (a ^ w[0]) * 0x9fb21c651e98df25ull; a ^= a >> 29;
+        b = (b ^ w[1]) * 0xd6e8feb86659fd93ull; b ^= b >> 31;
+        c = (c ^ w[2]) * 0xff51afd7ed558ccdull; c ^= c >> 33;
+        d = (d ^ w[3]) * 0xc4ceb9fe1a85ec53ull; d ^= d >> 27;
+    }
+    l_hash_ns += znx_now_ns() - begin;
+    return a ^ (b * 3) ^ (c * 5) ^ (d * 7);
+}
+
 /* ---- callbacks from the core ---- */
 
 static void debug_callback(void* context, int level, const char* message)
@@ -183,10 +207,14 @@ static void rollback_save(void)
         l_rb_done = 1;
         return;
     }
+    if (l_opt.stress_every > 0) {
+        l_st_save_ns += elapsed;
+        if (elapsed > l_st_save_worst) l_st_save_worst = elapsed;
+    } else
     out("rollback save frame %d: %llu us, %d bytes", l_frame,
         (unsigned long long)(elapsed / 1000), l_rb_state.len);
     l_rb_hashes = calloc((size_t)(l_opt.rb_b - l_opt.rb_a + 1), sizeof(uint64_t));
-    l_rb_hashes[0] = hash_rdram();
+    l_rb_hashes[0] = check_rdram();
 }
 
 static void rollback_replay(void)
@@ -204,10 +232,11 @@ static void rollback_replay(void)
         l_rb_done = 1;
         return;
     }
+    if (l_opt.stress_every <= 0)
     out("rollback load frame %d -> %d: %llu us", b, a, (unsigned long long)(load_ns / 1000));
 
     l_frame = a;
-    if (hash_rdram() != l_rb_hashes[0]) {
+    if (check_rdram() != l_rb_hashes[0]) {
         mismatches++;
         first_bad = a;
     }
@@ -221,7 +250,7 @@ static void rollback_replay(void)
             break;
         }
         l_frame++;
-        if (hash_rdram() != l_rb_hashes[l_frame - a]) {
+        if (check_rdram() != l_rb_hashes[l_frame - a]) {
             mismatches++;
             if (first_bad < 0)
                 first_bad = l_frame;
@@ -229,6 +258,26 @@ static void rollback_replay(void)
     }
     uint64_t replay_ns = (znx_now_ns() - replay_begin) - (l_hash_ns - hash_before);
     int replayed = b - a;
+    if (l_opt.stress_every > 0) {
+        uint64_t total = load_ns + replay_ns;
+        l_st_count++;
+        l_st_load_ns += load_ns;
+        l_st_replay_ns += replay_ns;
+        if (load_ns > l_st_load_worst) l_st_load_worst = load_ns;
+        if (total > l_st_total_worst) l_st_total_worst = total;
+        if (mismatches != 0 || l_failed) {
+            l_st_failed++;
+            if (l_st_first_bad < 0) l_st_first_bad = first_bad;
+            if (l_st_failed <= 5)
+                out("rollback stress: re-run of %d..%d differs (%d of %d hashes, first at frame %d)",
+                    a, b, mismatches, replayed + 1, first_bad);
+        }
+        CoreDoCommand(M64CMD_ROLLBACK_FREE_STATE, 0, l_rb_state.buffer);
+        l_rb_state.buffer = NULL;
+        free(l_rb_hashes);
+        l_rb_hashes = NULL;
+        return;
+    }
     out("rollback replay %d frames: %llu us (%.0f us/frame)", replayed,
         (unsigned long long)(replay_ns / 1000), replayed ? replay_ns / 1000.0 / replayed : 0.0);
     if (mismatches == 0 && !l_failed) {
@@ -278,6 +327,18 @@ static int begin_frame(void* user)
 {
     (void)user;
     first_frame_setup();
+    if (l_opt.stress_every > 0 && !l_failed) {
+        /* Every K frames: D frames before the boundary save, at the boundary rewind and re-run. */
+        const int k = l_opt.stress_every, d = l_opt.stress_depth;
+        if (l_rb_hashes == NULL && l_frame % k == k - d && l_frame + d <= l_opt.frames) {
+            l_opt.rb_a = l_frame;
+            l_opt.rb_b = l_frame + d;
+            l_rb_done = 0;
+            rollback_save();
+        } else if (l_rb_hashes != NULL && l_frame == l_opt.rb_b) {
+            rollback_replay();
+        }
+    } else
     if (l_opt.rb_a >= 0 && !l_rb_done) {
         if (l_frame == l_opt.rb_a && l_rb_hashes == NULL)
             rollback_save();
@@ -297,7 +358,7 @@ static void frame_done(void)
 {
     l_frame++;
     if (l_rb_hashes != NULL && !l_rb_done && l_frame <= l_opt.rb_b)
-        l_rb_hashes[l_frame - l_opt.rb_a] = hash_rdram();
+        l_rb_hashes[l_frame - l_opt.rb_a] = check_rdram();
     if (l_opt.hash_every > 0 && l_frame % l_opt.hash_every == 0)
         out("hash %d %016llx", l_frame, (unsigned long long)hash_rdram());
     if (l_opt.progress_every > 0 && l_frame % l_opt.progress_every == 0) {
@@ -585,6 +646,8 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
 
     /* rmgk_gekko: deterministic interrupts, four synchronized controller ports whose data
      * comes from the callback, then the rollback execute loop. */
+    if (l_opt.verbose)   /* the core then times each phase of a rollback save and load */
+        CoreDoCommand(M64CMD_ROLLBACK_SET_VERBOSE_STATS, 1, NULL);
     error = CoreDoCommand(M64CMD_ROLLBACK_SET_DETERMINISTIC, 1, NULL);
     if (error != M64ERR_SUCCESS) {
         l_failed = fail("M64CMD_ROLLBACK_SET_DETERMINISTIC", error);
@@ -625,6 +688,19 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         out("frames %d", l_frame);
         out("wall %.3f s (emulation %.3f s, hashing %.3f s)", wall / 1e9, emu_s, l_hash_ns / 1e9);
         out("fps %.1f", emu_s > 0 ? l_frame / emu_s : 0.0);
+        if (l_opt.stress_every > 0 && l_st_count > 0) {
+            out("rollback stress: %d rollbacks of %d frames, one every %d frames: %s",
+                l_st_count, l_opt.stress_depth, l_opt.stress_every,
+                l_st_failed ? "FAIL" : "PASS (every re-run frame identical)");
+            if (l_st_failed)
+                out("rollback stress: %d re-runs differed, first at frame %d", l_st_failed, l_st_first_bad);
+            out("rollback stress: save %.0f us (worst %.0f), load %.0f us (worst %.0f), re-run %.0f us/frame, "
+                "load + re-run of %d frames %.2f ms on average, %.2f ms at worst",
+                l_st_save_ns / 1e3 / l_st_count, l_st_save_worst / 1e3,
+                l_st_load_ns / 1e3 / l_st_count, l_st_load_worst / 1e3,
+                l_st_replay_ns / 1e3 / l_st_count / l_opt.stress_depth, l_opt.stress_depth,
+                (l_st_load_ns + l_st_replay_ns) / 1e6 / l_st_count, l_st_total_worst / 1e6);
+        }
         print_windows();
         if (l_frame < l_opt.frames) {
             err("znx-bench: stopped after %d of %d frames", l_frame, l_opt.frames);

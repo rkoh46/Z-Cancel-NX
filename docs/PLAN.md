@@ -140,3 +140,33 @@ Put the ROM at `sdmc:/switch/z-cancel-nx/rom.z64`; output goes to nxlink or the 
   (`invalidate_all_pages`), and the frames after it pay for recompiling. First optimisation target: keep
   compiled blocks across a rollback load when the code they came from did not change, then cut the 8.4 MB
   copies. A five-frame rollback has to fit in about 8 ms to leave room for the frame itself and the picture.
+
+### Rollback load fixed, 2026-11-12
+
+Where the 15.5 ms went, from the core's own phase timers (`verbose=1`): 4 ms flushing the whole 32 MB
+code cache from the instruction cache, 9 ms in `invalidate_all_pages()` (every compiled block dropped,
+two sweeps over the million-entry page tables), under 2 ms copying RDRAM.
+
+- `patches/0004`: a full invalidation flushes only the pages whose jumps it rewrote (they were already
+  tracked in `needs_clear_cache`); also fixes `do_clear_cache()` skipping a run of pages that reached the
+  last bit of a bitmap word.
+- `patches/0005`: a rollback load whose TLB entries did not change keeps compiled code. Before RDRAM is
+  overwritten it notes which pages holding compiled code differ from the incoming state and afterwards
+  invalidates only those, the way a guest write would; code from outside RDRAM is always dropped.
+
+Rollback stress (`--rollback-stress K D`, `rollback_stress=K,D` in bench.ini): every K frames rewind
+the last D and re-run them, comparing a checksum of RDRAM after every frame with the first pass.
+9,000 frames (boot, intro, scene loads, demo fight), a 7-frame rollback every 10 frames:
+
+| | Mac (M5) | Switch (2091 MHz) |
+|---|---|---|
+| rollbacks, all exact | 900 of 900 | 900 of 900 |
+| save | 0.12 ms | 1.69 ms (worst 2.04) |
+| load | 0.15 ms | 1.98 ms (worst 2.32) |
+| re-run, per frame | 0.11 ms | 0.95 ms |
+| load + 7 frames | 0.89 ms (worst 2.74) | 8.61 ms (worst 22.1, on a scene load) |
+
+The periodic hashes are the same as in a run without any rollback, on both machines. Budget on the
+Switch for the worst ordinary case (save 1.7 + a 7-frame rollback 8.6 + the frame itself 1.0): about
+11 ms of 16.7, before any picture. Save and load are now both an 8.4 MB copy; copying only pages that
+changed is the next step if the picture needs the room.

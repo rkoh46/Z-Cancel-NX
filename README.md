@@ -11,7 +11,7 @@ order things get tested in are in [docs/PLAN.md](docs/PLAN.md).
 
 | Step | State |
 |---|---|
-| 1. Speed test: RMG-K's emulator core on the Switch, no picture | done: 0.8 ms per frame in a fight; rollback load (15.5 ms) is the thing to fix |
+| 1. Speed test: RMG-K's emulator core on the Switch, no picture | done: 0.8 ms per frame in a fight; a 7-frame rollback costs 8.6 ms |
 | 2. Determinism rig: ARM64 against x86-64, same inputs, state hashed every frame | first results: see the plan |
 | 3. Picture, sound, controllers | not started |
 | 4. Netplay: rollback, connect codes, lobby | not started |

@@ -1,0 +1,48 @@
+new_dynarec arm64: a full invalidation flushes only the code it rewrote
+
+invalidate_all_pages() (every rollback load, every savestate load) flushed the whole 32 MB code
+cache from the instruction cache: about 12 ms on a Cortex-A57. The only code it changes is the
+jumps invalidate_page() unlinks, and each of those already marks its page in needs_clear_cache,
+so do_clear_cache() is enough. do_clear_cache() also skipped a run of marked pages that reached
+bit 31 of a bitmap word; it now flushes it. No change to emulated state.
+
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
+@@ -2972,7 +2972,12 @@
+       restore_candidate[((page&2047)>>3)+256]|=1<<(page&7);
+     }
+   }
+-  #if NEW_DYNAREC >= NEW_DYNAREC_ARM
++  #if NEW_DYNAREC == NEW_DYNAREC_ARM64
++  // Only the jumps invalidate_page() unlinked were rewritten, and each marked its page in
++  // needs_clear_cache: flush those pages. Flushing the whole 32 MB cache here cost about 12 ms
++  // on a Cortex-A57 on every rollback load.
++  do_clear_cache();
++  #elif NEW_DYNAREC >= NEW_DYNAREC_ARM
+   cache_flush((char *)base_addr_rx,(char *)base_addr_rx+(1<<TARGET_SIZE_2));
+   #endif
+   #ifdef USE_MINI_HT
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/arm64/assem_arm64.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/arm64/assem_arm64.c
+@@ -4612,15 +4612,13 @@
+           start=(intptr_t)base_addr_rx+i*131072+j*4096;
+           end=start+4095;
+           j++;
+-          while(j<32) {
+-            if(bitmap&(1<<j)) {
+-              end+=4096;
+-              j++;
+-            }else{
+-              cache_flush((char *)start,(char *)end);
+-              break;
+-            }
++          while(j<32&&(bitmap&(1<<j))) {
++            end+=4096;
++            j++;
+           }
++          // Also when the run of marked pages reaches the last bit of the word (the loop used to
++          // leave that run unflushed).
++          cache_flush((char *)start,(char *)end);
+         }
+       }
+       needs_clear_cache[i]=0;
