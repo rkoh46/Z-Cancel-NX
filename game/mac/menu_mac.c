@@ -6,6 +6,7 @@
  *   znx-game --menu-shot OUT.png [--menu-keys "down,down,a,shot=x.png,job"] [--menu-base DIR]
  *            [--menu-build GAME,STEP,DONE,TOTAL[,download]] [--menu-notice "title|text|detail"]
  *            [--menu-text "first|second"] [--menu-online GAME,SCREEN]
+ *            [--menu-theme light|dark] [--menu-font FILE|barlow] [--menu-glyphs] [--menu-overlay "Ping=41 ms|Delay=2"]
  *
  * --menu-base is the folder that stands in for sdmc:/switch/z-cancel-nx (default: menu-sd next to
  * the program). Keys: up down left right a b x y plus minus l r zl zr; "hold-minus" holds Minus for
@@ -16,7 +17,12 @@
  * servers the base folder's z-cancel-nx.ini names). --menu-text answers the system keyboard, one entry
  * per time it opens. --menu-online shows an online screen with made-up content (online.h
  * znx_online_debug: lobby, lobby-mismatch, host, host-ip, joining, list, list-empty). OUT.png is the
- * screen after the last key. */
+ * screen after the last key. --menu-theme stands in for the console's theme setting (Basic White or Basic
+ * Black). The console draws with its own system font and button glyphs, which a Mac does not have: the
+ * preview uses a system sans of this Mac that is close in width (--menu-font: another file, or "barlow"
+ * for the bundled fallback font) and the stand-in button discs, and holds the selection outline's pulse
+ * at its middle. --menu-glyphs opens the button glyph check (debug_glyphs=1); --menu-overlay shows the
+ * online match's label over a stand-in for the game's picture instead of a menu screen. */
 
 #define GL_SILENCE_DEPRECATION 1
 #include <OpenGL/OpenGL.h>
@@ -34,6 +40,7 @@
 #include "draw.h"
 #include "menu.h"
 #include "menu_mac.h"
+#include "menu_ui.h"
 
 #ifndef ZNX_VERSION
 #define ZNX_VERSION "dev"
@@ -167,6 +174,10 @@ int znx_menu_mac_main(int argc, char** argv)
     const char* notice = NULL;
     const char* base_arg = NULL;
     const char* online = NULL;
+    const char* theme = NULL;
+    const char* font_arg = NULL;
+    const char* overlay = NULL;
+    int glyphs = 0;
     CGLPixelFormatObj format = NULL;
     CGLContextObj context = NULL;
     GLint formats = 0;
@@ -183,6 +194,10 @@ int znx_menu_mac_main(int argc, char** argv)
         else if (!strcmp(argv[i], "--menu-build") && i + 1 < argc) build = argv[++i];
         else if (!strcmp(argv[i], "--menu-notice") && i + 1 < argc) notice = argv[++i];
         else if (!strcmp(argv[i], "--menu-online") && i + 1 < argc) online = argv[++i];
+        else if (!strcmp(argv[i], "--menu-theme") && i + 1 < argc) theme = argv[++i];
+        else if (!strcmp(argv[i], "--menu-font") && i + 1 < argc) font_arg = argv[++i];
+        else if (!strcmp(argv[i], "--menu-overlay") && i + 1 < argc) overlay = argv[++i];
+        else if (!strcmp(argv[i], "--menu-glyphs")) glyphs = 1;
         else if (!strcmp(argv[i], "--menu-text") && i + 1 < argc) {
             char copy[1024];
             snprintf(copy, sizeof(copy), "%s", argv[++i]);
@@ -191,7 +206,8 @@ int znx_menu_mac_main(int argc, char** argv)
         }
         else {
             fprintf(stderr, "znx-game --menu-shot OUT.png [--menu-keys K,K,...] [--menu-base DIR] "
-                            "[--menu-build GAME,STEP,DONE,TOTAL[,download]] [--menu-notice \"title|text|detail\"]\n");
+                            "[--menu-build GAME,STEP,DONE,TOTAL[,download]] [--menu-notice \"title|text|detail\"] "
+                            "[--menu-theme light|dark] [--menu-font FILE|barlow] [--menu-glyphs] [--menu-overlay \"A=1|B=2\"]\n");
             return 2;
         }
     }
@@ -206,11 +222,30 @@ int znx_menu_mac_main(int argc, char** argv)
         snprintf(base, sizeof(base), "%s/menu-sd", dir);
         mkdir(base, 0755);
     }
-    snprintf(font_path, sizeof(font_path), "%s/romfs/fonts/BarlowSemiCondensed-Medium.ttf", dir);
-    font = read_all(font_path, &font_size);
-    if (font == NULL) {
-        fprintf(stderr, "menu: no font at %s\n", font_path);
-        return 1;
+    {
+        /* The console's system font is not on a Mac. A system sans of this Mac that is close to it in
+         * width and weight stands in (read from where the system keeps it, never copied); the bundled
+         * font is what the console falls back to. */
+        static const char* const stand_ins[] = { "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                                                 "/System/Library/Fonts/Helvetica.ttc" };
+        font = NULL;
+        if (font_arg != NULL && strcmp(font_arg, "barlow") != 0) {
+            snprintf(font_path, sizeof(font_path), "%s", font_arg);
+            font = read_all(font_path, &font_size);
+        }
+        for (size_t i = 0; font == NULL && font_arg == NULL && i < sizeof(stand_ins) / sizeof(stand_ins[0]); ++i) {
+            snprintf(font_path, sizeof(font_path), "%s", stand_ins[i]);
+            font = read_all(font_path, &font_size);
+        }
+        if (font == NULL) {
+            snprintf(font_path, sizeof(font_path), "%s/romfs/fonts/BarlowSemiCondensed-Medium.ttf", dir);
+            font = read_all(font_path, &font_size);
+        }
+        if (font == NULL) {
+            fprintf(stderr, "menu: no font at %s\n", font_path);
+            return 1;
+        }
+        printf("menu: preview font %s (the console uses its system font and button glyphs)\n", font_path);
     }
 
     {
@@ -244,6 +279,10 @@ int znx_menu_mac_main(int argc, char** argv)
     config.base_dir = base;
     config.version = ZNX_VERSION;
     config.keyboard = keyboard;
+    config.console_theme = theme == NULL ? -1 : !strcmp(theme, "dark");
+    config.theme_note = "the Mac preview; --menu-theme sets it";
+    config.debug_glyphs = glyphs;
+    znx_theme_freeze(0.5f);
     menu = znx_menu_create(&config);
     if (notice != NULL) {
         char copy[1200], *title, *text, *detail;
@@ -316,6 +355,27 @@ int znx_menu_mac_main(int argc, char** argv)
         }
     }
     frame(menu, 0);
+    if (overlay != NULL) {
+        /* the match overlay over a stand-in for the game: black margins, a flat 4:3 picture */
+        char copy[256];
+        const char* labels[4];
+        const char* values[4];
+        int count = 0;
+        snprintf(copy, sizeof(copy), "%s", overlay);
+        for (char* t = strtok(copy, "|"); t != NULL && count < 4; t = strtok(NULL, "|")) {
+            char* eq = strchr(t, '=');
+            if (eq == NULL) continue;
+            *eq = '\0';
+            labels[count] = t;
+            values[count++] = eq + 1;
+        }
+        znx_draw_begin(l_fbo, W, H, 0x000000FFu);
+        znx_draw_rect(160, 0, 960, 720, 0, 0x5B7FA6FFu);
+        znx_draw_rect(160, 470, 960, 250, 0, 0x4F8A4BFFu);
+        znx_ui_overlay(labels, values, count);
+        znx_draw_end();
+        glFinish();
+    }
     save_png(out);
 
     znx_menu_destroy(menu);

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /* See menu.h.
  *
- * Design (the project's standing rules, ~/.claude/skills/unslop-native): the logo's palette, a
- * near-black field (#17161D) and one warm yellow (#FFCC33) spent on the selection marker, progress
- * and the mark; one neutral ramp for surfaces, three text roles; one font (Barlow Semi Condensed
- * Medium) in four sizes; everything on a 4-pixel grid in a 1280x720 frame. The selection marker
- * is the mark's own slant (0.17). A plain list, a detail panel for the selected row, the Switch's
- * button letters at the bottom. No animation: the screen changes when a button is pressed. */
+ * Design: the console's own system look, so the program reads as part of the Switch (docs/PLAN.md
+ * "Switch-style UI"). The two system themes, Basic White and Basic Black, following the console's
+ * setting; the system font and its button glyphs, loaded from the console at run time; System Settings'
+ * layout in a 1280x720 frame: the mark and the page's name in the header over a thin rule, a list of
+ * 70-pixel rows with thin lines on the left, values at the right in the accent colour, a detail pane on
+ * the right, the button hints right-aligned over the footer's rule. The selected row has the system's
+ * fill and its outline, which pulses between two colours: the one animation. */
 
 #if defined(__GNUC__) && !defined(__clang__)
 /* File names and paths are cut to the size of their field on purpose. */
@@ -26,7 +27,7 @@
 #include "patcher.h"
 #include "settings.h"
 
-enum screen { SCREEN_SCAN, SCREEN_HOME, SCREEN_GAME, SCREEN_SETTINGS, SCREEN_BUILD, SCREEN_MESSAGE, SCREEN_ONLINE };
+enum screen { SCREEN_SCAN, SCREEN_HOME, SCREEN_GAME, SCREEN_SETTINGS, SCREEN_BUILD, SCREEN_MESSAGE, SCREEN_ONLINE, SCREEN_GLYPHS };
 
 #define SETTINGS_ROWS 6   /* sound, stick range | name, input delay, public list, overlay */
 
@@ -36,7 +37,7 @@ struct znx_menu {
     char base[256];
     char version[32];
     struct znx_catalog catalog;
-    int scanned, scan_drawn;
+    int scanned, scan_drawn, debug_glyphs;
     struct znx_menu_settings settings;
     enum screen screen;
     int home_row, game, game_row, settings_row;
@@ -87,6 +88,24 @@ struct znx_menu* znx_menu_create(const struct znx_menu_config* config)
     snprintf(m->version, sizeof(m->version), "%s", config->version != NULL ? config->version : "");
     m->keyboard = config->keyboard;
     znx_settings_load(m->base, &m->settings);
+    m->debug_glyphs = config->debug_glyphs || m->settings.debug_glyphs;
+    {
+        /* the theme: the ini's theme key if it names one, else the console's setting, else Basic White */
+        char line[200];
+        int dark = 0;
+        if (!strcmp(m->settings.theme, "dark") || !strcmp(m->settings.theme, "light")) {
+            dark = m->settings.theme[0] == 'd';
+            snprintf(line, sizeof(line), "menu: theme %s (theme=%s in z-cancel-nx.ini)", dark ? "dark" : "light", m->settings.theme);
+        } else if (config->console_theme >= 0) {
+            dark = config->console_theme != 0;
+            snprintf(line, sizeof(line), "menu: theme %s (console setting)", dark ? "dark" : "light");
+        } else {
+            snprintf(line, sizeof(line), "menu: theme light (console setting unavailable: %s)",
+                     config->theme_note != NULL ? config->theme_note : "not asked");
+        }
+        znx_theme_set(dark);
+        znx_log_line(line);
+    }
     m->screen = SCREEN_SCAN;
     m->wait_release = 1;
     return m;
@@ -165,7 +184,9 @@ static void missing_rom_message(struct znx_menu* m)
     char detail[640] = "";
     size_t used = 0;
     const struct znx_catalog* c = &m->catalog;
-    int shown = c->rejected_count < ZNX_MAX_REJECTED ? c->rejected_count : ZNX_MAX_REJECTED;
+    /* five fit on the message screen under the text */
+    const int most = ZNX_MAX_REJECTED < 5 ? ZNX_MAX_REJECTED : 5;
+    int shown = c->rejected_count < most ? c->rejected_count : most;
     for (int i = 0; i < shown && used < sizeof(detail); ++i) {
         const struct znx_rejected* r = &c->rejected[i];
         used += (size_t)snprintf(detail + used, sizeof(detail) - used, "%s%s\t%s%s%s", i ? "\n" : "", r->name,
@@ -286,7 +307,7 @@ enum znx_menu_action znx_menu_update(struct znx_menu* m, uint32_t held)
         /* The first frame drew "looking for your ROM"; the scan happens on the second. */
         if (!m->scan_drawn) { m->scan_drawn = 1; return ZNX_MENU_NONE; }
         rescan(m);
-        m->screen = SCREEN_HOME;
+        m->screen = m->debug_glyphs ? SCREEN_GLYPHS : SCREEN_HOME;
         m->home_row = 0;
         for (int g = 0; g < ZNX_GAME_COUNT; ++g)
             if (m->catalog.state[g] == ZNX_STATE_READY) { m->home_row = g; break; }
@@ -311,6 +332,10 @@ enum znx_menu_action znx_menu_update(struct znx_menu* m, uint32_t held)
 
     switch (m->screen) {
     case SCREEN_SCAN:
+        break;
+    case SCREEN_GLYPHS:
+        if (pressed & (ZNX_BTN_A | ZNX_BTN_B))
+            m->screen = SCREEN_HOME;
         break;
     case SCREEN_HOME:
         m->home_row = move(m->home_row, HOME_ROWS, pressed);
@@ -442,147 +467,193 @@ enum znx_menu_action znx_menu_update(struct znx_menu* m, uint32_t held)
 
 /* ---- drawing pieces ---- */
 
-/* A button as the Switch draws it: a disc with its letter. */
-static float draw_key(float x, const char* letter)
+/* The selected row's outline is drawn after everything else, so the lines of the rows next to it do not
+ * cross it. */
+static struct { int on; float y; } l_focus;
+
+static float mid_base(int font, float cy)
 {
-    const float d = 32;
-    znx_draw_rect(x, FOOTER_MID - d / 2, d, d, d / 2, C_KEY);
-    znx_draw_text(ZNX_FONT_BODY, x + d / 2, FOOTER_MID + znx_cap_height(ZNX_FONT_BODY) / 2, letter, C_TEXT1, ZNX_TEXT_CENTER);
-    return d;
+    return cy + znx_cap_height(font) / 2;
 }
 
-/* The D-pad, for "change": four arms around a gap (not a plus sign, which is the Plus button),
- * the left and right ones lit. */
-static float draw_dpad_key(float x)
+static int hint_rank(const char* key)
 {
-    const float d = 32, cx = x + d / 2, cy = FOOTER_MID, arm = 6, t = 6, gap = 2;
-    znx_draw_rect(x, FOOTER_MID - d / 2, d, d, d / 2, C_KEY);
-    znx_draw_rect(cx - gap - arm - t / 2 + 1, cy - t / 2, arm, t, 1, C_TEXT1);   /* left */
-    znx_draw_rect(cx + gap + t / 2 - 1, cy - t / 2, arm, t, 1, C_TEXT1);         /* right */
-    znx_draw_rect(cx - t / 2, cy - gap - arm - t / 2 + 1, t, arm, 1, C_TEXT3);   /* up */
-    znx_draw_rect(cx - t / 2, cy + gap + t / 2 - 1, t, arm, 1, C_TEXT3);         /* down */
-    return d;
+    return !strcmp(key, "A") ? 0 : !strcmp(key, "B") ? 1 : !strcmp(key, "X") ? 2 : !strcmp(key, "Y") ? 3 : 4;
 }
 
-/* Hints right-aligned in the footer; key "+-" means the D-pad. */
 void znx_ui_footer(const struct hint* hints, int count, const char* left)
 {
-    float x = 1280 - MARGIN;
-    znx_draw_rect(MARGIN, FOOTER_LINE, 1280 - 2 * MARGIN, 1, 0, C_HAIRLINE);
-    for (int i = count - 1; i >= 0; --i) {
-        float w = znx_text_width(ZNX_FONT_BODY, hints[i].label, 0);
-        x -= w;
-        znx_draw_text(ZNX_FONT_BODY, x, FOOTER_MID + znx_cap_height(ZNX_FONT_BODY) / 2, hints[i].label, C_TEXT2, 0);
-        x -= 12 + 32;
-        if (!strcmp(hints[i].key, "+-")) draw_dpad_key(x);
-        else draw_key(x, hints[i].key);
-        x -= 32;
+    const float base = mid_base(ZNX_FONT_ROW, FOOTER_MID);
+    float x = RIGHT_EDGE;
+    znx_draw_rect(SEP_INSET, FOOTER_LINE, 1280 - 2 * SEP_INSET, 1, 0, C_SEP);
+    /* as the system orders them: A at the far right, B to its left, then the others */
+    for (int rank = 0; rank <= 4; ++rank)
+        for (int i = 0; i < count; ++i) {
+            const char* key = !strcmp(hints[i].key, "+-") ? "LR" : hints[i].key;
+            if (hint_rank(hints[i].key) != rank)
+                continue;
+            x -= znx_text_width(ZNX_FONT_ROW, hints[i].label, 0);
+            znx_draw_text(ZNX_FONT_ROW, x, base, hints[i].label, C_TEXT1, 0);
+            x -= 8 + znx_draw_button(ZNX_FONT_ROW, 0, base, key, C_TEXT1, C_FIELD, 0);
+            znx_draw_button(ZNX_FONT_ROW, x, base, key, C_TEXT1, C_FIELD, 1);
+            x -= 32;
+        }
+    if (left != NULL && left[0]) {
+        char fitted[256];
+        znx_text_fit(ZNX_FONT_SMALL, left, x - MARGIN, fitted, sizeof(fitted));
+        znx_draw_text(ZNX_FONT_SMALL, MARGIN, mid_base(ZNX_FONT_SMALL, FOOTER_MID), fitted, C_TEXT2, 0);
     }
-    if (left != NULL)
-        znx_draw_text(ZNX_FONT_SMALL, MARGIN, FOOTER_MID + znx_cap_height(ZNX_FONT_SMALL) / 2, left, C_TEXT3, 0);
 }
 
+/* The header: the mark on its tile, as system software shows an application's icon, the version, the rule. */
 static void draw_header(const struct znx_menu* m)
 {
-    znx_draw_mark(MARGIN, 40, 28, C_ACCENT);
-    znx_draw_text(ZNX_FONT_ROW, MARGIN + 44, 68, "Z-Cancel NX", C_TEXT1, 0);
+    znx_draw_rect(MARGIN, 24, 40, 40, 6, 0x17161DFFu);     /* the logo's field (assets/logo.png) */
+    znx_draw_mark(MARGIN + 10, 33, 22.5f, 0xFFCC33FFu);    /* and its yellow */
     if (m->version[0])
-        znx_draw_text(ZNX_FONT_SMALL, 1280 - MARGIN, 68, m->version, C_TEXT3, ZNX_TEXT_RIGHT | ZNX_TEXT_TABULAR);
+        znx_draw_text(ZNX_FONT_SMALL, RIGHT_EDGE, mid_base(ZNX_FONT_SMALL, 44), m->version, C_TEXT2, ZNX_TEXT_RIGHT);
+    znx_draw_rect(SEP_INSET, HEADER_LINE, 1280 - 2 * SEP_INSET, 1, 0, C_SEP);
 }
 
 void znx_ui_title(const char* title)
 {
-    znx_draw_text(ZNX_FONT_TITLE, MARGIN, TITLE_BASE, title, C_TEXT1, 0);
+    char fitted[200];
+    znx_text_fit(ZNX_FONT_TITLE, title, RIGHT_EDGE - 120 - (MARGIN + 56), fitted, sizeof(fitted));
+    znx_draw_text(ZNX_FONT_TITLE, MARGIN + 56, mid_base(ZNX_FONT_TITLE, 44), fitted, C_TEXT1, 0);
 }
 
-/* A list row: title, and below it an optional status line with a coloured dot (dot 0: none). */
-void znx_ui_row(float y, float h, int selected, const char* title, uint32_t title_color,
-                const char* status, uint32_t status_color, uint32_t dot, const char* value)
+void znx_ui_row_frame(float y, int selected)
 {
-    const float x = LIST_X, text_x = LIST_X + 32;
+    znx_draw_rect(LIST_X, y, LIST_W, 1, 0, C_LINE);
+    znx_draw_rect(LIST_X, y + ROW_H, LIST_W, 1, 0, C_LINE);
     if (selected) {
-        znx_draw_rect(x, y, LIST_W, h, 12, C_SELECTED);
-        znx_draw_slant(x + 12, y + h / 2 - 20, 6, 40, SLANT, C_ACCENT);
-    }
-    if (status == NULL) {
-        float base = y + h / 2 + znx_cap_height(ZNX_FONT_ROW) / 2;
-        znx_draw_text(ZNX_FONT_ROW, text_x, base, title, title_color, 0);
-        if (value != NULL)
-            znx_draw_text(ZNX_FONT_BODY, x + LIST_W - 32, base, value, C_TEXT2, ZNX_TEXT_RIGHT | ZNX_TEXT_TABULAR);
-        return;
-    }
-    znx_draw_text(ZNX_FONT_ROW, text_x, y + 36, title, title_color, 0);
-    if (value != NULL)
-        znx_draw_text(ZNX_FONT_ROW, x + LIST_W - 32, y + 36, value, C_TEXT1, ZNX_TEXT_RIGHT | ZNX_TEXT_TABULAR);
-    {
-        float sx = text_x;
-        const float base = y + 64;
-        if (dot != 0) {
-            znx_draw_rect(sx, base - znx_cap_height(ZNX_FONT_SMALL) / 2 - 4, 8, 8, 4, dot);
-            sx += 16;
-        }
-        char fitted[256];
-        znx_text_fit(ZNX_FONT_SMALL, status, LIST_W - (sx - x) - 32, fitted, sizeof(fitted));
-        znx_draw_text(ZNX_FONT_SMALL, sx, base, fitted, status_color, 0);
+        znx_draw_rect(LIST_X, y + 1, LIST_W, ROW_H - 1, 2, C_SELECTED);
+        l_focus.on = 1;
+        l_focus.y = y;
     }
 }
 
-/* The detail panel: key/value lines, then a paragraph, then a quieter note. Returns the panel's
- * bottom. A field with mono set is an identifier (an MD5): small tabular figures. */
-static float panel_height(const struct field* fields, int count, const char* paragraph, float extra, const char* note)
+static void flush_focus(void)
 {
-    const float key_w = 88, value_w = PANEL_W - PANEL_PAD * 2 - key_w, text_w = PANEL_W - PANEL_PAD * 2;
-    float height = PANEL_PAD;
-    for (int i = 0; i < count; ++i)
-        height += FIELD_STEP * (fields[i].mono ? 1 : znx_draw_wrapped(ZNX_FONT_BODY, 0, 0, value_w, fields[i].value, 0));
-    if (paragraph != NULL)
-        height += (count > 0 ? 24 : 0) + znx_draw_wrapped(ZNX_FONT_BODY, 0, 0, text_w, paragraph, 0) * znx_line_height(ZNX_FONT_BODY);
-    height += extra;
-    if (note != NULL)
-        height += 12 + znx_draw_wrapped(ZNX_FONT_SMALL, 0, 0, text_w, note, 0) * znx_line_height(ZNX_FONT_SMALL);
-    return height + PANEL_PAD - 4;
+    if (l_focus.on)   /* 5 pixels wide around the fill, over the row's two lines */
+        znx_draw_ring(LIST_X - 5, l_focus.y - 4, LIST_W + 10, ROW_H + 9, 6, 5, znx_theme_highlight());
+    l_focus.on = 0;
 }
 
-/* extra: height of a block the caller draws after the paragraph; its top is stored in *extra_y. */
+void znx_ui_row(float y, int selected, const char* title, uint32_t title_color, const char* value,
+                uint32_t value_color, uint32_t dot)
+{
+    const float base = mid_base(ZNX_FONT_ROW, y + ROW_H / 2), right = LIST_X + LIST_W - ROW_PAD;
+    float taken = 0;
+    char fitted[256];
+    znx_ui_row_frame(y, selected);
+    if (value != NULL && value[0]) {
+        /* the value keeps its place; a long title gives way */
+        znx_text_fit(ZNX_FONT_ROW, value, LIST_W - 2 * ROW_PAD - 160, fitted, sizeof(fitted));
+        taken = znx_draw_text(ZNX_FONT_ROW, right, base, fitted, value_color, ZNX_TEXT_RIGHT) + 24;
+        if (dot != 0) {
+            znx_draw_rect(right - taken + 8, y + ROW_H / 2 - 4, 8, 8, 4, dot);
+            taken += 16;
+        }
+    }
+    znx_text_fit(ZNX_FONT_ROW, title, LIST_W - 2 * ROW_PAD - taken, fitted, sizeof(fitted));
+    znx_draw_text(ZNX_FONT_ROW, LIST_X + ROW_PAD, base, fitted, title_color, 0);
+}
+
+float znx_ui_section(float y, const char* label)
+{
+    znx_draw_rect(LIST_X, y + 12, 4, 24, 0, C_TEXT2);
+    znx_draw_text(ZNX_FONT_SMALL, LIST_X + 16, mid_base(ZNX_FONT_SMALL, y + 24), label, C_TEXT1, 0);
+    return 48;
+}
+
+void znx_ui_scrollbar(float y, int visible, int first, int count)
+{
+    const float track = visible * ROW_H, x = LIST_X + LIST_W + 12;
+    if (count <= visible)
+        return;
+    znx_draw_rect(x, y + track * first / count, 4, track * visible / count, 2, C_TEXT3);
+}
+
+float znx_ui_steps(float y, const char* const* names, int count, int current, const char* value, const char* detail,
+                   float progress)
+{
+    for (int i = 0; i < count; ++i, y += ROW_H) {
+        if (i < current)
+            znx_ui_row(y, 0, names[i], C_TEXT2, "Done", C_TEXT2, 0);
+        else if (i == current)
+            znx_ui_row(y, 0, names[i], C_TEXT1, value, C_ACCENT, 0);
+        else
+            znx_ui_row(y, 0, names[i], C_TEXT3, NULL, 0, 0);
+    }
+    y += 24;
+    if (detail != NULL && detail[0]) {
+        char fitted[256];
+        znx_text_fit(ZNX_FONT_SMALL, detail, LIST_W - 2 * ROW_PAD, fitted, sizeof(fitted));
+        znx_draw_text(ZNX_FONT_SMALL, LIST_X + ROW_PAD, y + 16, fitted, C_TEXT2, 0);
+        y += 32;
+    }
+    if (progress >= 0) {
+        const float w = LIST_W - 2 * ROW_PAD, fill = w * (progress > 1 ? 1 : progress);
+        znx_draw_rect(LIST_X + ROW_PAD, y, w, 4, 2, C_LINE);
+        if (fill > 0)
+            znx_draw_rect(LIST_X + ROW_PAD, y, fill < 4 ? 4 : fill, 4, 2, C_ACCENT);
+        y += 4;
+    }
+    return y;
+}
+
+static int is_md5(const char* text)
+{
+    return strlen(text) == 32 && strspn(text, "0123456789ABCDEFabcdef") == 32;
+}
+
 float znx_ui_panel_ex(float y, const struct field* fields, int count, const char* paragraph, float extra,
                       float* extra_y, const char* note)
 {
-    const float x = PANEL_X, key_w = 88, value_x = PANEL_X + PANEL_PAD + key_w;
-    const float value_w = PANEL_W - PANEL_PAD * 2 - key_w, text_w = PANEL_W - PANEL_PAD * 2;
-    const float height = panel_height(fields, count, paragraph, extra, note);
-    float cursor = y + PANEL_PAD;   /* top of the next line box; baselines sit 24 below */
+    const float x = PANEL_X, key_w = 120, value_x = PANEL_X + key_w, value_w = PANEL_W - key_w;
+    float cursor = y + 4;   /* top of the next line box; baselines sit 24 below */
     char fitted[256];
 
-    znx_draw_rect(x, y, PANEL_W, height, 16, C_CARD);
+    /* the pane's surface, from the header's rule to the footer's */
+    znx_draw_rect(PANE_X, HEADER_LINE + 1, 1280 - PANE_X, FOOTER_LINE - HEADER_LINE - 1, 0, C_PANEL);
     for (int i = 0; i < count; ++i) {
         const float base = cursor + 24;
-        int lines = 1;
-        znx_draw_text(ZNX_FONT_SMALL, x + PANEL_PAD, base, fields[i].key, C_TEXT3, 0);
-        if (fields[i].mono) {
+        znx_draw_text(ZNX_FONT_SMALL, x, base, fields[i].key, C_TEXT2, 0);
+        if (fields[i].mono && is_md5(fields[i].value)) {
+            /* 32 hexadecimal digits: two lines of two groups, so nothing is cut */
+            const char* v = fields[i].value;
+            snprintf(fitted, sizeof(fitted), "%.8s %.8s", v, v + 8);
+            znx_draw_text(ZNX_FONT_SMALL, value_x, base, fitted, C_TEXT1, ZNX_TEXT_TABULAR);
+            snprintf(fitted, sizeof(fitted), "%.8s %.8s", v + 16, v + 24);
+            znx_draw_text(ZNX_FONT_SMALL, value_x, base + 24, fitted, C_TEXT1, ZNX_TEXT_TABULAR);
+            cursor += FIELD_STEP + 24;
+        } else if (fields[i].mono) {
             znx_text_fit_flags(ZNX_FONT_SMALL, fields[i].value, value_w, fitted, sizeof(fitted), ZNX_TEXT_TABULAR);
             znx_draw_text(ZNX_FONT_SMALL, value_x, base, fitted, C_TEXT1, ZNX_TEXT_TABULAR);
+            cursor += FIELD_STEP;
         } else {
-            lines = znx_draw_wrapped(ZNX_FONT_BODY, value_x, base, value_w, fields[i].value, C_TEXT1);
+            const int lines = znx_draw_wrapped(ZNX_FONT_BODY, value_x, base, value_w, fields[i].value, C_TEXT1);
+            cursor += FIELD_STEP + (lines > 1 ? (lines - 1) * znx_line_height(ZNX_FONT_BODY) : 0);
         }
-        cursor += FIELD_STEP * lines;
     }
-    if (paragraph != NULL) {
+    if (paragraph != NULL && paragraph[0]) {
         if (count > 0) {
             cursor += 12;
-            znx_draw_rect(x + PANEL_PAD, cursor, text_w, 1, 0, C_HAIRLINE);
+            znx_draw_rect(x, cursor, PANEL_W, 1, 0, C_LINE);
             cursor += 12;
         }
-        cursor += znx_draw_wrapped(ZNX_FONT_BODY, x + PANEL_PAD, cursor + 24, text_w, paragraph, C_TEXT2) *
-                  znx_line_height(ZNX_FONT_BODY);
+        cursor += znx_draw_wrapped(ZNX_FONT_BODY, x, cursor + 24, PANEL_W, paragraph, C_TEXT1) *
+                  znx_line_height(ZNX_FONT_BODY) + 4;
     }
     if (extra_y != NULL)
         *extra_y = cursor;
     cursor += extra;
-    if (note != NULL) {
+    if (note != NULL && note[0]) {
         cursor += 12;
-        znx_draw_wrapped(ZNX_FONT_SMALL, x + PANEL_PAD, cursor + 18, text_w, note, C_TEXT3);
+        cursor += znx_draw_wrapped(ZNX_FONT_SMALL, x, cursor + 20, PANEL_W, note, C_TEXT2) * znx_line_height(ZNX_FONT_SMALL);
     }
-    return y + height;
+    return cursor;
 }
 
 float znx_ui_panel(float y, const struct field* fields, int count, const char* paragraph, const char* note)
@@ -590,29 +661,44 @@ float znx_ui_panel(float y, const struct field* fields, int count, const char* p
     return znx_ui_panel_ex(y, fields, count, paragraph, 0, NULL, note);
 }
 
-static void status_of(const struct znx_menu* m, int game, char* text, size_t size, uint32_t* dot, uint32_t* color)
+void znx_ui_overlay(const char* const* labels, const char* const* values, int count)
 {
-    const struct znx_game_info* info = znx_game_info(game);
-    const struct znx_catalog* c = &m->catalog;
-    char zip[32];
+    /* Fixed colours: it sits on the game's picture or its black margin, whatever the theme. */
+    const float x = 8, y = 8, pad = 12, row = 24;
+    float w = 0;
+    for (int i = 0; i < count; ++i) {
+        const float line = znx_text_width(ZNX_FONT_SMALL, labels[i], 0) + 12 + znx_text_width(ZNX_FONT_SMALL, values[i], 0);
+        if (line > w) w = line;
+    }
+    w += 2 * pad;
+    znx_draw_rect(x, y, w, count * row + 16, 8, 0x2D2D2DD0u);
+    for (int i = 0; i < count; ++i) {
+        const float base = y + 8 + i * row + 18;
+        znx_draw_text(ZNX_FONT_SMALL, x + pad, base, labels[i], 0xC8C8C8FFu, 0);
+        znx_draw_text(ZNX_FONT_SMALL, x + w - pad, base, values[i], 0xFFFFFFFFu, ZNX_TEXT_RIGHT);
+    }
+}
+
+/* The value at the right of a game's row: its state in a word. */
+static void status_of(const struct znx_menu* m, int game, const char** text, uint32_t* dot, uint32_t* color)
+{
     *color = C_TEXT2;
-    switch (c->state[game]) {
+    *dot = 0;
+    switch (m->catalog.state[game]) {
     case ZNX_STATE_READY:
         *dot = C_READY;
-        snprintf(text, size, "Ready \xC2\xB7 %s", file_name(c->rom_path[game]));
+        *color = C_TEXT1;
+        *text = "Ready";
         break;
     case ZNX_STATE_NEEDS_BUILD:
-        *dot = C_TEXT3;
-        snprintf(text, size, "Built from your ROM when you choose it");
+        *text = "Not built";
         break;
     case ZNX_STATE_NEEDS_PATCH:
-        *dot = C_TEXT3;
-        znx_format_size(info->zip_size, zip, sizeof(zip));
-        snprintf(text, size, "Needs the patch: A downloads it from GitHub, %s", zip);
+        *text = "No patch";
         break;
     default:
         *dot = C_MISSING;
-        snprintf(text, size, game == ZNX_GAME_VANILLA ? "Needs your ROM" : "Needs your Super Smash Bros. ROM first");
+        *text = "No ROM";
         break;
     }
 }
@@ -627,23 +713,22 @@ static int format_index(const char* format)
 static void draw_home(struct znx_menu* m)
 {
     const struct znx_catalog* c = &m->catalog;
-    const struct hint hints[] = { { "A", "Choose" }, { "B", "Quit" } };
-    char status[256], size[32], value[96];
+    const struct hint hints[] = { { "A", "OK" }, { "B", "Quit" } };
+    const char* status;
+    char size[32];
     uint32_t dot, color;
     float y = LIST_Y;
 
-    znx_ui_title("Choose a game");
+    znx_ui_title("Z-Cancel NX");
     for (int g = 0; g < ZNX_GAME_COUNT; ++g) {
-        status_of(m, g, status, sizeof(status), &dot, &color);
-        znx_ui_row(y, ROW_H, m->home_row == g, znx_game_info(g)->title, C_TEXT1, status, color, dot, NULL);
-        y += ROW_H + ROW_GAP;
+        status_of(m, g, &status, &dot, &color);
+        znx_ui_row(y, m->home_row == g, znx_game_info(g)->title, C_TEXT1, status, color, dot);
+        y += ROW_H;
     }
-    y += 16;
-    snprintf(value, sizeof(value), "%s \xC2\xB7 sound %s \xC2\xB7 stick %d", m->settings.name, m->settings.sound ? "on" : "off",
-             m->settings.stick_range);
-    znx_ui_row(y, 64, m->home_row == ZNX_GAME_COUNT, "Settings", C_TEXT1, NULL, 0, 0, value);
+    y += 32;
+    znx_ui_row(y, m->home_row == ZNX_GAME_COUNT, "Settings", C_TEXT1, NULL, 0, 0);
 
-    /* The panel: what the selected row is and what A does. */
+    /* The pane: what the selected row is and what A does. */
     if (m->home_row < ZNX_GAME_COUNT) {
         const int g = m->home_row;
         const struct znx_game_info* info = znx_game_info(g);
@@ -707,10 +792,12 @@ static void draw_home(struct znx_menu* m)
             note = c->patch_problem[g];
         znx_ui_panel(LIST_Y, fields, count, paragraph, note);
     } else {
-        char path[320];
+        char path[320], summary[160];
         snprintf(path, sizeof(path), "%s/z-cancel-nx.ini", m->base);
-        const struct field fields[] = { { "File", path, 0 } };
-        znx_ui_panel(LIST_Y, fields, 1, "Sound, how far a full stick tilt reaches, and your name and delay for online play.", NULL);
+        snprintf(summary, sizeof(summary), "%s \xC2\xB7 sound %s \xC2\xB7 stick %d", m->settings.name,
+                 m->settings.sound ? "on" : "off", m->settings.stick_range);
+        const struct field fields[] = { { "Now", summary, 0 }, { "File", path, 0 } };
+        znx_ui_panel(LIST_Y, fields, 2, "Sound, how far a full stick tilt reaches, and your name and delay for online play.", NULL);
     }
     znx_ui_footer(hints, 2, m->base);
 }
@@ -718,7 +805,7 @@ static void draw_home(struct znx_menu* m)
 static void draw_game(struct znx_menu* m)
 {
     const struct znx_game_info* info = znx_game_info(m->game);
-    const struct hint hints[] = { { "A", "Choose" }, { "B", "Back" } };
+    const struct hint hints[] = { { "A", "OK" }, { "B", "Back" } };
     char size[32];
     const struct field fields[] = {
         { "File", file_name(m->catalog.rom_path[m->game]), 0 },
@@ -728,32 +815,38 @@ static void draw_game(struct znx_menu* m)
     znx_format_size(info->size, size, sizeof(size));
 
     znx_ui_title(info->title);
-    znx_ui_row(LIST_Y, ROW_H, m->game_row == 0, "Play", C_TEXT1, "On this console, up to four controllers", C_TEXT2, 0, NULL);
-    znx_ui_row(LIST_Y + ROW_H + ROW_GAP, ROW_H, m->game_row == 1, "Online play", C_TEXT1,
-             "Against players on RMG-K or another Switch, with rollback", C_TEXT2, 0, NULL);
+    znx_ui_row(LIST_Y, m->game_row == 0, "Play", C_TEXT1, NULL, 0, 0);
+    znx_ui_row(LIST_Y + ROW_H, m->game_row == 1, "Online play", C_TEXT1, NULL, 0, 0);
     znx_ui_panel(LIST_Y, fields, 3,
-               "To come back here from the game, hold \xE2\x88\x92\xC2\xA0(Minus), or L\xC2\xA0+\xC2\xA0R\xC2\xA0+\xC2\xA0Z\xC2\xA0+\xC2\xA0Start "
-               "on a GameCube controller.",
-               NULL);
+                 m->game_row == 0 ? "On this console, with up to four controllers."
+                                  : "Against players on RMG-K or another Switch, with rollback.",
+                 "To come back here from the game, hold \xE2\x88\x92\xC2\xA0(Minus), or L\xC2\xA0+\xC2\xA0R\xC2\xA0+\xC2\xA0Z\xC2\xA0+\xC2\xA0Start "
+                 "on a GameCube controller.");
     znx_ui_footer(hints, 2, m->base);
 }
 
-/* The stick range scale in the panel: 60 to 100, RMG-K's 84 marked, the value in yellow. */
+/* The stick range scale in the pane: 60 to 100, RMG-K's 84 marked, the value in the accent. */
 static void draw_stick_scale(float x, float y, float w, int value)
 {
     const float track_y = y + 36;
     const float vx = x + (float)(value - ZNX_STICK_MIN) / (ZNX_STICK_MAX - ZNX_STICK_MIN) * w;
     const float dx = x + (float)(ZNX_STICK_DEFAULT - ZNX_STICK_MIN) / (ZNX_STICK_MAX - ZNX_STICK_MIN) * w;
     char label[8];
-    znx_draw_rect(x, track_y, w, 4, 2, C_HAIRLINE);
+    znx_draw_rect(x, track_y, w, 4, 2, C_LINE);
     znx_draw_rect(x, track_y, vx - x, 4, 2, C_ACCENT);
-    znx_draw_rect(dx - 1, track_y - 8, 2, 20, 1, C_TEXT3);
-    znx_draw_slant(vx - 3, track_y - 12, 6, 28, SLANT, C_ACCENT);
+    znx_draw_rect(dx - 1, track_y - 6, 2, 16, 1, C_TEXT2);
+    znx_draw_rect(vx - 8, track_y - 6, 16, 16, 8, C_ACCENT);
     snprintf(label, sizeof(label), "%d", ZNX_STICK_MIN);
-    znx_draw_text(ZNX_FONT_SMALL, x, track_y + 36, label, C_TEXT3, ZNX_TEXT_TABULAR);
+    znx_draw_text(ZNX_FONT_SMALL, x, track_y + 40, label, C_TEXT2, 0);
     snprintf(label, sizeof(label), "%d", ZNX_STICK_MAX);
-    znx_draw_text(ZNX_FONT_SMALL, x + w, track_y + 36, label, C_TEXT3, ZNX_TEXT_RIGHT | ZNX_TEXT_TABULAR);
-    znx_draw_text(ZNX_FONT_SMALL, dx, track_y + 36, "84, RMG-K", C_TEXT3, ZNX_TEXT_CENTER | ZNX_TEXT_TABULAR);
+    znx_draw_text(ZNX_FONT_SMALL, x + w, track_y + 40, label, C_TEXT2, ZNX_TEXT_RIGHT);
+    znx_draw_text(ZNX_FONT_SMALL, dx, track_y + 40, "84, RMG-K", C_TEXT2, ZNX_TEXT_CENTER);
+}
+
+static void switch_row(float y, int selected, const char* title, int on)
+{
+    /* as System Settings shows a switch: On in the accent, Off quiet */
+    znx_ui_row(y, selected, title, C_TEXT1, on ? "On" : "Off", on ? C_ACCENT : C_TEXT2, 0);
 }
 
 static void draw_settings(struct znx_menu* m)
@@ -764,7 +857,6 @@ static void draw_settings(struct znx_menu* m)
     const struct hint hints_delay[] = { { "+-", "Change" }, { "Y", "Auto" }, { "B", "Save and go back" } };
     const struct znx_menu_settings* s = &m->settings;
     char stick[16], delay[32], path[320];
-    const float h = 56, step = 60;
     float y = LIST_Y;
     snprintf(path, sizeof(path), "%s/z-cancel-nx.ini", m->base);
     snprintf(stick, sizeof(stick), "%d", s->stick_range);
@@ -772,19 +864,18 @@ static void draw_settings(struct znx_menu* m)
     else snprintf(delay, sizeof(delay), "%d frame%s", s->input_delay, s->input_delay == 1 ? "" : "s");
 
     znx_ui_title("Settings");
-    znx_ui_row(y, h, m->settings_row == 0, "Sound", C_TEXT1, NULL, 0, 0, s->sound ? "On" : "Off");
-    y += step;
-    znx_ui_row(y, h, m->settings_row == 1, "Stick range", C_TEXT1, NULL, 0, 0, stick);
-    y += step + 24;
-    znx_draw_text(ZNX_FONT_SMALL, LIST_X + 32, y + 4, "Online", C_TEXT3, 0);
-    y += 16;
-    znx_ui_row(y, h, m->settings_row == 2, "Name", C_TEXT1, NULL, 0, 0, s->name);
-    y += step;
-    znx_ui_row(y, h, m->settings_row == 3, "Input delay", C_TEXT1, NULL, 0, 0, delay);
-    y += step;
-    znx_ui_row(y, h, m->settings_row == 4, "Public list", C_TEXT1, NULL, 0, 0, s->public_list ? "On" : "Off");
-    y += step;
-    znx_ui_row(y, h, m->settings_row == 5, "Match overlay", C_TEXT1, NULL, 0, 0, s->net_overlay ? "On" : "Off");
+    switch_row(y, m->settings_row == 0, "Sound", s->sound);
+    y += ROW_H;
+    znx_ui_row(y, m->settings_row == 1, "Stick range", C_TEXT1, stick, C_ACCENT, 0);
+    y += ROW_H + 16;
+    y += znx_ui_section(y, "Online");
+    znx_ui_row(y, m->settings_row == 2, "Name", C_TEXT1, s->name, C_ACCENT, 0);
+    y += ROW_H;
+    znx_ui_row(y, m->settings_row == 3, "Input delay", C_TEXT1, delay, C_ACCENT, 0);
+    y += ROW_H;
+    switch_row(y, m->settings_row == 4, "Public list", s->public_list);
+    y += ROW_H;
+    switch_row(y, m->settings_row == 5, "Match overlay", s->net_overlay);
 
     switch (m->settings_row) {
     case 0:
@@ -797,7 +888,7 @@ static void draw_settings(struct znx_menu* m)
         znx_ui_panel_ex(LIST_Y, NULL, 0,
                         "What the game reads when a stick is pushed all the way. RMG-K's default is 84; lower makes "
                         "full tilt harder to reach, higher makes it easier.", 96, &scale_y, path);
-        draw_stick_scale(PANEL_X + PANEL_PAD + 8, scale_y, PANEL_W - PANEL_PAD * 2 - 16, s->stick_range);
+        draw_stick_scale(PANEL_X + 8, scale_y, PANEL_W - 16, s->stick_range);
         znx_ui_footer(hints_stick, 3, NULL);
         break;
     }
@@ -819,8 +910,8 @@ static void draw_settings(struct znx_menu* m)
         znx_ui_footer(hints_toggle, 2, NULL);
         break;
     default:
-        znx_ui_panel(LIST_Y, NULL, 0, "Ping, rollbacks and delay, small in the black margin beside the picture during "
-                     "an online match. It is drawn over the picture only and never changes the game.", NULL);
+        znx_ui_panel(LIST_Y, NULL, 0, "Ping, delay and rollbacks in a small label at the top left during an online "
+                     "match. It is drawn over the picture only and never changes the game.", NULL);
         znx_ui_footer(hints_toggle, 2, NULL);
         break;
     }
@@ -831,54 +922,26 @@ static void draw_build(struct znx_menu* m)
     const struct znx_game_info* info = znx_game_info(m->game);
     const struct znx_job* job = &m->job;
     const struct hint hints[] = { { "B", "Cancel" } };
-    char title[160], out[600], done_text[64], a[32], b[32];
-    const char* names[ZNX_STEP_COUNT] = { "Download the patch", "Build the ROM", "Check the result" };
-    float y = LIST_Y;
-    const int step = job->step;
+    static const char* const names[ZNX_STEP_COUNT] = { "Download the patch", "Build the ROM", "Check the result" };
+    const int first = job->downloads ? 0 : 1;
     const uint64_t done = job->done, total = job->total;
+    char title[160], out[600], percent[16], detail[160], a[32], b[32];
 
     snprintf(title, sizeof(title), "Building %s", info->title);
     znx_ui_title(title);
-    for (int s = job->downloads ? 0 : 1; s < ZNX_STEP_COUNT; ++s) {
-        const int current = s == step, finished = s < step;
-        const float h = current ? 104 : 64;
-        const char* detail = NULL;
-        char detail_text[160];
-        if (current)
-            znx_draw_rect(LIST_X, y, LIST_W, h, 12, C_SELECTED);
-        if (current)
-            znx_draw_slant(LIST_X + 12, y + 16, 6, 40, SLANT, C_ACCENT);
-        znx_draw_text(ZNX_FONT_ROW, LIST_X + 32, y + 46 - (current ? 10 : 0) - (current ? 0 : 4), names[s],
-                      current ? C_TEXT1 : finished ? C_TEXT2 : C_TEXT3, 0);
-        if (finished)
-            snprintf(done_text, sizeof(done_text), "Done");
-        else if (current && total > 0)
-            snprintf(done_text, sizeof(done_text), "%d%%", (int)(done * 100 / total));
-        else
-            done_text[0] = '\0';
-        if (done_text[0])
-            znx_draw_text(ZNX_FONT_BODY, LIST_X + LIST_W - 32, y + 36, done_text, finished ? C_TEXT3 : C_TEXT1,
-                          ZNX_TEXT_RIGHT | ZNX_TEXT_TABULAR);
-        if (current) {
-            const float bar_w = LIST_W - 64;
-            const float fill = total > 0 ? bar_w * (float)((double)done / (double)total) : 0;
-            znx_draw_rect(LIST_X + 32, y + 56, bar_w, 6, 3, C_HAIRLINE);
-            if (fill > 0)
-                znx_draw_rect(LIST_X + 32, y + 56, fill < 6 ? 6 : fill, 6, 3, C_ACCENT);
-            if (s == ZNX_STEP_DOWNLOAD) {
-                znx_format_size(done, a, sizeof(a));
-                znx_format_size(total, b, sizeof(b));
-                snprintf(detail_text, sizeof(detail_text), "%s of %s from github.com", a, b);
-                detail = detail_text;
-            } else if (s == ZNX_STEP_BUILD) {
-                detail = "Applying the patch to your ROM";
-            } else {
-                detail = "Comparing the MD5 with RMG-K's";
-            }
-            znx_draw_text(ZNX_FONT_SMALL, LIST_X + 32, y + 88, detail, C_TEXT2, ZNX_TEXT_TABULAR);
-        }
-        y += h + ROW_GAP;
+    if (total > 0) snprintf(percent, sizeof(percent), "%d%%", (int)(done * 100 / total));
+    else percent[0] = '\0';
+    if (job->step == ZNX_STEP_DOWNLOAD) {
+        znx_format_size(done, a, sizeof(a));
+        znx_format_size(total, b, sizeof(b));
+        snprintf(detail, sizeof(detail), "%s of %s from github.com", a, b);
+    } else if (job->step == ZNX_STEP_BUILD) {
+        snprintf(detail, sizeof(detail), "Applying the patch to your ROM");
+    } else {
+        snprintf(detail, sizeof(detail), "Comparing the MD5 with RMG-K's");
     }
+    znx_ui_steps(LIST_Y, names + first, ZNX_STEP_COUNT - first, job->step - first, percent, detail,
+                 total > 0 ? (float)((double)done / (double)total) : -1.0f);
     snprintf(out, sizeof(out), "roms/%s", info->out_name);
     {
         const struct field fields[] = {
@@ -893,28 +956,23 @@ static void draw_build(struct znx_menu* m)
     znx_ui_footer(hints, 1, m->base);
 }
 
+/* A message: what happened as the heading, what to do under it, then the details as a plain list (one
+ * entry per line of message_detail; "name<TAB>details" puts the details small under the name), and OK
+ * where there is room for it. */
 static void draw_message(struct znx_menu* m)
 {
     const struct hint hints[] = { { "A", "OK" } };
-    const float width = 760;
-    float y = TITLE_BASE;
-    int lines = znx_draw_wrapped(ZNX_FONT_TITLE, MARGIN, y, width, m->message_title, C_TEXT1);
-    y += (lines - 1) * znx_line_height(ZNX_FONT_TITLE) + 48;
-    lines = znx_draw_wrapped(ZNX_FONT_BODY, MARGIN, y, width, m->message_text, C_TEXT2);
-    y += lines * 32 + 16;
+    const float width = 800, wide = RIGHT_EDGE - MARGIN;
+    float y = LIST_Y + 36;
+    int lines;
+    znx_ui_title("Z-Cancel NX");
+    lines = znx_draw_wrapped(ZNX_FONT_TITLE, MARGIN, y, width, m->message_title, C_TEXT1);
+    y += (lines - 1) * znx_line_height(ZNX_FONT_TITLE) + 44;
+    lines = znx_draw_wrapped(ZNX_FONT_BODY, MARGIN, y, width, m->message_text, C_TEXT1);
+    y += (lines - 1) * znx_line_height(ZNX_FONT_BODY) + 28;
     if (m->message_detail[0]) {
-        /* One entry per line: "name<TAB>details" shows the name, and under it the details small. */
         const char* p = m->message_detail;
-        int entries = 0, two_line = 0;
-        for (const char* q = p; *q;) {
-            size_t n = strcspn(q, "\n");
-            entries++;
-            if (memchr(q, '\t', n) != NULL) two_line++;
-            q += n;
-            if (*q == '\n') q++;
-        }
-        znx_draw_rect(MARGIN, y, width + 48, 24 + entries * 32 + two_line * 24 + 8, 12, C_CARD);
-        y += 24;
+        znx_draw_rect(MARGIN, y, wide, 1, 0, C_LINE);
         while (*p) {
             char raw[256], line[256];
             size_t n = strcspn(p, "\n");
@@ -923,38 +981,101 @@ static void draw_message(struct znx_menu* m)
             memcpy(raw, p, n);
             raw[n] = '\0';
             tab = strchr(raw, '\t');
+            if (y + (tab != NULL ? 52 : 32) > FOOTER_LINE - 8)
+                break;   /* no room left: the rest is in latest.log */
             if (tab == NULL) {
                 /* A plain line (a log line, a path): small. */
-                znx_text_fit_flags(ZNX_FONT_SMALL, raw, width, line, sizeof(line), ZNX_TEXT_TABULAR);
-                znx_draw_text(ZNX_FONT_SMALL, MARGIN + 24, y + 20, line, C_TEXT2, ZNX_TEXT_TABULAR);
+                znx_text_fit(ZNX_FONT_SMALL, raw, wide - 2 * ROW_PAD, line, sizeof(line));
+                znx_draw_text(ZNX_FONT_SMALL, MARGIN + ROW_PAD, y + 23, line, C_TEXT2, 0);
                 y += 32;
             } else {
+                /* a file and why it is not used: the name, and under it the details small */
                 *tab = '\0';
-                znx_text_fit(ZNX_FONT_BODY, raw, width, line, sizeof(line));
-                znx_draw_text(ZNX_FONT_BODY, MARGIN + 24, y + 24, line, C_TEXT1, 0);
-                y += 32;
-            }
-            if (tab != NULL) {
-                znx_text_fit_flags(ZNX_FONT_SMALL, tab + 1, width, line, sizeof(line), ZNX_TEXT_TABULAR);
-                znx_draw_text(ZNX_FONT_SMALL, MARGIN + 24, y + 16, line, C_TEXT2, ZNX_TEXT_TABULAR);
-                y += 24;
+                znx_text_fit(ZNX_FONT_BODY, raw, wide - 2 * ROW_PAD, line, sizeof(line));
+                znx_draw_text(ZNX_FONT_BODY, MARGIN + ROW_PAD, y + 23, line, C_TEXT1, 0);
+                znx_text_fit(ZNX_FONT_SMALL, tab + 1, wide - 2 * ROW_PAD, line, sizeof(line));
+                znx_draw_text(ZNX_FONT_SMALL, MARGIN + ROW_PAD, y + 44, line, C_TEXT2, 0);
+                y += 52;
+                znx_draw_rect(MARGIN, y, wide, 1, 0, C_LINE);
             }
             p += n;
             if (*p == '\n') p++;
         }
+        if (strchr(m->message_detail, '\t') == NULL) {
+            y += 8;
+            znx_draw_rect(MARGIN, y, wide, 1, 0, C_LINE);
+        }
+    }
+    /* OK, the one thing to press, with the selection outline as a system dialog has it */
+    y += 32;
+    if (y + ROW_H <= FOOTER_LINE - 12) {
+        znx_ui_row_frame(y, 1);
+        znx_draw_text(ZNX_FONT_ROW, LIST_X + LIST_W / 2, mid_base(ZNX_FONT_ROW, y + ROW_H / 2), "OK", C_ACCENT, ZNX_TEXT_CENTER);
     }
     znx_ui_footer(hints, 1, NULL);
 }
 
 static void draw_scan(struct znx_menu* m)
 {
-    znx_ui_title("Looking for your ROM");
-    znx_draw_text(ZNX_FONT_BODY, MARGIN, LIST_Y + 24, m->base, C_TEXT2, 0);
+    znx_ui_title("Z-Cancel NX");
+    znx_draw_text(ZNX_FONT_ROW, MARGIN + ROW_PAD, LIST_Y + 44, "Looking for your ROM", C_TEXT1, 0);
+    znx_draw_text(ZNX_FONT_SMALL, MARGIN + ROW_PAD, LIST_Y + 76, m->base, C_TEXT2, 0);
+    znx_ui_footer(NULL, 0, NULL);
+}
+
+/* debug_glyphs=1: the console's button glyphs with their code points, to check from one screenshot
+ * that the ones the footer uses are the right ones. */
+static void draw_glyphs(struct znx_menu* m)
+{
+    const struct hint hints[] = { { "A", "OK" }, { "B", "Back" }, { "Y", "Y" }, { "X", "X" }, { "+-", "D-pad" } };
+    static const char* const used_keys[] = { "A", "B", "X", "Y", "LR" };
+    const float cell_w = 70, cell_h = 64, top = LIST_Y + 48;
+    unsigned used[16];
+    int used_count = 0, present = 0;
+    char line[200];
+    (void)m;
+    for (int k = 0; k < (int)(sizeof(used_keys) / sizeof(used_keys[0])); ++k) {
+        unsigned codes[2];
+        const int n = znx_button_codes(used_keys[k], codes);
+        for (int i = 0; i < n; ++i) used[used_count++] = codes[i];
+    }
+    for (unsigned code = 0xE0A0; code <= 0xE0FF; ++code)
+        present += znx_draw_has_symbol(code);
+    znx_ui_title("Button glyphs");
+    if (present > 0)
+        snprintf(line, sizeof(line), "The console's symbol font: %d of 96 glyphs from U+E0A0. The footer uses the ones "
+                 "whose code is in the accent colour.", present);
+    else
+        snprintf(line, sizeof(line), "The console's symbol font is not loaded: the footer shows stand-ins drawn by "
+                 "this program. The codes in the accent colour are the ones it would use.");
+    znx_draw_wrapped(ZNX_FONT_SMALL, MARGIN, LIST_Y + 4, RIGHT_EDGE - MARGIN, line, C_TEXT1);
+    for (int i = 0; i < 96; ++i) {
+        const unsigned code = 0xE0A0 + (unsigned)i;
+        const float x = MARGIN + (i % 16) * cell_w, y = top + (i / 16) * cell_h;
+        char glyph[4] = { (char)(0xE0 | (code >> 12)), (char)(0x80 | ((code >> 6) & 0x3F)), (char)(0x80 | (code & 0x3F)), 0 };
+        char label[8];
+        int is_used = 0;
+        for (int k = 0; k < used_count; ++k)
+            if (used[k] == code) is_used = 1;
+        snprintf(label, sizeof(label), "%04X", code);
+        if (znx_draw_has_symbol(code))
+            znx_draw_text(ZNX_FONT_ROW, x + cell_w / 2, y + 28, glyph, C_TEXT1, ZNX_TEXT_CENTER);
+        else
+            znx_draw_rect(x + cell_w / 2 - 2, y + 18, 4, 4, 2, C_TEXT3);
+        znx_draw_text(ZNX_FONT_SMALL, x + cell_w / 2, y + 52, label, is_used ? C_ACCENT : present ? C_TEXT2 : C_TEXT3,
+                      ZNX_TEXT_CENTER);
+    }
+    znx_draw_wrapped(ZNX_FONT_SMALL, MARGIN, top + 6 * cell_h + 24, RIGHT_EDGE - MARGIN,
+                     "Expected: A E0E0, B E0E1, X E0E2, Y E0E3, L E0E4, R E0E5, ZL E0E6, ZR E0E7, D-pad E0EA, D-pad left "
+                     "E0ED and right E0EE, Plus E0EF, Minus E0F0, left stick E0C1. The footer below shows A, B, X, Y and "
+                     "the D-pad's left and right as hints.", C_TEXT2);
+    znx_ui_footer(hints, 5, znx_theme_is_dark() ? "Theme: Basic Black" : "Theme: Basic White");
 }
 
 void znx_menu_draw(struct znx_menu* m, unsigned framebuffer, int width, int height)
 {
     znx_draw_begin(framebuffer, width, height, C_FIELD);
+    l_focus.on = 0;
     draw_header(m);
     switch (m->screen) {
     case SCREEN_SCAN: draw_scan(m); break;
@@ -964,6 +1085,8 @@ void znx_menu_draw(struct znx_menu* m, unsigned framebuffer, int width, int heig
     case SCREEN_BUILD: draw_build(m); break;
     case SCREEN_MESSAGE: draw_message(m); break;
     case SCREEN_ONLINE: znx_online_draw(); break;
+    case SCREEN_GLYPHS: draw_glyphs(m); break;
     }
+    flush_focus();
     znx_draw_end();
 }

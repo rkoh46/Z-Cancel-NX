@@ -46,6 +46,16 @@ static bool ini_key(const char* key, const char* value, void* user)
         else snprintf(s->inputs_path, sizeof(s->inputs_path), ZNX_BASE_DIR "/%s", value);
     }
     else if (!strcmp(key, "cpu_mhz")) s->cpu_mhz = (uint32_t)atoi(value);
+    else if (!strcmp(key, "vs")) {   /* vs=STAGE:F1,F2,F3,F4  a forced VS match of level 9 CPUs */
+        const char* list = strchr(value, ':');
+        s->options.vs_stage = (int)strtol(value, NULL, 0);
+        for (int port = 0; port < 4; ++port) {
+            if (list != NULL) list++;
+            s->options.vs_fighters[port] = (list != NULL && *list && *list != '-') ? (int)strtol(list, NULL, 0) : -1;
+            list = list != NULL ? strchr(list, ',') : NULL;
+        }
+        s->options.rb_a = s->options.rb_b = -1;
+    }
     else if (!strcmp(key, "rollback_stress")) {   /* rollback_stress=K,D */
         int k, d;
         if (sscanf(value, "%d ,%d", &k, &d) == 2 && k > d && d > 0) { s->options.stress_every = k; s->options.stress_depth = d; s->options.rb_a = s->options.rb_b = -1; }

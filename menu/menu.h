@@ -39,6 +39,9 @@ struct znx_menu_config {
     const char* base_dir;   /* sdmc:/switch/z-cancel-nx */
     const char* version;    /* shown small in the corner */
     znx_keyboard_fn keyboard;   /* the system keyboard (names, connect codes, addresses); NULL: none */
+    int console_theme;      /* the console's theme: 0 Basic White, 1 Basic Black, -1 not known */
+    const char* theme_note; /* with -1: why, for the log; may be NULL */
+    int debug_glyphs;       /* start on the button glyph check (also the ini's debug_glyphs=1) */
 };
 
 struct znx_menu* znx_menu_create(const struct znx_menu_config* config);

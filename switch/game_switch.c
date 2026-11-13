@@ -38,6 +38,7 @@
  * Lines also go to a PC running nxlink (-s). */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,7 @@
 #include "menu_switch.h"
 #include "p2p/znx_p2p.h"
 #include "screen_switch.h"
+#include "sysfont_switch.h"
 #include "vidext_switch.h"
 #include "znx_version.h"
 #include "znx_switch.h"
@@ -70,6 +72,7 @@ struct settings {
     int sound;                 /* 1: the audio plugin; 0: silent */
     int stick_range;           /* what a fully tilted stick reads on the N64 axis; 0 = 84 */
     int menu;                  /* 1: the start screen */
+    char matrix[256];          /* a stage matrix file on the SD card (docs/STAGE_MATRIX.md), or empty */
     int net_overlay;           /* online: the match overlay */
     int net_vsync;             /* online: 0 RMG-K's timer pacer (swap interval 0), 1 vsync with drift correction */
 };
@@ -92,21 +95,61 @@ static bool ini_key(const char* key, const char* value, void* user)
     else if (!strcmp(key, "stick_range")) s->stick_range = atoi(value);
     else if (!strcmp(key, "verbose")) s->options.verbose = atoi(value);
     else if (!strcmp(key, "menu")) s->menu = atoi(value) != 0;
+    else if (!strcmp(key, "matrix")) snprintf(s->matrix, sizeof(s->matrix), "%s", value);
     else if (!strcmp(key, "net_overlay")) s->net_overlay = atoi(value) != 0;
     else if (!strcmp(key, "net_vsync")) s->net_vsync = atoi(value) != 0;
     /* the online settings the start screen keeps (menu/settings.h): read there */
     else if (!strcmp(key, "name") || !strcmp(key, "input_delay") || !strcmp(key, "public_list") ||
              !strcmp(key, "p2p_port") || !strcmp(key, "p2p_code") || !strcmp(key, "p2p_token") ||
              !strcmp(key, "nat_server") || !strcmp(key, "list_server") || !strcmp(key, "lobby_server") ||
-             !strcmp(key, "lobby_stun") || !strcmp(key, "lobby_bind")) {}
+             !strcmp(key, "lobby_stun") || !strcmp(key, "lobby_bind") || !strcmp(key, "theme") ||
+             !strcmp(key, "debug_glyphs")) {}
     else return false;
     return true;
+}
+
+/* ---- the stage matrix (matrix=<file> in the ini): forced VS matches one after another, each timed ---- */
+
+static uint64_t thread_cpu_ns(void);
+
+#define MX_SETTLE 660          /* frames before timing starts: the battle is set up at 421, then it loads */
+#define MX_MAX 20000
+static struct {
+    int on, stage, fighters[4], frames;
+    uint64_t last_ns;
+    uint32_t count, over16, over33;
+    uint64_t sum_ns, worst_ns;
+    int worst_frame;
+    uint16_t* ms100;           /* each timed frame in 1/100 ms, for the percentiles */
+} l_mx;
+
+static void matrix_frame(int frames)
+{
+    const uint64_t now = thread_cpu_ns();
+    const uint64_t ns = l_mx.last_ns != 0 && now > l_mx.last_ns ? now - l_mx.last_ns : 0;
+    l_mx.last_ns = now;
+    if (frames <= MX_SETTLE || l_mx.count >= MX_MAX)
+        return;
+    if (l_mx.ms100 != NULL)
+        l_mx.ms100[l_mx.count] = ns / 10000 > 65535 ? 65535 : (uint16_t)(ns / 10000);
+    l_mx.count++;
+    l_mx.sum_ns += ns;
+    if (ns > l_mx.worst_ns) { l_mx.worst_ns = ns; l_mx.worst_frame = frames - 1; }
+    if (ns > 16666667ull) l_mx.over16++;
+    if (ns > 33333333ull) l_mx.over33++;
+}
+
+static int matrix_compare(const void* a, const void* b)
+{
+    return (int)*(const uint16_t*)a - (int)*(const uint16_t*)b;
 }
 
 /* On the emulation thread, after every frame. */
 static void frame_done(int frames, uint64_t frame_ns)
 {
     znx_game_frame_done(frames, frame_ns);
+    if (l_mx.on)
+        matrix_frame(frames);
     if (frames % 600 == 0) {
         /* The audio plugin's own counters, through the same table its API is looked up in. */
         static void (*stats)(unsigned*, unsigned*, unsigned*);
@@ -345,6 +388,14 @@ static int play(const char* rom_path, bool have_romfs, bool online)
     read_settings(&settings);
     settings.options.rom_path = rom_path;
     znx_log("rom: %s", rom_path);
+    if (l_mx.on) {
+        settings.options.vs_stage = l_mx.stage;
+        memcpy(settings.options.vs_fighters, l_mx.fighters, sizeof(l_mx.fighters));
+        settings.options.frames = l_mx.frames;
+        settings.options.inputs_path = NULL;
+        settings.game.report_every = 0;
+        settings.sound = 0;
+    }
     if (online) {
         /* Swap interval 0 under RMG-K's timer by default: the console's compositor takes whole buffers at
          * the display's refresh, so a frame is never torn, only shown once more or replaced before it was
@@ -428,6 +479,59 @@ int main(int argc, char** argv)
     have_romfs = znx_front_romfs();
     read_settings(&settings);
 
+    if (settings.matrix[0]) {
+        /* Lines: <rom file in the app's folder> <stage> <f1,f2[,f3,f4]> <frames> [label...]; # comments.
+         * Each case is a fresh start of the emulator; the emulation thread's own running time per frame is
+         * what is reported (the picture is drawn, vsync as the ini says). */
+        char path[512], line[512];
+        FILE* file;
+        int cases = 0;
+        snprintf(path, sizeof(path), "%s%s", strchr(settings.matrix, ':') != NULL ? "" : ZNX_BASE_DIR "/", settings.matrix);
+        file = fopen(path, "r");
+        if (file == NULL)
+            znx_log("matrix: cannot open %s", path);
+        l_mx.ms100 = malloc(MX_MAX * sizeof(uint16_t));
+        while (file != NULL && fgets(line, sizeof(line), file) != NULL && !znx_bench_stop_requested()) {
+            char rom_name[200], fighters[64], label[160] = "", rom[512];
+            int stage = 0, frames = 0, used = 0;
+            if (line[0] == '#' || sscanf(line, "%199s %i %63s %d %n", rom_name, &stage, fighters, &frames, &used) < 4)
+                continue;
+            snprintf(label, sizeof(label), "%s", line + used);
+            label[strcspn(label, "\r\n")] = 0;
+            snprintf(rom, sizeof(rom), ZNX_BASE_DIR "/%s", rom_name);
+            l_mx.last_ns = 0; l_mx.count = l_mx.over16 = l_mx.over33 = 0;
+            l_mx.sum_ns = l_mx.worst_ns = 0; l_mx.worst_frame = 0;
+            l_mx.on = 1; l_mx.stage = stage; l_mx.frames = frames;
+            {
+                const char* f = fighters;
+                for (int port = 0; port < 4; ++port) {
+                    l_mx.fighters[port] = (f != NULL && *f && *f != '-') ? (int)strtol(f, NULL, 0) : -1;
+                    f = f != NULL ? strchr(f, ',') : NULL;
+                    if (f != NULL) f++;
+                }
+            }
+            const int code = play(rom, have_romfs, false);
+            uint32_t p50 = 0, p99 = 0, p999 = 0;
+            if (l_mx.ms100 != NULL && l_mx.count > 0) {
+                qsort(l_mx.ms100, l_mx.count, sizeof(uint16_t), matrix_compare);
+                p50 = l_mx.ms100[l_mx.count / 2];
+                p99 = l_mx.ms100[(uint64_t)l_mx.count * 99 / 100];
+                p999 = l_mx.ms100[(uint64_t)l_mx.count * 999 / 1000];
+            }
+            znx_log("matrix\t%s\t0x%02x\t%s\t%s\texit %d\tframes %u\tavg %.2f\tp50 %.2f\tp99 %.2f\tp99.9 %.2f\tworst %.2f at %d\tover16.7 %u\tover33 %u",
+                    rom_name, stage, fighters, label, code, l_mx.count,
+                    l_mx.count ? l_mx.sum_ns / 1e6 / l_mx.count : 0.0, p50 / 100.0, p99 / 100.0, p999 / 100.0,
+                    l_mx.worst_ns / 1e6, l_mx.worst_frame, l_mx.over16, l_mx.over33);
+            cases++;
+        }
+        if (file != NULL)
+            fclose(file);
+        l_mx.on = 0;
+        znx_log("matrix: %d cases", cases);
+        znx_front_end(0, false);
+        return 0;
+    }
+
     if (!settings.menu || (argc > 1 && znx_file_exists(argv[1]))) {
         /* No start screen: one game, then back to the Homebrew Menu (scripted runs, nxlink). */
         const char* rom = znx_front_find_rom(argc, argv);
@@ -439,6 +543,13 @@ int main(int argc, char** argv)
     config.base_dir = ZNX_BASE_DIR;
     config.version = ZNX_VERSION;
     config.keyboard = znx_switch_keyboard;
+    {
+        /* the console's Basic White / Basic Black; the ini's theme key can override it (menu/settings.h) */
+        static char theme_note[64];
+        config.console_theme = znx_sysfont_console_theme(theme_note, sizeof(theme_note));
+        config.theme_note = theme_note;
+        config.debug_glyphs = 0;
+    }
     menu = znx_menu_create(&config);
     if (menu == NULL) {
         znx_log(PROGRAM ": no memory for the start screen");

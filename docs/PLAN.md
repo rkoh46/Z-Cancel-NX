@@ -1039,3 +1039,63 @@ joined, libjuice connected the two directly (18 ms), the console started the mat
 console 55 rollbacks (deepest 7), the Mac 59 (deepest 5): all 15 check lines identical. The WebSocket
 client, libjuice (its wake-up pipe is a loopback UDP pair on Horizon) and the pre-match manifest all work
 on libnx. The real RMG-K lobby server and a real RMG-K peer are untested.
+
+## Switch-style UI, 2026-11-12: built and previewed on the Mac, not yet run on a console
+
+The start screen, the online and lobby screens and the match overlay now follow the console's own system
+software (System Settings), so the program reads as part of the Switch. Behaviour, navigation and the meaning of
+every text are unchanged; copy was shortened only where a row needed it.
+
+- **Themes.** Basic White and Basic Black (`menu/draw.c` `znx_theme`), from the console's setting
+  (`setsysGetColorSetId`, `switch/sysfont_switch.c`); `theme=auto|light|dark` in `z-cancel-nx.ini` overrides it
+  (read only, default auto). The colours are the usual approximations of the system's (THIRD_PARTY_NOTICES.md).
+- **Type.** The console's shared system font and its Nintendo Extended font with the button glyphs, read at run
+  time with `plGetSharedFontByType` and handed to FreeType from memory; nothing of Nintendo's is in the NRO. If
+  pl does not give the font, or FreeType refuses it, the bundled Barlow font is used, and the hints are drawn as
+  discs with the button's letter. Sizes: 18, 20, 22, 28 and 40 pixels.
+- **Layout (1280x720).** Header: the mark on its dark tile and the page's name at 28 px, a thin rule 30 px from
+  the edges at y 88. Left: a list of 70 px rows with thin lines, 22 px text, the value at the right in the accent
+  colour (On in the accent, Off quiet), status dots in green, red or grey. Right: the detail pane on the panel
+  colour (key/value lines, a paragraph, a quieter note; an MD5 on two lines). Footer: a rule at y 647, small
+  status text at the left, the hints at the right in the system's order (A outermost, then B, X, Y, D-pad).
+  Long lists scroll, with a thin bar beside them; steps (building, joining, starting) are rows with Done or a
+  figure at the right and a thin accent progress bar under the list; a message has its text, the details as a
+  plain list and a selected OK row.
+- **Selection.** The system's fill and a 5 px rounded outline whose colour moves between the two highlight
+  colours every 72 frames (1.2 s): the one animation. It is drawn after the rows so their lines do not cross it.
+- **Button glyphs.** `znx_draw_button` (draw.c): A U+E0E0, B U+E0E1, X U+E0E2, Y U+E0E3, D-pad left U+E0ED and
+  right U+E0EE in the footer; the table also knows L, R, ZL, ZR (E0E4-E0E7), Plus E0EF, Minus E0F0, D-pad E0EA,
+  left stick E0C1. They are the code points the open Switch libraries use; none could be checked off the
+  console. `debug_glyphs=1` in the ini opens a page with all 96 glyphs from U+E0A0 and their codes, the ones in
+  use in the accent colour, so one screenshot settles it.
+- **Overlay.** `znx_ui_overlay`: a small dark translucent rounded rectangle with white text at the top left, in
+  the system font, over the black margin. It is still drawn only into the window's framebuffer after GLideN64's
+  frame, with every piece of OpenGL state restored; it never touches the game.
+- **Log lines to look for in `latest.log`:** `menu: theme dark (console setting)` / `menu: theme light
+  (theme=light in z-cancel-nx.ini)` / `menu: theme light (console setting unavailable: 0x...)`;
+  `menu: system font loaded (N bytes)` or `menu: system font unavailable: 0x..., using the bundled font`;
+  `menu: system button glyphs loaded (N bytes)` or `... unavailable: 0x..., drawing stand-ins`;
+  `menu: drawing with the system font, button glyphs from the system`; `menu: the system font cannot be used
+  (...), using the bundled font`.
+- **Preview.** `znx-game --menu-shot` takes `--menu-theme light|dark`, `--menu-font FILE|barlow`, `--menu-glyphs`
+  and `--menu-overlay "Ping=41 ms|Delay=2|Rollbacks=3"`. A Mac has neither the console's font nor its glyphs: the
+  preview draws with Hiragino Sans GB from the Mac's system folder (close in width; Helvetica, then Barlow, if it
+  is missing), shows the stand-in discs, and holds the outline's pulse at its middle. Every screen in both themes
+  is in `build/menu-preview/switch-style/{light,dark}/`.
+
+### Where the slow frames come from, 2026-11-12
+
+Stage matrix on the console (`matrix=<file>` in the ini: forced four-CPU VS matches one after another,
+each a fresh start, 3,000 frames timed from frame 660, picture on). Vanilla, all 14 stages that start:
+the emulation thread runs 4.7 to 5.6 ms per frame on average, p99 7.7 to 10.4 ms, but every stage has 5
+to 12 frames over 16.7 ms and 2 to 6 over 33 ms, and a second pass with every shader cached gives the
+same numbers. The headless bench shows the same frames without any picture, and patch 0008's
+`DebugDynarecStats` attributes them: the forced match on Congo Jungle compiles 1,165 blocks after frame
+660 at 0.485 ms per block on the console (0.077 ms on the Mac); frame 661 takes 59.5 ms of which 57.6
+compiling 68 blocks, 869 takes 40.6 of which 38.7, 2,087 takes 31.6 of which 30.1. So the only frames
+that miss the display in a match are frames in which the recompiler meets code for the first time.
+Next: compile ahead of need from a saved list of blocks, and make a compile cheaper.
+
+The console's menus were restyled after the system's own (Basic White and Basic Black from the console's
+setting, the shared system font and button glyphs loaded at run time, System Settings' layout); checked
+on the console in both themes.

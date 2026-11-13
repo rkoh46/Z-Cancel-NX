@@ -60,6 +60,7 @@ void znx_settings_load(const char* base, struct znx_menu_settings* s)
     snprintf(s->name, sizeof(s->name), "Switch");
     s->input_delay = 0;
     s->p2p_port = 27886;
+    snprintf(s->theme, sizeof(s->theme), "auto");
     ini_path(base, path, sizeof(path));
     f = fopen(path, "r");
     if (f == NULL)
@@ -84,6 +85,8 @@ void znx_settings_load(const char* base, struct znx_menu_settings* s)
         else if (!strcmp(key, "lobby_server")) copy_text(s->lobby_server, sizeof(s->lobby_server), value);
         else if (!strcmp(key, "lobby_stun")) copy_text(s->lobby_stun, sizeof(s->lobby_stun), value);
         else if (!strcmp(key, "lobby_bind")) copy_text(s->lobby_bind, sizeof(s->lobby_bind), value);
+        else if (!strcmp(key, "theme")) copy_text(s->theme, sizeof(s->theme), value);
+        else if (!strcmp(key, "debug_glyphs")) s->debug_glyphs = atoi(value) != 0;
     }
     fclose(f);
 }

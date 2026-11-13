@@ -31,6 +31,12 @@ struct znx_options {
     int dump_frame;            /* write RDRAM to dump_path after this many frames, or -1 */
     const char* dump_path;
     int progress_every;        /* "progress" line every K frames, 0 = never */
+    /* A forced VS match (docs/STAGE_MATRIX.md): START is pressed at frames 200 and 420, and on the frame the
+     * scene byte first asks for the mode select the battle setup is written into RDRAM and the scene changed
+     * to the VS battle. Same addresses in vanilla, Smash Remix 2.0.1 and +EXTRA 0.6.0. vs_stage < 0: off. */
+    int vs_stage;              /* gkind / Remix stage id */
+    int vs_fighters[4];        /* fighter kind per port, -1 = empty; level 9 CPUs */
+    int vs_level;              /* CPU level 1..9, 0 = 9 */
     int input_players;         /* controller ports the rollback session synchronizes (1-4); 0 = 4. The
                                 * rest read as unplugged (pif.c). RMG-K's P2P sessions use 2. */
     struct znx_window windows[ZNX_MAX_WINDOWS];

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-/* See lobby_entry.h. The screens follow the start screen and the online screens (online.c): a list on
- * the left, a detail panel on the right, the Switch's button letters at the bottom, one yellow accent for
- * the selection marker. The lobby itself (connection, rooms, ICE, the match) is net/lobby_play.cpp; these
+/* See lobby_entry.h. The screens follow the start screen and the online screens (menu_ui.h): the console's
+ * system look, a list of rows on the left, a detail pane on the right, the button hints at the bottom.
+ * The lobby itself (connection, rooms, ICE, the match) is net/lobby_play.cpp; these
  * functions only show it and pass the player's choices on. */
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -26,7 +26,7 @@
 
 #define MAX_ROOMS 32
 #define CHAT_LINES 10
-#define ROOM_ROWS_VISIBLE 5
+#define ROOM_ROWS_VISIBLE 7
 
 /* What the screens show: from net/lobby_play.h, or made up (preview). */
 struct view {
@@ -326,27 +326,6 @@ enum znx_online_result znx_lobby_update(uint32_t pressed, uint32_t held, char* t
 
 /* ---- drawing ---- */
 
-/* Steps of something that takes a few seconds: the current one raised, with a line under it. */
-static void draw_steps(const char* const* steps, int count, int current, const char* detail)
-{
-    float y = LIST_Y;
-    for (int i = 0; i < count; ++i) {
-        const int now = i == current;
-        const float h = now ? 104 : 64;
-        if (now) {
-            znx_draw_rect(LIST_X, y, LIST_W, h, 12, C_SELECTED);
-            znx_draw_slant(LIST_X + 12, y + 16, 6, 40, SLANT, C_ACCENT);
-        }
-        znx_draw_text(ZNX_FONT_ROW, LIST_X + 32, y + (now ? 36 : 42), steps[i], i < current ? C_TEXT2 : now ? C_TEXT1 : C_TEXT3, 0);
-        if (now && detail != NULL) {
-            char fitted[200];
-            znx_text_fit(ZNX_FONT_SMALL, detail, LIST_W - 64, fitted, sizeof(fitted));
-            znx_draw_text(ZNX_FONT_SMALL, LIST_X + 32, y + 76, fitted, C_TEXT2, 0);
-        }
-        y += h + ROW_GAP;
-    }
-}
-
 static void draw_connecting(void)
 {
     const struct hint hints[] = { { "B", "Cancel" } };
@@ -358,7 +337,7 @@ static void draw_connecting(void)
         snprintf(detail, sizeof(detail), "%s, %d s", l.v.status.server, l.v.status.seconds);
     else
         snprintf(detail, sizeof(detail), "%s", l.v.status.server);
-    draw_steps(steps, 2, 0, detail);
+    znx_ui_steps(LIST_Y, steps, 2, 0, NULL, detail, -1);
     {
         const struct field fields[] = {
             { "Server", l.v.status.server, 1 },
@@ -381,7 +360,7 @@ static void draw_entering(void)
     char title[160];
     snprintf(title, sizeof(title), "%s", l.entering[0] ? l.entering : "Joining");
     znx_ui_title(title);
-    draw_steps(steps, 2, 0, "Waiting for the lobby server");
+    znx_ui_steps(LIST_Y, steps, 2, 0, NULL, "Waiting for the lobby server", -1);
     {
         const struct field fields[] = { { "Name", l.v.status.username, 0 }, { "Game", l.request.goodname, 0 } };
         znx_ui_panel(LIST_Y, fields, 2, "The room opens as soon as the server answers.", NULL);
@@ -402,7 +381,7 @@ static void draw_rooms(void)
 {
     const struct hint hints_open[] = { { "A", "Open" }, { "+-", "Seats" }, { "B", "Leave lobby" } };
     const struct hint hints_join[] = { { "A", "Join" }, { "B", "Leave lobby" } };
-    char title[160], left[160], status[200], ping[32], seats[32], name[64];
+    char title[160], left[160], value[64], seats[32], name[64];
     int first;
     float y = LIST_Y;
     snprintf(title, sizeof(title), "Rooms \xC2\xB7 %s", l.request.title);
@@ -413,27 +392,25 @@ static void draw_rooms(void)
     if (first < 0) first = 0;
     for (int i = first; i <= l.v.room_count && i < first + ROOM_ROWS_VISIBLE; ++i) {
         if (i == 0) {
-            snprintf(status, sizeof(status), "%d seats, you start the match", l.seats);
-            znx_ui_row(y, ROW_H, l.row == 0, "Open a room", C_TEXT1, status, C_TEXT2, 0, NULL);
+            snprintf(value, sizeof(value), "%d seats", l.seats);
+            znx_ui_row(y, l.row == 0, "Open a room", C_TEXT1, value, C_ACCENT, 0);
         } else {
             const struct znx_lobby_play_room* r = &l.v.rooms[i - 1];
             const int joinable = !r->in_game && r->players < r->max_players;
-            snprintf(status, sizeof(status), "%s \xC2\xB7 %d of %d players%s", r->host, r->players, r->max_players,
-                     r->in_game ? " \xC2\xB7 in a match" : r->players >= r->max_players ? " \xC2\xB7 full" : "");
-            if (r->ping_estimate > 0) snprintf(ping, sizeof(ping), "~%d ms", r->ping_estimate);
-            else ping[0] = '\0';
-            znx_ui_row(y, ROW_H, l.row == i, r->name, joinable ? C_TEXT1 : C_TEXT2, status, C_TEXT2,
-                       joinable ? C_READY : C_TEXT3, NULL);
-            if (ping[0])   /* an estimate: quieter than a measured figure */
-                znx_draw_text(ZNX_FONT_BODY, LIST_X + LIST_W - 32, y + 36, ping, C_TEXT2, ZNX_TEXT_RIGHT | ZNX_TEXT_TABULAR);
+            if (r->in_game) snprintf(value, sizeof(value), "In a match");
+            else if (!joinable) snprintf(value, sizeof(value), "Full");
+            else snprintf(value, sizeof(value), "%d of %d", r->players, r->max_players);
+            znx_ui_row(y, l.row == i, r->name, joinable ? C_TEXT1 : C_TEXT2, value, joinable ? C_TEXT1 : C_TEXT2,
+                       joinable ? C_READY : C_TEXT3);
         }
-        y += ROW_H + ROW_GAP;
+        y += ROW_H;
     }
+    znx_ui_scrollbar(LIST_Y, ROOM_ROWS_VISIBLE, first, l.v.room_count + 1);
     if (l.v.room_count == 0) {
         char line[200];
         snprintf(line, sizeof(line), "No room is open with %s right now. Open one and wait, or stay here: the "
                  "list updates by itself.", l.request.title);
-        znx_draw_wrapped(ZNX_FONT_BODY, LIST_X + 32, y + 32, LIST_W - 64, line, C_TEXT2);
+        znx_draw_wrapped(ZNX_FONT_BODY, LIST_X + ROW_PAD, y + 48, LIST_W - 2 * ROW_PAD, line, C_TEXT2);
     }
 
     if (l.row == 0) {
@@ -480,74 +457,81 @@ static void draw_rooms(void)
     }
 }
 
-/* One seat of the room: port, name, connection, delay, who it is. */
-static void draw_seat(float y, float h, int port, const struct znx_lobby_play_seat* s)
+/* One seat of the room: port, name and who it is; connection, ping and delay at the right. */
+static void draw_seat(float y, int port, const struct znx_lobby_play_seat* s)
 {
-    char label[8], fitted[64], line[96], right[32];
-    uint32_t dot = C_TEXT3;
-    znx_draw_rect(LIST_X, y, LIST_W, h, 12, C_CARD);
+    const float base = y + ROW_H / 2 + znx_cap_height(ZNX_FONT_ROW) / 2, right = LIST_X + LIST_W - ROW_PAD;
+    char label[8], fitted[64], line[96], state[48];
+    const char* role;
+    uint32_t dot = C_TEXT3, color = C_TEXT2;
+    float x = LIST_X + ROW_PAD + 44, state_w, role_w;
+    znx_ui_row_frame(y, 0);
     snprintf(label, sizeof(label), "P%d", port);
-    znx_draw_text(ZNX_FONT_BODY, LIST_X + 24, y + 34, label, C_TEXT3, ZNX_TEXT_TABULAR);
+    znx_draw_text(ZNX_FONT_ROW, LIST_X + ROW_PAD, base, label, C_TEXT2, 0);
     if (s->user_id == 0) {
-        znx_draw_text(ZNX_FONT_ROW, LIST_X + 72, y + 34, "Open seat", C_TEXT3, 0);
+        znx_draw_text(ZNX_FONT_ROW, x, base, "Open seat", C_TEXT3, 0);
         return;
     }
-    znx_text_fit(ZNX_FONT_ROW, s->name, LIST_W - 260, fitted, sizeof(fitted));
-    znx_draw_text(ZNX_FONT_ROW, LIST_X + 72, y + 34, fitted, C_TEXT1, 0);
     if (s->self) {
-        snprintf(line, sizeof(line), "This console");
+        state[0] = '\0';
         dot = C_READY;
+        color = C_TEXT1;
     } else if (s->ice == 1) {
-        if (s->ping >= 0) snprintf(line, sizeof(line), "Connected \xC2\xB7 %d ms", s->ping);
-        else snprintf(line, sizeof(line), "Connected \xC2\xB7 measuring the ping");
+        if (s->ping >= 0) snprintf(state, sizeof(state), "%d ms", s->ping);
+        else snprintf(state, sizeof(state), "Measuring");
         dot = C_READY;
+        color = C_TEXT1;
     } else if (s->ice < 0) {
-        snprintf(line, sizeof(line), "No direct connection");
+        snprintf(state, sizeof(state), "No connection");
         dot = C_MISSING;
+        color = C_TEXT1;
     } else if (s->attempt > 1) {
-        snprintf(line, sizeof(line), "Connecting, attempt %d of 20", s->attempt);
+        snprintf(state, sizeof(state), "Connecting (%d of 20)", s->attempt);
     } else {
-        snprintf(line, sizeof(line), "Connecting");
+        snprintf(state, sizeof(state), "Connecting");
     }
-    znx_draw_rect(LIST_X + 72, y + 58 - znx_cap_height(ZNX_FONT_SMALL) / 2 - 4, 8, 8, 4, dot);
-    znx_draw_text(ZNX_FONT_SMALL, LIST_X + 88, y + 58, line, s->ice < 0 && !s->self ? C_TEXT1 : C_TEXT2, 0);
-    snprintf(right, sizeof(right), "%s", s->self ? (s->host ? "You, host" : "You") : s->host ? "Host" : "");
-    if (right[0])
-        znx_draw_text(ZNX_FONT_BODY, LIST_X + LIST_W - 24, y + 34, right, C_TEXT2, ZNX_TEXT_RIGHT);
-    if (s->delay >= 0) {
-        snprintf(line, sizeof(line), "Delay %d", s->delay);
-        znx_draw_text(ZNX_FONT_SMALL, LIST_X + LIST_W - 24, y + 58, line, C_TEXT3, ZNX_TEXT_RIGHT | ZNX_TEXT_TABULAR);
-    }
+    if (s->delay >= 0 && (s->self || s->ice == 1))
+        snprintf(line, sizeof(line), "%s%sDelay %d", state, state[0] ? " \xC2\xB7 " : "", s->delay);
+    else
+        snprintf(line, sizeof(line), "%s", state[0] ? state : "This console");
+    state_w = znx_draw_text(ZNX_FONT_ROW, right, base, line, color, ZNX_TEXT_RIGHT);
+    znx_draw_rect(right - state_w - 16, y + ROW_H / 2 - 4, 8, 8, 4, dot);
+    role = s->self ? (s->host ? "You, host" : "You") : s->host ? "Host" : "";
+    role_w = role[0] ? znx_text_width(ZNX_FONT_SMALL, role, 0) + 12 : 0;
+    znx_text_fit(ZNX_FONT_ROW, s->name, right - state_w - 40 - role_w - x, fitted, sizeof(fitted));
+    x += znx_draw_text(ZNX_FONT_ROW, x, base, fitted, C_TEXT1, 0) + 12;
+    if (role[0])
+        znx_draw_text(ZNX_FONT_SMALL, x, base, role, C_TEXT2, 0);
 }
 
 static void draw_chat(float top, float bottom)
 {
-    const float step = znx_line_height(ZNX_FONT_SMALL);
-    int fit = (int)((bottom - top - 16) / step);
-    int first;
+    const float step = znx_line_height(ZNX_FONT_SMALL), left = LIST_X + ROW_PAD, right = LIST_X + LIST_W - ROW_PAD;
+    int fit, first;
     float y;
-    znx_draw_rect(LIST_X, top, LIST_W, 1, 0, C_HAIRLINE);
+    top += znx_ui_section(top, "Room chat");
+    fit = (int)((bottom - top) / step);
     if (fit < 1)
         return;
     if (l.v.chat_count == 0) {
-        znx_draw_text(ZNX_FONT_SMALL, LIST_X + 24, top + 16 + step, "Room chat: Y writes a line", C_TEXT3, 0);
+        znx_draw_text(ZNX_FONT_SMALL, left, top + 18, "Nothing yet: Y writes a line", C_TEXT2, 0);
         return;
     }
     first = l.v.chat_count > fit ? l.v.chat_count - fit : 0;
-    y = top + 16 + step;
+    y = top + 18;
     for (int i = first; i < l.v.chat_count; ++i, y += step) {
         const struct znx_lobby_play_chat_line* c = &l.v.chat[i];
         char fitted[300];
-        float x = LIST_X + 24;
+        float x = left;
         if (c->name[0]) {
-            char name[64];
-            snprintf(name, sizeof(name), "%s", c->name);
-            x += znx_draw_text(ZNX_FONT_SMALL, x, y, name, c->self ? C_TEXT3 : C_TEXT2, 0) + 12;
-            znx_text_fit(ZNX_FONT_SMALL, c->text, LIST_X + LIST_W - 24 - x, fitted, sizeof(fitted));
+            char name[96];
+            znx_text_fit(ZNX_FONT_SMALL, c->name, 180, name, sizeof(name));
+            x += znx_draw_text(ZNX_FONT_SMALL, x, y, name, C_TEXT2, 0) + 12;
+            znx_text_fit(ZNX_FONT_SMALL, c->text, right - x, fitted, sizeof(fitted));
             znx_draw_text(ZNX_FONT_SMALL, x, y, fitted, C_TEXT1, 0);
         } else {
-            znx_text_fit(ZNX_FONT_SMALL, c->text, LIST_W - 48, fitted, sizeof(fitted));
-            znx_draw_text(ZNX_FONT_SMALL, x, y, fitted, C_TEXT3, 0);
+            znx_text_fit(ZNX_FONT_SMALL, c->text, right - left, fitted, sizeof(fitted));
+            znx_draw_text(ZNX_FONT_SMALL, x, y, fitted, C_TEXT2, 0);
         }
     }
 }
@@ -558,16 +542,15 @@ static void draw_room(void)
     const struct hint hints[] = { { "Y", "Chat" }, { "+-", "Delay" }, { "B", "Leave" } };
     const struct znx_lobby_play_room_view* r = &l.v.room;
     const int seats = r->max_players >= 2 && r->max_players <= 4 ? r->max_players : 2;
-    const float h = 72;
     char left[160], delay[64], prediction[32], players[32], paragraph[300];
     float y = LIST_Y;
     znx_ui_title(r->name[0] ? r->name : "Room");
     footer_left(left, sizeof(left));
     for (int i = 0; i < seats; ++i) {
-        draw_seat(y, h, i + 1, &r->seats[i]);
-        y += h + ROW_GAP;
+        draw_seat(y, i + 1, &r->seats[i]);
+        y += ROW_H;
     }
-    draw_chat(y + 8, FOOTER_LINE - 16);
+    draw_chat(y + 8, FOOTER_LINE - 12);
 
     delay_label(r->delay_auto, r->local_delay, delay, sizeof(delay));
     snprintf(prediction, sizeof(prediction), "Up to %d frames", r->prediction);
@@ -610,18 +593,18 @@ static void draw_starting(void)
     static const char* const steps[3] = { "Connect to every player", "Sync the room's settings", "Start the game" };
     const struct znx_lobby_play_status* s = &l.v.status;
     const struct znx_lobby_play_room_view* r = &l.v.room;
-    char detail[160], seat[16], delay[64], prediction[32];
+    char detail[160], seat[16], delay[64], prediction[32], left_time[16];
     int self_seat = 0;
     for (int i = 0; i < 4; ++i)
         if (r->seats[i].self)
             self_seat = i + 1;
     znx_ui_title("Starting the match");
     if (s->start_step == 0)
-        snprintf(detail, sizeof(detail), "%d of %d connected \xC2\xB7 %d s left", s->start_connected, s->start_peers,
-                 s->start_seconds_left);
+        snprintf(detail, sizeof(detail), "%d of %d connected", s->start_connected, s->start_peers);
     else
-        snprintf(detail, sizeof(detail), "The host's cheats and save data \xC2\xB7 %d s left", s->start_seconds_left);
-    draw_steps(steps, 3, s->start_step, detail);
+        snprintf(detail, sizeof(detail), "The host's cheats and save data");
+    snprintf(left_time, sizeof(left_time), "%d s", s->start_seconds_left);
+    znx_ui_steps(LIST_Y, steps, 3, s->start_step, left_time, detail, -1);
     snprintf(seat, sizeof(seat), "P%d", self_seat);
     delay_label(r->delay_auto, r->local_delay, delay, sizeof(delay));
     snprintf(prediction, sizeof(prediction), "Up to %d frames", r->prediction);
@@ -715,10 +698,11 @@ void znx_lobby_debug(const struct znx_online_request* request, const char* which
         }
     } else {
         struct znx_lobby_play_room_view* r = &v->room;
-        const int host = !strcmp(which, "room-host") || !strcmp(which, "room-4");
+        const int longest = !strcmp(which, "long");   /* names as long as they get, a third player still connecting */
+        const int host = !strcmp(which, "room-host") || !strcmp(which, "room-4") || longest;
         r->id = 104;
         r->same_rom = 1;
-        r->max_players = !strcmp(which, "room-4") ? 4 : 2;
+        r->max_players = !strcmp(which, "room-4") || longest ? 4 : 2;
         r->prediction = 7;
         r->local_delay = 2;
         r->delay_auto = 1;
@@ -746,6 +730,14 @@ void znx_lobby_debug(const struct znx_online_request* request, const char* which
             fake_chat(l.username, "sure, Hyrule", 1);
             if (r->max_players == 4)
                 fake_chat("", "dreamland_dan joined", 0);
+            if (longest) {
+                snprintf(r->name, sizeof(r->name), "Saturday night friendlies, everyone welcome!");
+                fake_seat(&r->seats[0], 1, "Maximilian_the_Magnificent_2000", 2, 1, 0, 1, 1);
+                fake_seat(&r->seats[1], 2, "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW", 9, 1, 238, 0, 0);
+                fake_seat(&r->seats[2], 3, "dreamland_dan_the_second_account", 3, 0, -1, 0, 0);
+                r->seats[2].attempt = 12;
+                fake_chat("WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW", "a chat line that is long enough that it cannot fit in the column and has to be cut", 0);
+            }
         } else {
             const int failed = !strcmp(which, "room-ice-failed");
             snprintf(r->name, sizeof(r->name), "kirbyfan64's Room");

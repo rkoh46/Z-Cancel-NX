@@ -1,0 +1,9 @@
+# Power-on to the mode select screen, for Super Smash Bros. (USA), Smash Remix 2.0.1 and Smash Remix 2.0.1
+# +EXTRA 0.6.0 alike. Scene byte 800A4AD0: vanilla 1B -> 1C (intro) -> 01 title at frame 201 -> 07 at 421;
+# Remix 1B -> 37 (its splash) -> 01 title at 296 -> 07 at 421.
+# Meant for the memory-poke start (tools/vs_poke_plan.py, docs/STAGE_MATRIX.md): the pokes go in on the
+# frame the scene byte first reads 07.
+200 1 10000000   # START: skip the intro
+206 1 00000000
+420 1 10000000   # START at the title -> mode select
+426 1 00000000

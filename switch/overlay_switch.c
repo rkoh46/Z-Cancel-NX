@@ -6,7 +6,9 @@
  * (menu/draw.c) and font. It only adds pixels to the window's framebuffer: nothing goes near RDRAM or
  * the emulated machine, so it cannot change the game. GLideN64 caches OpenGL state (it skips calls that
  * would set what it believes is already set), so every piece of state draw.c touches is read before and
- * put back after: the cache stays true. The text sits in the black margin left of the 4:3 picture. */
+ * put back after: the cache stays true. The label (menu_ui.h znx_ui_overlay: a small dark rounded
+ * rectangle with white text, in the console's system font) sits at the top left, in the black margin
+ * beside the 4:3 picture. */
 
 #include "overlay_switch.h"
 
@@ -17,6 +19,8 @@
 #include <EGL/egl.h>
 
 #include "draw.h"
+#include "menu_ui.h"
+#include "sysfont_switch.h"
 #include "znx_switch.h"
 
 #define FONT_PATH "romfs:/fonts/BarlowSemiCondensed-Medium.ttf"
@@ -75,8 +79,9 @@ static struct {
     void (*PixelStorei)(GLenum, GLint);
 } gl;
 
-static void* l_font;
-static size_t l_font_size;
+static void* l_font;             /* the bundled font, when it is the one used */
+static const void* l_face;
+static size_t l_face_size;
 static int l_ready, l_failed;
 
 static void* getproc(const char* name)
@@ -97,24 +102,33 @@ static int load(void)
     GET(BlendEquationSeparate) GET(UseProgram) GET(BindVertexArray) GET(BindBuffer) GET(ActiveTexture)
     GET(BindTexture) GET(BindSampler) GET(BindFramebuffer) GET(ColorMask) GET(PixelStorei)
 #undef GET
-    f = fopen(FONT_PATH, "rb");
-    if (f == NULL) {
-        znx_log("overlay: cannot open " FONT_PATH);
-        return 0;
+    {
+        /* the system font the start screen already asked for; else the bundled one */
+        const void* extended;
+        size_t extended_size;
+        if (!znx_sysfont_get(&l_face, &l_face_size, &extended, &extended_size)) {
+            f = fopen(FONT_PATH, "rb");
+            if (f == NULL) {
+                znx_log("overlay: cannot open " FONT_PATH);
+                return 0;
+            }
+            fseek(f, 0, SEEK_END);
+            size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            l_font = size > 0 ? malloc((size_t)size) : NULL;
+            if (l_font == NULL || fread(l_font, 1, (size_t)size, f) != (size_t)size) {
+                fclose(f);
+                free(l_font);
+                l_font = NULL;
+                znx_log("overlay: cannot read the font");
+                return 0;
+            }
+            fclose(f);
+            l_face = l_font;
+            l_face_size = (size_t)size;
+        }
+        znx_draw_set_symbol_font(NULL, 0);   /* no button glyphs in the label */
     }
-    fseek(f, 0, SEEK_END);
-    size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    l_font = size > 0 ? malloc((size_t)size) : NULL;
-    if (l_font == NULL || fread(l_font, 1, (size_t)size, f) != (size_t)size) {
-        fclose(f);
-        free(l_font);
-        l_font = NULL;
-        znx_log("overlay: cannot read the font");
-        return 0;
-    }
-    fclose(f);
-    l_font_size = (size_t)size;
     {
         /* draw.c's init binds its own objects: keep GLideN64's bindings around it too */
         GLint program = 0, vao = 0, buffer = 0, active = 0, texture = 0, align = 4;
@@ -125,7 +139,7 @@ static int load(void)
         gl.ActiveTexture(GL_TEXTURE0);
         gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
         gl.GetIntegerv(GL_UNPACK_ALIGNMENT, &align);
-        const int ok = znx_draw_init(getproc, l_font, l_font_size, error, sizeof(error));
+        const int ok = znx_draw_init(getproc, l_face, l_face_size, error, sizeof(error));
         gl.PixelStorei(GL_UNPACK_ALIGNMENT, align);
         gl.BindTexture(GL_TEXTURE_2D, (unsigned)texture);
         gl.ActiveTexture((GLenum)active);
@@ -184,11 +198,7 @@ void znx_overlay_draw(int width, int height, const char* const* labels, const ch
     gl.Disable(GL_FRAMEBUFFER_SRGB);
     gl.PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     znx_draw_begin_over(0, width, height);
-    for (int i = 0; i < count; ++i) {
-        const float y = 56 + i * 28;
-        znx_draw_text(ZNX_FONT_SMALL, 24, y, labels[i], 0x7D7986FFu, 0);
-        znx_draw_text(ZNX_FONT_SMALL, 136, y, values[i], 0xEDE9E1FFu, ZNX_TEXT_RIGHT | ZNX_TEXT_TABULAR);
-    }
+    znx_ui_overlay(labels, values, count);
     znx_draw_end();
 
     /* everything back as GLideN64 left it */

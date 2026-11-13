@@ -18,7 +18,12 @@
  *                                         release server ws://216.128.157.98:8080/ws
  *   lobby_stun=off|host:port              STUN for the lobby's ICE; empty = the server's (RMG-K's behaviour)
  *   lobby_bind=a.b.c.d                    the ICE agents' local address; empty = this console's own address
- * The three lobby_ keys are read only: the menu never writes them (other lines of the file are kept). */
+ *   theme=auto|light|dark                 the start screen's theme; auto (default) follows the console's
+ *                                         Basic White / Basic Black setting
+ *   debug_glyphs=0|1                      1: the start screen opens on a page of the console's button glyphs
+ *                                         with their code points (to check them from a screenshot)
+ * The three lobby_ keys, theme and debug_glyphs are read only: the menu never writes them (other lines of
+ * the file are kept). */
 #ifndef ZNX_SETTINGS_H
 #define ZNX_SETTINGS_H
 
@@ -42,6 +47,8 @@ struct znx_menu_settings {
     char lobby_server[160];
     char lobby_stun[128];
     char lobby_bind[64];
+    char theme[8];    /* "auto", "light" or "dark" */
+    int debug_glyphs;
 };
 
 /* Defaults, then whatever the file says. */

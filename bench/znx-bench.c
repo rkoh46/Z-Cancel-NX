@@ -80,6 +80,15 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--rollback-test") && i + 2 < argc) { o.rb_a = atoi(argv[++i]); o.rb_b = atoi(argv[++i]); }
         else if (!strcmp(a, "--check-every") && i + 1 < argc) o.check_every = atoi(argv[++i]);
         else if (!strcmp(a, "--check-skip") && i + 2 < argc) { o.check_skip_lo = strtol(argv[++i], NULL, 16) & 0x7fffff; o.check_skip_hi = strtol(argv[++i], NULL, 16) & 0x7fffff; }
+        else if (!strcmp(a, "--vs") && i + 2 < argc) {   /* --vs STAGE F1,F2[,F3,F4]: a forced VS match of level 9 CPUs */
+            o.vs_stage = (int)strtol(argv[++i], NULL, 0);
+            char* list = argv[++i];
+            for (int port = 0; port < 4 && list != NULL && *list; ++port) {
+                o.vs_fighters[port] = *list == '-' ? -1 : (int)strtol(list, NULL, 0);
+                list = strchr(list, ',');
+                if (list != NULL) list++;
+            }
+        }
         else if (!strcmp(a, "--rollback-stress") && i + 2 < argc) { o.stress_every = atoi(argv[++i]); o.stress_depth = atoi(argv[++i]); }
         else if (!strcmp(a, "--watch") && i + 1 < argc) o.watch = strtol(argv[++i], NULL, 16) & 0x7fffff;
         else if (!strcmp(a, "--dump-ram") && i + 2 < argc) { o.dump_frame = atoi(argv[++i]); o.dump_path = argv[++i]; }

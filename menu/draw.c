@@ -105,9 +105,9 @@ GL_FUNCTIONS(DECLARE)
 
 /* ---- state ---- */
 
-static const int l_font_px[ZNX_FONT_COUNT] = { 18, 22, 28, 36 };
+static const int l_font_px[ZNX_FONT_COUNT] = { 18, 20, 22, 28, 40 };
 /* Baseline to baseline in wrapped text, on the 4-pixel grid. */
-static const float l_line_step[ZNX_FONT_COUNT] = { 24, 32, 36, 44 };
+static const float l_line_step[ZNX_FONT_COUNT] = { 24, 28, 32, 40, 52 };
 
 #define ATLAS 1024
 #define FIRST_CHAR 32
@@ -115,6 +115,10 @@ static const float l_line_step[ZNX_FONT_COUNT] = { 24, 32, 36, 44 };
 static const unsigned l_extra_chars[] = { 0x00B7, 0x2026, 0x2013, 0x2014, 0x2019, 0x00D7, 0x2192, 0x2190, 0x2212, 0x00A0 };
 #define EXTRA_COUNT (sizeof(l_extra_chars) / sizeof(l_extra_chars[0]))
 #define GLYPHS (LAST_CHAR - FIRST_CHAR + 1 + EXTRA_COUNT)
+/* The symbol font's range: the console's button glyphs. */
+#define SYM_FIRST 0xE0A0u
+#define SYM_LAST 0xE0FFu
+#define SYM_COUNT (SYM_LAST - SYM_FIRST + 1)
 
 struct glyph {
     short x, y, w, h;      /* in the atlas */
@@ -125,19 +129,20 @@ struct glyph {
 
 struct font {
     struct glyph glyphs[GLYPHS];
+    struct glyph symbols[SYM_COUNT];
     float line_height, cap_height, tabular_advance;
 };
 
 struct vertex {
     float x, y, u, v;
     float lx, ly, hx, hy;   /* position inside the shape relative to its centre, and the shape's half size */
-    float radius, mode;     /* mode 0: atlas alpha; 1: rounded box */
+    float radius, mode;     /* mode 0: atlas alpha; 1: rounded box; 2: its outline, u pixels wide */
     uint8_t r, g, b, a;
 };
 
 #define MARK_SIZES 2
-/* Rasterised at the sizes drawn (the header's 28-pixel letter is a 30-pixel square), so the cut stays sharp. */
-static const int l_mark_px[MARK_SIZES] = { 30, 160 };
+/* Rasterised at the sizes drawn (the header's 22.5-pixel letter is a 24-pixel square), so the cut stays sharp. */
+static const int l_mark_px[MARK_SIZES] = { 24, 160 };
 
 static struct {
     int ready;
@@ -149,10 +154,21 @@ static struct {
     int count, capacity;
     int width, height;
     FT_Library library;
-    FT_Face face;
+    FT_Face face, symbol_face;
     uint8_t* pixels;        /* the atlas while it is built */
     int pen_x, pen_y, row_h;
 } g;
+
+/* Set before znx_draw_init, which clears g. */
+static const void* l_symbol_data;
+static size_t l_symbol_size;
+static unsigned l_frames;       /* frames drawn, for the selection outline's pulse */
+
+void znx_draw_set_symbol_font(const void* font_data, size_t font_size)
+{
+    l_symbol_data = font_data;
+    l_symbol_size = font_data != NULL ? font_size : 0;
+}
 
 /* ---- shaders ---- */
 
@@ -180,6 +196,7 @@ static const char* l_fragment_shader =
     "        vec2 q = abs(v_local.xy) - v_local.zw + vec2(r);\n"
     "        float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - r;\n"
     "        alpha = clamp(0.5 - d, 0.0, 1.0);\n"
+    "        if (v_shape.y > 1.5) alpha *= clamp(0.5 + d + v_uv.x, 0.0, 1.0);\n"
     "    }\n"
     "    o_color = vec4(v_color.rgb, v_color.a * alpha);\n"
     "}\n";
@@ -285,33 +302,49 @@ static int glyph_index(unsigned code)
     return -1;
 }
 
+/* One glyph into the atlas. 0 only when the atlas is full; a glyph the face lacks stays absent. */
+static int load_glyph(FT_Face face, unsigned code, struct glyph* gl)
+{
+    FT_UInt id = FT_Get_Char_Index(face, code);
+    FT_Bitmap* bitmap;
+    int x, y;
+    memset(gl, 0, sizeof(*gl));
+    if (id == 0 || FT_Load_Glyph(face, id, FT_LOAD_TARGET_LIGHT) != 0 ||
+        FT_Render_Glyph(face->glyph, FT_RENDER_MODE_LIGHT) != 0)
+        return 1;
+    bitmap = &face->glyph->bitmap;
+    if (!atlas_place((int)bitmap->width, (int)bitmap->rows, &x, &y))
+        return 0;
+    for (unsigned r = 0; r < bitmap->rows; ++r)
+        memcpy(g.pixels + (y + r) * ATLAS + x, bitmap->buffer + r * bitmap->pitch, bitmap->width);
+    gl->x = (short)x; gl->y = (short)y;
+    gl->w = (short)bitmap->width; gl->h = (short)bitmap->rows;
+    gl->left = (short)face->glyph->bitmap_left;
+    gl->top = (short)face->glyph->bitmap_top;
+    gl->advance = face->glyph->advance.x / 64.0f;
+    gl->present = 1;
+    return 1;
+}
+
 static int build_font(int index, char* error, size_t error_size)
 {
     struct font* font = &g.fonts[index];
     FT_Set_Pixel_Sizes(g.face, 0, (FT_UInt)l_font_px[index]);
     font->line_height = l_line_step[index];
     font->tabular_advance = 0;
-    for (int i = 0; i < (int)GLYPHS; ++i) {
-        struct glyph* gl = &font->glyphs[i];
-        FT_UInt id = FT_Get_Char_Index(g.face, glyph_code(i));
-        int x, y;
-        memset(gl, 0, sizeof(*gl));
-        if (id == 0 || FT_Load_Glyph(g.face, id, FT_LOAD_TARGET_LIGHT) != 0 ||
-            FT_Render_Glyph(g.face->glyph, FT_RENDER_MODE_LIGHT) != 0)
-            continue;
-        FT_Bitmap* bitmap = &g.face->glyph->bitmap;
-        if (!atlas_place((int)bitmap->width, (int)bitmap->rows, &x, &y)) {
+    for (int i = 0; i < (int)GLYPHS; ++i)
+        if (!load_glyph(g.face, glyph_code(i), &font->glyphs[i])) {
             snprintf(error, error_size, "menu: the glyph atlas is full");
             return 0;
         }
-        for (unsigned r = 0; r < bitmap->rows; ++r)
-            memcpy(g.pixels + (y + r) * ATLAS + x, bitmap->buffer + r * bitmap->pitch, bitmap->width);
-        gl->x = (short)x; gl->y = (short)y;
-        gl->w = (short)bitmap->width; gl->h = (short)bitmap->rows;
-        gl->left = (short)g.face->glyph->bitmap_left;
-        gl->top = (short)g.face->glyph->bitmap_top;
-        gl->advance = g.face->glyph->advance.x / 64.0f;
-        gl->present = 1;
+    /* The button glyphs, at the two sizes they are drawn in (the footer's hints, the glyph check). */
+    if (g.symbol_face != NULL && (index == ZNX_FONT_ROW || index == ZNX_FONT_BODY)) {
+        FT_Set_Pixel_Sizes(g.symbol_face, 0, (FT_UInt)l_font_px[index]);
+        for (unsigned i = 0; i < SYM_COUNT; ++i)
+            if (!load_glyph(g.symbol_face, SYM_FIRST + i, &font->symbols[i])) {
+                snprintf(error, error_size, "menu: the glyph atlas is full");
+                return 0;
+            }
     }
     {
         /* Tabular figures for hex and times: the widest of 0-9, A-F. */
@@ -346,6 +379,9 @@ int znx_draw_init(void* (*getproc)(const char*), const void* font_data, size_t f
         FT_Done_FreeType(g.library);
         return 0;
     }
+    /* A symbol font that cannot be read is not an error: the stand-ins are drawn instead. */
+    if (l_symbol_data != NULL && FT_New_Memory_Face(g.library, l_symbol_data, (FT_Long)l_symbol_size, 0, &g.symbol_face) != 0)
+        g.symbol_face = NULL;
     g.pixels = calloc(ATLAS, ATLAS);
     if (g.pixels == NULL) {
         snprintf(error, error_size, "menu: no memory for the glyph atlas");
@@ -365,8 +401,10 @@ int znx_draw_init(void* (*getproc)(const char*), const void* font_data, size_t f
         g.marks[i].x = (short)x; g.marks[i].y = (short)y; g.marks[i].size = (short)l_mark_px[i];
     }
     FT_Done_Face(g.face);
+    if (g.symbol_face != NULL) FT_Done_Face(g.symbol_face);
     FT_Done_FreeType(g.library);
     g.face = NULL;
+    g.symbol_face = NULL;
     g.library = NULL;
 
     p_glGenTextures(1, &g.atlas);
@@ -438,6 +476,7 @@ void znx_draw_shutdown(void)
     if (g.vao) p_glDeleteVertexArrays(1, &g.vao);
     if (g.atlas) p_glDeleteTextures(1, &g.atlas);
     if (g.face) FT_Done_Face(g.face);
+    if (g.symbol_face) FT_Done_Face(g.symbol_face);
     if (g.library) FT_Done_FreeType(g.library);
     free(g.vertices);
     free(g.pixels);
@@ -459,6 +498,7 @@ void znx_draw_begin(unsigned framebuffer, int width, int height, uint32_t clear)
 {
     g.width = width;
     g.height = height;
+    l_frames++;
     p_glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     p_glViewport(0, 0, width, height);
     p_glDisable(GL_DEPTH_TEST);
@@ -554,15 +594,15 @@ void znx_draw_rect(float x, float y, float w, float h, float radius, uint32_t co
     quad(xy, uv, local, hx, hy, radius, 1.0f, color);
 }
 
-void znx_draw_slant(float x, float y, float w, float h, float shear, uint32_t color)
+void znx_draw_ring(float x, float y, float w, float h, float radius, float thickness, uint32_t color)
 {
     const float m = 1.0f, hx = w / 2, hy = h / 2;
-    const float top = shear * (h + 2 * m) / 2, bottom = -top;
-    const float xy[4][2] = { { x - m + top, y - m }, { x + w + m + top, y - m },
-                             { x + w + m + bottom, y + h + m }, { x - m + bottom, y + h + m } };
-    const float uv[4][2] = { { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 } };
+    const float xy[4][2] = { { x - m, y - m }, { x + w + m, y - m }, { x + w + m, y + h + m }, { x - m, y + h + m } };
+    const float uv[4][2] = { { thickness, 0 }, { thickness, 0 }, { thickness, 0 }, { thickness, 0 } };
     const float local[4][2] = { { -hx - m, -hy - m }, { hx + m, -hy - m }, { hx + m, hy + m }, { -hx - m, hy + m } };
-    quad(xy, uv, local, hx, hy, 0.0f, 1.0f, color);
+    if (radius > hx) radius = hx;
+    if (radius > hy) radius = hy;
+    quad(xy, uv, local, hx, hy, radius, 2.0f, color);
 }
 
 static void atlas_quad(float x, float y, float w, float h, int ax, int ay, int aw, int ah, uint32_t color)
@@ -614,14 +654,38 @@ static int tabular_char(unsigned code)
     return (code >= '0' && code <= '9') || (code >= 'A' && code <= 'F');
 }
 
+static const struct glyph* find_glyph(const struct font* font, unsigned code)
+{
+    int index;
+    if (code >= SYM_FIRST && code <= SYM_LAST)
+        return font->symbols[code - SYM_FIRST].present ? &font->symbols[code - SYM_FIRST] : NULL;
+    index = glyph_index(code);
+    if (index >= 0 && !font->glyphs[index].present) {
+        /* a font without this punctuation: the nearest plain character, so nothing vanishes from a sentence */
+        static const unsigned stand_in[][2] = {
+            { 0x2212, 0x2013 }, { 0x2013, '-' }, { 0x2014, '-' }, { 0x00A0, ' ' }, { 0x2019, '\'' }, { 0x00D7, 'x' },
+            { 0x00B7, '-' }, { 0x2192, '>' }, { 0x2190, '<' }, { 0x2026, '.' },
+        };
+        for (unsigned i = 0; i < sizeof(stand_in) / sizeof(stand_in[0]); ++i)
+            if (stand_in[i][0] == code)
+                return find_glyph(font, stand_in[i][1]);
+    }
+    return index >= 0 ? &font->glyphs[index] : NULL;
+}
+
 static float advance(const struct font* font, unsigned code, int flags)
 {
-    int index = glyph_index(code);
-    if (index < 0)
+    const struct glyph* gl = find_glyph(font, code);
+    if (gl == NULL)
         return 0;
     if ((flags & ZNX_TEXT_TABULAR) && tabular_char(code))
         return font->tabular_advance;
-    return font->glyphs[index].advance;
+    return gl->advance;
+}
+
+int znx_draw_has_symbol(unsigned code)
+{
+    return g.ready && code >= SYM_FIRST && code <= SYM_LAST && g.fonts[ZNX_FONT_ROW].symbols[code - SYM_FIRST].present;
 }
 
 float znx_text_width(int font_id, const char* text, int flags)
@@ -644,10 +708,9 @@ float znx_draw_text(int font_id, float x, float y, const char* text, uint32_t co
     y = floorf(y + 0.5f);
     while (*text) {
         unsigned code = next_code(&text);
-        int index = glyph_index(code);
-        if (index < 0)
+        const struct glyph* gl = find_glyph(font, code);
+        if (gl == NULL)
             continue;
-        const struct glyph* gl = &font->glyphs[index];
         float step = advance(font, code, flags);
         float offset = (flags & ZNX_TEXT_TABULAR) && tabular_char(code) ? (step - gl->advance) / 2 : 0;
         if (gl->present && gl->w > 0)
@@ -666,7 +729,7 @@ int znx_draw_wrapped(int font, float x, float y, float width, const char* text, 
     int lines = 0;
     const float step = g.fonts[font].line_height;
     while (*text) {
-        /* The longest run of whole words that fits; a single word longer than the line is cut. */
+        /* The longest run of whole words that fits. */
         size_t best = 0, length = 0;
         const char* p = text;
         while (*p == ' ') p++;
@@ -686,6 +749,11 @@ int znx_draw_wrapped(int font, float x, float y, float width, const char* text, 
         if (best >= sizeof(line)) best = sizeof(line) - 1;
         memcpy(line, text, best);
         line[best] = '\0';
+        /* a single word wider than the line (a path, a file name) is broken where it stops fitting */
+        while (best > 1 && strchr(line, ' ') == NULL && znx_text_width(font, line, 0) > width) {
+            do best--; while (best > 1 && ((unsigned char)text[best] & 0xC0) == 0x80);
+            line[best] = '\0';
+        }
         if (color != 0)
             znx_draw_text(font, x, y + lines * step, line, color, 0);
         lines++;
@@ -718,4 +786,127 @@ void znx_text_fit_flags(int font, const char* text, float width, char* out, size
         if (znx_text_width(font, out, flags) <= width)
             return;
     }
+}
+
+/* ---- controller buttons in text ---- */
+
+/* The Nintendo Extended font's private-use code points, as the open Switch libraries use them (Borealis's
+ * hints, nx-hbmenu): the filled set from U+E0E0. debug_glyphs=1 shows them all for checking on a console. */
+static const struct { const char* key; unsigned codes[2]; const char* letter; } l_buttons[] = {
+    { "A", { 0xE0E0, 0 }, "A" }, { "B", { 0xE0E1, 0 }, "B" }, { "X", { 0xE0E2, 0 }, "X" }, { "Y", { 0xE0E3, 0 }, "Y" },
+    { "L", { 0xE0E4, 0 }, "L" }, { "R", { 0xE0E5, 0 }, "R" }, { "ZL", { 0xE0E6, 0 }, "ZL" }, { "ZR", { 0xE0E7, 0 }, "ZR" },
+    { "+", { 0xE0EF, 0 }, "+" }, { "-", { 0xE0F0, 0 }, "\xE2\x88\x92" },
+    { "LR", { 0xE0ED, 0xE0EE }, NULL }, { "DPAD", { 0xE0EA, 0 }, NULL }, { "LS", { 0xE0C1, 0 }, "L" },
+};
+
+static int find_button(const char* key)
+{
+    for (int i = 0; i < (int)(sizeof(l_buttons) / sizeof(l_buttons[0])); ++i)
+        if (strcmp(l_buttons[i].key, key) == 0)
+            return i;
+    return -1;
+}
+
+int znx_button_codes(const char* key, unsigned codes[2])
+{
+    const int i = find_button(key);
+    codes[0] = codes[1] = 0;
+    if (i < 0)
+        return 0;
+    codes[0] = l_buttons[i].codes[0];
+    codes[1] = l_buttons[i].codes[1];
+    return codes[1] ? 2 : 1;
+}
+
+static void put_code(char* out, unsigned code)
+{
+    out[0] = (char)(0xE0 | (code >> 12));
+    out[1] = (char)(0x80 | ((code >> 6) & 0x3F));
+    out[2] = (char)(0x80 | (code & 0x3F));
+    out[3] = '\0';
+}
+
+float znx_draw_button(int font, float x, float baseline, const char* key, uint32_t color, uint32_t knock, int draw)
+{
+    const int i = find_button(key);
+    const float cap = g.fonts[font].cap_height;
+    const float d = floorf(cap * 1.5f + 0.5f);          /* a 22-pixel line: a 24-pixel disc */
+    const float cy = floorf(baseline - cap / 2 + 0.5f);
+    if (i >= 0) {
+        const struct font* f = &g.fonts[font];
+        const unsigned a = l_buttons[i].codes[0], b = l_buttons[i].codes[1];
+        if (find_glyph(f, a) != NULL && (b == 0 || find_glyph(f, b) != NULL)) {
+            char text[8];
+            float w;
+            put_code(text, a);
+            if (b != 0) put_code(text + 3, b);
+            w = znx_text_width(font, text, 0);
+            if (draw) znx_draw_text(font, x, baseline, text, color, 0);
+            return w;
+        }
+    }
+    if (i >= 0 && l_buttons[i].letter == NULL) {
+        /* the D-pad: a cross; for "LR" the up and down arms are quieter */
+        const float arm = floorf(d / 3 + 0.5f), cx = x + d / 2;
+        if (draw) {
+            const uint32_t quiet = strcmp(key, "LR") == 0 ? (color & 0xFFFFFF00u) | 0x66u : color;
+            znx_draw_rect(cx - arm / 2, cy - d / 2, arm, d, 2, quiet);
+            znx_draw_rect(x, cy - arm / 2, d, arm, 2, color);
+        }
+        return d;
+    }
+    {
+        /* a disc with the letter; two letters make it a pill */
+        const char* letter = i >= 0 ? l_buttons[i].letter : key;
+        const float tw = znx_text_width(ZNX_FONT_SMALL, letter, 0);
+        const float w = tw + 8 > d ? floorf(tw + 12.5f) : d;
+        if (draw) {
+            znx_draw_rect(x, cy - d / 2, w, d, d / 2, color);
+            znx_draw_text(ZNX_FONT_SMALL, x + w / 2, cy + g.fonts[ZNX_FONT_SMALL].cap_height / 2, letter, knock, ZNX_TEXT_CENTER);
+        }
+        return w;
+    }
+}
+
+/* ---- the theme ---- */
+
+/* The colours of the console's two themes as the open Switch libraries approximate them (Borealis's theme
+ * values, MIT; see THIRD_PARTY_NOTICES.md). */
+static const struct znx_theme l_themes[2] = {
+    {   /* Basic White */
+        0xEBEBEBFFu, 0xF0F0F0FFu, 0xFCFFF8FFu,
+        0x2D2D2DFFu, 0x828282FFu, 0xA8A8A8FFu,
+        0x2D2D2DFFu, 0xCFCFCFFFu,
+        0x3250F0FFu,
+        0x0DB6D5FFu, 0x50EFD9FFu,
+        0x1E9E5AFFu, 0xD9412FFFu,
+    },
+    {   /* Basic Black */
+        0x2D2D2DFFu, 0x323232FFu, 0x1F2227FFu,
+        0xFFFFFFFFu, 0xA3A3A3FFu, 0x787878FFu,
+        0xFFFFFFFFu, 0x4E4E4EFFu,
+        0x00FFCCFFu,
+        0x198AC6FFu, 0x89F1F2FFu,
+        0x6ED478FFu, 0xFF6A5AFFu,
+    },
+};
+static int l_dark;
+static float l_freeze = -1.0f;
+
+void znx_theme_set(int dark) { l_dark = dark != 0; }
+int znx_theme_is_dark(void) { return l_dark; }
+const struct znx_theme* znx_theme(void) { return &l_themes[l_dark]; }
+void znx_theme_freeze(float phase) { l_freeze = phase; }
+
+uint32_t znx_theme_highlight(void)
+{
+    const struct znx_theme* t = &l_themes[l_dark];
+    /* a sine between the two colours, one cycle in 72 frames */
+    const float k = l_freeze >= 0 ? l_freeze : 0.5f - 0.5f * cosf((float)(l_frames % 72) / 72.0f * 6.2831853f);
+    uint32_t out = 0;
+    for (int shift = 24; shift >= 8; shift -= 8) {
+        const float a = (float)((t->highlight_a >> shift) & 255), b = (float)((t->highlight_b >> shift) & 255);
+        out |= (uint32_t)(a + (b - a) * k + 0.5f) << shift;
+    }
+    return out | 0xFFu;
 }

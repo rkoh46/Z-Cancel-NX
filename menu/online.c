@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-/* See online.h. The screens follow the start screen (menu.c): a list on the left, a detail panel on
- * the right, the Switch's button letters at the bottom, one yellow accent for the selection marker and
- * the connect code. Copy says what happens and what to do next, in the player's words. */
+/* See online.h. The screens follow the start screen (menu.c, menu_ui.h): the console's system look, a
+ * list of rows on the left, a detail pane on the right, the button hints at the bottom, the accent colour
+ * for values and the connect code. Copy says what happens and what to do next, in the player's words. */
 
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic ignored "-Wformat-truncation"
@@ -517,26 +517,17 @@ static void setting_delay_text(const struct znx_menu_settings* set, char* out, s
 
 static void draw_menu(void)
 {
-    const struct hint hints[] = { { "A", "Choose" }, { "B", "Back" } };
+    const struct hint hints[] = { { "A", "OK" }, { "B", "Back" } };
     static const char* const titles[MENU_ROWS] = { "Host a game", "Join with a code", "Join by IP address",
                                                    "Public games", "Lobby" };
-    const char* status[MENU_ROWS] = {
-        "Others join you with your connect code",
-        "The host's code, like ABC@12",
-        "For a player on your network, or a forwarded port",
-        "",
-        "RMG-K's rooms: matches of up to four players",
-    };
     const struct znx_menu_settings* set = l.request.settings;
-    char title[160], delay[32], port[16], list_status[160];
+    char title[160], delay[32], port[16];
     float y = LIST_Y;
-    snprintf(list_status, sizeof(list_status), "Hosts waiting with %s", l.request.title);
-    status[ROW_LIST] = list_status;
     snprintf(title, sizeof(title), "Online \xC2\xB7 %s", l.request.title);
     znx_ui_title(title);
     for (int i = 0; i < MENU_ROWS; ++i) {
-        znx_ui_row(y, ROW_H, l.row == i, titles[i], C_TEXT1, status[i], C_TEXT2, 0, NULL);
-        y += ROW_H + ROW_GAP;
+        znx_ui_row(y, l.row == i, titles[i], C_TEXT1, NULL, 0, 0);
+        y += ROW_H;
     }
     setting_delay_text(set, delay, sizeof(delay));
     snprintf(port, sizeof(port), "UDP %d", set->p2p_port);
@@ -551,20 +542,21 @@ static void draw_menu(void)
             fields[count++] = (struct field){ "Delay", delay, 0 };
             fields[count++] = (struct field){ "Port", port, 1 };
             fields[count++] = (struct field){ "Listed", set->public_list ? "On the public list" : "Not listed", 0 };
-            paragraph = "You are player 1. The other player joins with your code from RMG-K's Peer to Peer window or "
-                        "from another Switch.";
+            paragraph = "Others join you with your connect code. You are player 1. The other player joins from "
+                        "RMG-K's Peer to Peer window or from another Switch.";
             note = "Name, delay and the public list are in Settings.";
             break;
         case ROW_CODE:
             fields[count++] = (struct field){ "Name", set->name, 0 };
-            paragraph = "You are player 2. The host's code finds them through RMG-K's connect-code server, which also "
-                        "opens the way through both routers.";
+            paragraph = "Type the host's code, like ABC@12. You are player 2. The code finds the host through "
+                        "RMG-K's connect-code server, which also opens the way through both routers.";
             note = "The host's delay is used for the match.";
             break;
         case ROW_IP:
             fields[count++] = (struct field){ "Name", set->name, 0 };
-            paragraph = "You are player 2. Type the address the host sees on their screen. Over the internet the host "
-                        "must forward that UDP port on their router.";
+            paragraph = "For a player on your network, or a forwarded port. You are player 2. Type the address the "
+                        "host sees on their screen. Over the internet the host must forward that UDP port on their "
+                        "router.";
             note = "Without a port, 27886 is used, RMG-K's default.";
             break;
         case ROW_LIST:
@@ -577,8 +569,8 @@ static void draw_menu(void)
             snprintf(server, sizeof(server), "%s", set->lobby_server[0] ? set->lobby_server : ZNX_LOBBY_URL_RELEASE);
             fields[count++] = (struct field){ "Name", set->name, 0 };
             fields[count++] = (struct field){ "Server", server, 1 };
-            paragraph = "RMG-K's Join Rollback Netplay lobby: open a room or join one with this game, then play "
-                        "against RMG-K players and other Switches.";
+            paragraph = "RMG-K's Join Rollback Netplay lobby, for matches of up to four players: open a room or join "
+                        "one with this game, then play against RMG-K players and other Switches.";
             note = "Your controller plays whatever seat the room gives you.";
             break;
         }
@@ -588,56 +580,56 @@ static void draw_menu(void)
     znx_ui_footer(hints, 2, NULL);
 }
 
-/* The connect code, the screen's one bright moment: big, tabular, in the accent. */
-static void draw_code_card(float y, const struct znx_p2p_status* s)
+/* The connect code, the screen's one large figure, in the accent. Returns the bottom. */
+static float draw_code(float y, const struct znx_p2p_status* s)
 {
-    const float h = 168;
-    char line[128];
-    znx_draw_rect(LIST_X, y, LIST_W, h, 16, C_CARD);
-    znx_draw_slant(LIST_X + 24, y + 76, 6, 40, SLANT, C_ACCENT);
+    const float x = LIST_X + ROW_PAD, w = LIST_W - 2 * ROW_PAD;
+    char line[128], fitted[128];
     if (s->code[0]) {
-        znx_draw_text(ZNX_FONT_SMALL, LIST_X + 48, y + 44, "Your connect code", C_TEXT3, 0);
-        znx_draw_text(ZNX_FONT_TITLE, LIST_X + 48, y + 108, s->code, C_ACCENT, ZNX_TEXT_TABULAR);
-        znx_draw_text(ZNX_FONT_SMALL, LIST_X + 48, y + 144, "The same code every time this console hosts", C_TEXT3, 0);
+        znx_draw_text(ZNX_FONT_SMALL, x, y + 20, "Your connect code", C_TEXT2, 0);
+        znx_draw_text(ZNX_FONT_BIG, x, y + 76, s->code, C_ACCENT, 0);
+        znx_draw_text(ZNX_FONT_SMALL, x, y + 112, "The same code every time this console hosts", C_TEXT2, 0);
     } else if (s->code_state == 2) {
-        znx_draw_text(ZNX_FONT_SMALL, LIST_X + 48, y + 44, "No connect code yet: join by address", C_TEXT3, 0);
+        znx_draw_text(ZNX_FONT_SMALL, x, y + 20, "No connect code yet: join by address", C_TEXT2, 0);
         if (s->public_address[0])
             snprintf(line, sizeof(line), "%s", s->public_address);
         else if (l.local_ip[0])
             snprintf(line, sizeof(line), "%s:%d", l.local_ip, s->port);
         else
             snprintf(line, sizeof(line), "Port %d", s->port);
-        znx_draw_text(ZNX_FONT_TITLE, LIST_X + 48, y + 108, line, C_TEXT1, ZNX_TEXT_TABULAR);
-        znx_draw_text(ZNX_FONT_SMALL, LIST_X + 48, y + 144, "The connect-code server does not answer; still asking",
-                      C_TEXT3, 0);
+        znx_text_fit(ZNX_FONT_BIG, line, w, fitted, sizeof(fitted));
+        znx_draw_text(ZNX_FONT_BIG, x, y + 76, fitted, C_TEXT1, 0);
+        znx_draw_text(ZNX_FONT_SMALL, x, y + 112, "The connect-code server does not answer; still asking", C_TEXT2, 0);
     } else {
-        znx_draw_text(ZNX_FONT_SMALL, LIST_X + 48, y + 44, "Your connect code", C_TEXT3, 0);
-        znx_draw_text(ZNX_FONT_ROW, LIST_X + 48, y + 100, "Asking the connect-code server", C_TEXT2, 0);
+        znx_draw_text(ZNX_FONT_SMALL, x, y + 20, "Your connect code", C_TEXT2, 0);
+        znx_draw_text(ZNX_FONT_ROW, x, y + 68, "Asking the connect-code server", C_TEXT2, 0);
     }
+    return y + 136;
 }
 
 static void draw_host(const struct znx_p2p_status* s)
 {
     const struct hint hints[] = { { "B", "Stop hosting" } };
     const struct znx_menu_settings* set = l.request.settings;
-    char lan[96], delay[48], port[16], listed[64];
+    char lan[96], delay[48], port[16];
     float y = LIST_Y;
     znx_ui_title("Waiting for a player");
-    draw_code_card(y, s);
-    y += 168 + 16;
+    y = draw_code(y, s);
     if (l.local_ip[0])
         snprintf(lan, sizeof(lan), "%s:%d", l.local_ip, s->port);
     else
         snprintf(lan, sizeof(lan), "Port %d", s->port);
-    znx_ui_row(y, 56, 0, "On your network", C_TEXT2, NULL, 0, 0, lan);
-    y += 56 + 4;
-    snprintf(listed, sizeof(listed), "%s", set->public_list ? (s->enlisted ? "Listed" : "Listing") : "Off");
-    znx_ui_row(y, 56, 0, "Public list", C_TEXT2, NULL, 0, 0, listed);
-    y += 56 + 4;
+    znx_ui_row(y, 0, "On your network", C_TEXT1, lan, C_ACCENT, 0);
+    y += ROW_H;
+    if (set->public_list)
+        znx_ui_row(y, 0, "Public list", C_TEXT1, s->enlisted ? "Listed" : "Listing", s->enlisted ? C_ACCENT : C_TEXT2, 0);
+    else
+        znx_ui_row(y, 0, "Public list", C_TEXT1, "Off", C_TEXT2, 0);
+    y += ROW_H;
     if (s->message[0]) {
         char fitted[200];
-        znx_text_fit(ZNX_FONT_SMALL, s->message, LIST_W - 64, fitted, sizeof(fitted));
-        znx_draw_text(ZNX_FONT_SMALL, LIST_X + 32, y + 28, fitted, C_TEXT2, 0);
+        znx_text_fit(ZNX_FONT_SMALL, s->message, LIST_W - 2 * ROW_PAD, fitted, sizeof(fitted));
+        znx_draw_text(ZNX_FONT_SMALL, LIST_X + ROW_PAD, y + 40, fitted, C_TEXT2, 0);
     }
     setting_delay_text(set, delay, sizeof(delay));
     snprintf(port, sizeof(port), "UDP %d", s->port);
@@ -664,23 +656,10 @@ static void draw_joining(void)
     char code[32], title[160];
     const int by_code = znx_p2p_normalize_code(l.join_target, code, sizeof(code));
     const char* steps[2] = { by_code ? "Find the host" : "Call the host", "Log in and get the host's settings" };
-    float y = LIST_Y;
     snprintf(title, sizeof(title), "Joining %s", by_code ? code : l.join_target);
     znx_ui_title(title);
-    for (int i = 0; i < 2; ++i) {
-        const int current = i == 0;
-        const float h = current ? 104 : 64;
-        if (current) {
-            znx_draw_rect(LIST_X, y, LIST_W, h, 12, C_SELECTED);
-            znx_draw_slant(LIST_X + 12, y + 16, 6, 40, SLANT, C_ACCENT);
-        }
-        znx_draw_text(ZNX_FONT_ROW, LIST_X + 32, y + (current ? 36 : 42), steps[i], current ? C_TEXT1 : C_TEXT3, 0);
-        if (current)
-            znx_draw_text(ZNX_FONT_SMALL, LIST_X + 32, y + 76,
-                          by_code ? "Asking RMG-K's connect-code server where the host is" : "Waiting for the host to answer",
-                          C_TEXT2, 0);
-        y += h + ROW_GAP;
-    }
+    znx_ui_steps(LIST_Y, steps, 2, 0, NULL,
+                 by_code ? "Asking RMG-K's connect-code server where the host is" : "Waiting for the host to answer", -1);
     {
         const struct field fields[] = {
             { by_code ? "Code" : "Address", by_code ? code : l.join_target, 1 },
@@ -697,19 +676,24 @@ static void draw_joining(void)
     znx_ui_footer(hints, 1, NULL);
 }
 
-/* One player before the match: port number, name, ready state, and who it is. */
+/* One player before the match: port, name and who it is, ready or not at the right. */
 static void draw_player(float y, int port, const char* name, int ready, const char* role)
 {
+    const float base = y + ROW_H / 2 + znx_cap_height(ZNX_FONT_ROW) / 2, right = LIST_X + LIST_W - ROW_PAD;
+    const char* state = ready ? "Ready" : "Not ready";
+    const float state_w = znx_text_width(ZNX_FONT_ROW, state, 0);
+    const float role_w = role[0] ? znx_text_width(ZNX_FONT_SMALL, role, 0) + 12 : 0;
     char label[8], fitted[64];
-    znx_draw_rect(LIST_X, y, LIST_W, ROW_H, 12, C_CARD);
+    float x = LIST_X + ROW_PAD + 44;
+    znx_ui_row_frame(y, 0);
     snprintf(label, sizeof(label), "P%d", port);
-    znx_draw_text(ZNX_FONT_BODY, LIST_X + 24, y + 36, label, C_TEXT3, ZNX_TEXT_TABULAR);
-    znx_text_fit(ZNX_FONT_ROW, name, LIST_W - 220, fitted, sizeof(fitted));
-    znx_draw_text(ZNX_FONT_ROW, LIST_X + 72, y + 36, fitted, C_TEXT1, 0);
-    znx_draw_rect(LIST_X + 72, y + 64 - znx_cap_height(ZNX_FONT_SMALL) / 2 - 4, 8, 8, 4, ready ? C_READY : C_TEXT3);
-    znx_draw_text(ZNX_FONT_SMALL, LIST_X + 88, y + 64, ready ? "Ready" : "Not ready", ready ? C_TEXT1 : C_TEXT2, 0);
+    znx_draw_text(ZNX_FONT_ROW, LIST_X + ROW_PAD, base, label, C_TEXT2, 0);
+    znx_text_fit(ZNX_FONT_ROW, name, right - state_w - 40 - role_w - x, fitted, sizeof(fitted));
+    x += znx_draw_text(ZNX_FONT_ROW, x, base, fitted, C_TEXT1, 0) + 12;
     if (role[0])
-        znx_draw_text(ZNX_FONT_BODY, LIST_X + LIST_W - 24, y + 36, role, C_TEXT2, ZNX_TEXT_RIGHT);
+        znx_draw_text(ZNX_FONT_SMALL, x, base, role, C_TEXT2, 0);
+    znx_draw_text(ZNX_FONT_ROW, right, base, state, ready ? C_TEXT1 : C_TEXT2, ZNX_TEXT_RIGHT);
+    znx_draw_rect(right - state_w - 16, y + ROW_H / 2 - 4, 8, 8, 4, ready ? C_READY : C_TEXT3);
 }
 
 static void draw_lobby(const struct znx_p2p_status* s)
@@ -726,21 +710,25 @@ static void draw_lobby(const struct znx_p2p_status* s)
     const int r1 = s->host ? s->local_ready : s->peer_ready;
     const int r2 = s->host ? s->peer_ready : s->local_ready;
     const int blocked = s->game_mismatch || s->not_rollback || (!s->can_ready && !s->local_ready);
+    const float note_x = LIST_X + ROW_PAD;
     snprintf(title, sizeof(title), "Match with %s", them);
     znx_ui_title(title);
     draw_player(y, 1, p1, r1, s->host ? "You, host" : "Host");
-    y += ROW_H + ROW_GAP;
+    y += ROW_H;
     draw_player(y, 2, p2, r2, s->host ? "" : "You");
-    y += ROW_H + ROW_GAP + 16;
-    if (s->game_mismatch)
-        znx_draw_text(ZNX_FONT_BODY, LIST_X + 24, y + 24, "Not the same game: this match cannot start", C_MISSING, 0);
-    else if (s->not_rollback)
-        znx_draw_text(ZNX_FONT_BODY, LIST_X + 24, y + 24, "The host uses delay-based netplay", C_MISSING, 0);
+    y += ROW_H + 40;
+    if (s->game_mismatch) {
+        znx_draw_rect(note_x, y - 12, 8, 8, 4, C_MISSING);
+        znx_draw_text(ZNX_FONT_BODY, note_x + 16, y, "Not the same game: this match cannot start", C_TEXT1, 0);
+    } else if (s->not_rollback) {
+        znx_draw_rect(note_x, y - 12, 8, 8, 4, C_MISSING);
+        znx_draw_text(ZNX_FONT_BODY, note_x + 16, y, "The host uses delay-based netplay", C_TEXT1, 0);
+    }
     if (!blocked) {
         if (s->local_ready && !s->peer_ready)
-            znx_draw_text(ZNX_FONT_BODY, LIST_X + 24, y + 24, "Waiting for the other player to be ready", C_TEXT2, 0);
+            znx_draw_text(ZNX_FONT_BODY, note_x, y, "Waiting for the other player to be ready", C_TEXT2, 0);
         else if (!s->local_ready && s->peer_ready)
-            znx_draw_text(ZNX_FONT_BODY, LIST_X + 24, y + 24, "They are ready: A starts the match", C_TEXT1, 0);
+            znx_draw_text(ZNX_FONT_BODY, note_x, y, "They are ready: A starts the match", C_TEXT1, 0);
     }
 
     if (s->ping >= 0) snprintf(ping, sizeof(ping), "%d ms", s->ping);
@@ -754,12 +742,13 @@ static void draw_lobby(const struct znx_p2p_status* s)
         const char* note;
         char mismatch[400], app_note[200];
         fields[count++] = (struct field){ "Game", s->host ? l.request.goodname : (s->host_game[0] ? s->host_game : "Asking the host"), 0 };
-        fields[count++] = (struct field){ "Ping", ping, 1 };
+        fields[count++] = (struct field){ "Ping", ping, 0 };
         fields[count++] = (struct field){ "Delay", delay, 0 };
         fields[count++] = (struct field){ "Rollback", prediction, 0 };
         if (s->game_mismatch) {
-            snprintf(mismatch, sizeof(mismatch), "The host plays %s, and you chose %s. Leave, choose the host's game "
-                     "on the first screen and join again.", readable_game(s->host_game), l.request.title);
+            snprintf(mismatch, sizeof(mismatch), "The host plays %s and you chose %s, so the match cannot start. "
+                     "Leave, choose the host's game on the first screen and join again.", readable_game(s->host_game),
+                     l.request.title);
             paragraph = mismatch;
         } else if (s->not_rollback) {
             paragraph = "The host's RMG-K is set to delay-based netplay. Ask them to switch the Peer to Peer window to "
@@ -785,38 +774,39 @@ static void draw_lobby(const struct znx_p2p_status* s)
         znx_ui_footer(s->local_ready ? hints_unready : hints_ready, 2, NULL);
 }
 
+#define LIST_VISIBLE 7
+
 static void draw_list(void)
 {
     const struct hint hints[] = { { "A", "Join" }, { "Y", "Refresh" }, { "B", "Back" } };
     const struct hint hints_empty[] = { { "Y", "Refresh" }, { "B", "Back" } };
-    char count_text[64], status[200];
+    const float x = LIST_X + ROW_PAD, w = LIST_W - 2 * ROW_PAD;
+    char count_text[64];
     znx_ui_title("Public games");
     if (l.list_busy) {
-        znx_draw_text(ZNX_FONT_ROW, LIST_X + 32, LIST_Y + 44, "Looking for games", C_TEXT2, 0);
-        znx_draw_text(ZNX_FONT_SMALL, LIST_X + 32, LIST_Y + 76, l.list_host, C_TEXT3, 0);
+        znx_draw_text(ZNX_FONT_ROW, x, LIST_Y + 44, "Looking for games", C_TEXT1, 0);
+        znx_draw_text(ZNX_FONT_SMALL, x, LIST_Y + 76, l.list_host, C_TEXT2, 0);
     } else if (l.list_error[0]) {
-        znx_draw_text(ZNX_FONT_ROW, LIST_X + 32, LIST_Y + 44, "The list could not be loaded", C_TEXT1, 0);
-        znx_draw_wrapped(ZNX_FONT_BODY, LIST_X + 32, LIST_Y + 84, LIST_W - 64, l.list_error, C_TEXT2);
+        znx_draw_text(ZNX_FONT_ROW, x, LIST_Y + 44, "The list could not be loaded", C_TEXT1, 0);
+        znx_draw_wrapped(ZNX_FONT_BODY, x, LIST_Y + 84, w, l.list_error, C_TEXT2);
     } else if (l.list_count == 0) {
-        char line[200];
-        snprintf(line, sizeof(line), "Nobody is waiting with %s", l.request.title);
-        znx_draw_text(ZNX_FONT_ROW, LIST_X + 32, LIST_Y + 44, line, C_TEXT1, 0);
-        znx_draw_wrapped(ZNX_FONT_BODY, LIST_X + 32, LIST_Y + 84, LIST_W - 64,
-                         "Host a game and turn on Public list in Settings so others find you, or look again in a "
-                         "minute.", C_TEXT2);
+        char line[300];
+        snprintf(line, sizeof(line), "No one is hosting %s on the public list. Host a game and turn on Public list in "
+                 "Settings so others find you, or look again in a minute.", l.request.title);
+        znx_draw_text(ZNX_FONT_ROW, x, LIST_Y + 44, "Nobody is waiting", C_TEXT1, 0);
+        znx_draw_wrapped(ZNX_FONT_BODY, x, LIST_Y + 84, w, line, C_TEXT2);
     } else {
-        const int visible = 5;
-        int first = l.list_row - visible + 1;
+        int first = l.list_row - LIST_VISIBLE + 1;
         float y = LIST_Y;
         if (first < 0) first = 0;
-        for (int i = first; i < l.list_count && i < first + visible; ++i) {
+        for (int i = first; i < l.list_count && i < first + LIST_VISIBLE; ++i) {
             const struct znx_p2p_listing* g = &l.list[i];
             const int same = strcmp(g->app, ZNX_P2P_APP) == 0;
-            snprintf(status, sizeof(status), "%s \xC2\xB7 %s", g->code, g->app);
-            znx_ui_row(y, ROW_H, l.list_row == i, g->user[0] ? g->user : "Unnamed", C_TEXT1, status, C_TEXT2,
-                       same ? 0 : C_MISSING, NULL);
-            y += ROW_H + ROW_GAP;
+            znx_ui_row(y, l.list_row == i, g->user[0] ? g->user : "Unnamed", C_TEXT1, g->code, C_ACCENT,
+                       same ? 0 : C_MISSING);
+            y += ROW_H;
         }
+        znx_ui_scrollbar(LIST_Y, LIST_VISIBLE, first, l.list_count);
     }
     if (l.list_total > 0)
         snprintf(count_text, sizeof(count_text), "%d of %d listed game%s %s this ROM", l.list_count, l.list_total,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /* See menu_switch.h. The menu's own OpenGL 3.3 core context on the shared window surface, the
- * font from the NRO's romfs, every controller (handheld, Joy-Con, Pro, GameCube adapter) read as
+ * console's system font and button glyphs (sysfont_switch.c; the font in the NRO's romfs when the
+ * console does not give them), every controller (handheld, Joy-Con, Pro, GameCube adapter) read as
  * one, and the buffer swap pacing the loop. */
 
 #include "menu_switch.h"
@@ -16,6 +17,7 @@
 
 #include "draw.h"
 #include "screen_switch.h"
+#include "sysfont_switch.h"
 #include "znx_switch.h"
 
 #define FONT_PATH "romfs:/fonts/BarlowSemiCondensed-Medium.ttf"
@@ -31,6 +33,7 @@ static void* getproc(const char* name)
     return (void*)eglGetProcAddress(name);
 }
 
+/* The bundled font, the fallback. */
 static int load_font(void)
 {
     FILE* f;
@@ -55,6 +58,41 @@ static int load_font(void)
     }
     fclose(f);
     l_font_size = (size_t)size;
+    return 1;
+}
+
+/* The renderer with the console's system font and button glyphs; with the bundled font if the console
+ * does not give its own or FreeType cannot read it. */
+static int start_draw(void)
+{
+    const void* standard;
+    const void* extended;
+    size_t standard_size, extended_size;
+    char error[256];
+    static int said;
+    if (znx_sysfont_get(&standard, &standard_size, &extended, &extended_size)) {
+        znx_draw_set_symbol_font(extended, extended_size);
+        if (znx_draw_init(getproc, standard, standard_size, error, sizeof(error))) {
+            if (!said)
+                znx_log("menu: drawing with the system font, button glyphs %s", extended != NULL ? "from the system" : "drawn as stand-ins");
+            said = 1;
+            return 1;
+        }
+        znx_log("menu: the system font cannot be used (%s), using the bundled font", error);
+        znx_draw_shutdown();
+        znx_sysfont_reject();
+    }
+    if (!load_font())
+        return 0;
+    znx_draw_set_symbol_font(extended, extended_size);
+    if (!znx_draw_init(getproc, l_font, l_font_size, error, sizeof(error))) {
+        znx_log("%s", error);
+        znx_draw_shutdown();
+        return 0;
+    }
+    if (!said)
+        znx_log("menu: drawing with the bundled font, button glyphs %s", extended != NULL ? "from the system" : "drawn as stand-ins");
+    said = 1;
     return 1;
 }
 
@@ -120,11 +158,10 @@ enum znx_menu_action znx_menu_switch_run(struct znx_menu* menu)
     EGLSurface surface;
     EGLContext context;
     PadState pad;
-    char error[256];
     enum znx_menu_action action = ZNX_MENU_NONE;
 
     l_failed = true;   /* until the first frame is shown */
-    if (!load_font() || !znx_screen_open())
+    if (!znx_screen_open())
         return ZNX_MENU_QUIT;
     display = znx_screen_display();
     surface = znx_screen_surface();
@@ -140,9 +177,7 @@ enum znx_menu_action znx_menu_switch_run(struct znx_menu* menu)
         return ZNX_MENU_QUIT;
     }
     eglSwapInterval(display, 1);
-    if (!znx_draw_init(getproc, l_font, l_font_size, error, sizeof(error))) {
-        znx_log("%s", error);
-        znx_draw_shutdown();
+    if (!start_draw()) {
         eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(display, context);
         return ZNX_MENU_QUIT;

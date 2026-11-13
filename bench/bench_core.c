@@ -76,6 +76,11 @@ static int l_st_count, l_st_failed, l_st_first_bad = -1;
 static uint64_t l_st_save_ns, l_st_load_ns, l_st_replay_ns, l_st_save_worst, l_st_load_worst, l_st_total_worst;
 
 static uint32_t* l_frame_us10; /* time of every frame in units of 0.1 us */
+/* Per frame, when the core exports DebugDynarecStats: blocks compiled and time compiling (0.1 us). */
+static void (*l_dynarec_stats)(unsigned long long*);
+static uint16_t* l_frame_blocks;
+static uint32_t* l_frame_compile_us10;
+static unsigned long long l_dyn_last[4];
 static uint64_t l_frame_begin; /* when the frame in flight started, 0 between frames */
 static uint64_t l_frame_ns;    /* time of the frame that just ended */
 static uint64_t l_emu_ns;      /* sum of all frame times */
@@ -109,6 +114,8 @@ void znx_options_defaults(struct znx_options* o)
     o->rb_a = o->rb_b = -1;
     o->watch = -1;
     o->dump_frame = -1;
+    o->vs_stage = -1;
+    o->vs_fighters[0] = o->vs_fighters[1] = o->vs_fighters[2] = o->vs_fighters[3] = -1;
     /* Vanilla Super Smash Bros. (U) without input: logo and intro, title at 4313, then the
      * CPU demo fight from 4983. Windows that the run does not reach are not printed. */
     o->windows[0] = (struct znx_window){ "intro", 0, 4300 };
@@ -193,6 +200,45 @@ static void debug_callback(void* context, int level, const char* message)
         err("[%s] %s", (const char*)context, message);
 }
 
+/* ---- a forced VS match (tools/vs_poke_plan.py is the reference for these bytes) ---- */
+
+static int l_vs_done;
+
+static void poke(uint32_t address, const uint8_t* bytes, int count)
+{
+    uint8_t* ram = (uint8_t*)l_rdram;   /* host-order words: N64 byte A is at (A & 0x7FFFFF) ^ 3 */
+    for (int i = 0; i < count; ++i)
+        ram[((address + (uint32_t)i) & 0x7fffff) ^ 3] = bytes[i];
+}
+
+static void vs_start_if_due(void)
+{
+    enum { SCENE = 0x800A4AD0, SCENE_GKIND = 0x800A4ADF, TRANSFER = 0x800A4D08, PLAYER0 = 0x800A4D28, PLAYER_SIZE = 0x74 };
+    if (l_opt.vs_stage < 0 || l_vs_done || l_rdram == NULL || l_rdram[(SCENE & 0x7fffff) ^ 3] != 0x07)
+        return;
+    const uint8_t level = (uint8_t)(l_opt.vs_level >= 1 && l_opt.vs_level <= 9 ? l_opt.vs_level : 9);
+    int cpus = 0, seen[256] = { 0 };
+    for (int port = 0; port < 4; ++port) {
+        const int fkind = l_opt.vs_fighters[port];
+        if (fkind < 0) {
+            const uint8_t none[2] = { 2, 0x1C };
+            poke(PLAYER0 + port * PLAYER_SIZE + 2, none, 2);
+            continue;
+        }
+        const uint8_t shade = (uint8_t)seen[fkind & 0xff]++;
+        const uint8_t player[11] = { level, 9, 1, (uint8_t)fkind, (uint8_t)port, (uint8_t)port, 0, shade, 4, 1, 4 };
+        poke(PLAYER0 + port * PLAYER_SIZE, player, 11);
+        cpus++;
+    }
+    const uint8_t header[7] = { (uint8_t)l_opt.vs_stage, 0, 1, 0, (uint8_t)cpus, 100, 0 };   /* time match, no limit */
+    const uint8_t stage = (uint8_t)l_opt.vs_stage, battle = 0x16;
+    poke(TRANSFER + 1, header, 7);
+    poke(SCENE_GKIND, &stage, 1);
+    poke(SCENE, &battle, 1);
+    l_vs_done = 1;
+    out("vs: stage 0x%02x with %d level %d CPUs set up at frame %d", l_opt.vs_stage, cpus, level, l_frame);
+}
+
 /* The controller state for the frame about to run: the last script line at or before it. */
 static int input_callback(void* values, int size, int players)
 {
@@ -201,6 +247,12 @@ static int input_callback(void* values, int size, int players)
         return 0;
     for (int p = 0; p < players && p < MAX_PLAYERS; ++p)
         result[p] = 0;
+    if (l_opt.vs_stage >= 0) {
+        /* START at 200 and 420 reaches the mode select; the pokes take it from there. Nothing else is pressed. */
+        if ((l_frame >= 200 && l_frame < 206) || (l_frame >= 420 && l_frame < 426))
+            result[0] = 0x10000000u;
+        return 1;
+    }
     if (l_event_count == 0 && l_host->live_inputs != NULL) {
         uint32_t live[4] = { 0, 0, 0, 0 };
         l_host->live_inputs(live);
@@ -346,6 +398,13 @@ static void frame_timer_stop(void)
     l_frame_ns = ns;
     if (l_frame_us10 != NULL && l_frame >= 0 && l_frame < l_opt.frames)
         l_frame_us10[l_frame] = ns / 100 > 0xffffffffull ? 0xffffffffu : (uint32_t)(ns / 100);
+    if (l_dynarec_stats != NULL && l_frame_blocks != NULL && l_frame >= 0 && l_frame < l_opt.frames) {
+        unsigned long long now[4];
+        l_dynarec_stats(now);
+        l_frame_blocks[l_frame] = now[0] - l_dyn_last[0] > 65535 ? 65535 : (uint16_t)(now[0] - l_dyn_last[0]);
+        l_frame_compile_us10[l_frame] = (uint32_t)((now[1] - l_dyn_last[1]) * 10);
+        memcpy(l_dyn_last, now, sizeof(now));
+    }
 }
 
 static int begin_frame(void* user)
@@ -382,6 +441,7 @@ static int begin_frame(void* user)
 static void frame_done(void)
 {
     l_frame++;
+    vs_start_if_due();
     if (l_host->frame_done != NULL)
         l_host->frame_done(l_frame, l_frame_ns);
     if (l_rb_hashes != NULL && !l_rb_done && l_frame <= l_opt.rb_b)
@@ -575,6 +635,34 @@ static void print_windows(void)
         out("window %s %d..%d: %d frames, %.3f ms/frame, worst %.3f ms at frame %d", win->name,
             win->from, to, to - win->from, total / 1e4 / (to - win->from), worst / 1e4, worst_frame);
     }
+    if (l_opt.vs_stage >= 0 && l_frame > 660) {
+        /* A forced VS match: every frame of the fight over 12 ms, and how many over a display frame. */
+        int over16 = 0, over33 = 0, listed = 0;
+        uint64_t total = 0, blocks = 0, compile = 0;
+        char line[700];
+        int used = 0;
+        for (int f = 660; f < l_frame; ++f) {
+            const uint32_t t = l_frame_us10[f];
+            total += t;
+            if (t > 166667u) over16++;
+            if (t > 333333u) over33++;
+            if (t > 120000u && listed < 16) {
+                used += snprintf(line + used, sizeof(line) - (size_t)used, " %d:%.1f", f, t / 1e4);
+                if (l_frame_blocks != NULL)
+                    used += snprintf(line + used, sizeof(line) - (size_t)used, "(%u blocks %.1f)", l_frame_blocks[f],
+                                     l_frame_compile_us10[f] / 1e4);
+                listed++;
+            }
+            if (l_frame_blocks != NULL) { blocks += l_frame_blocks[f]; compile += l_frame_compile_us10[f]; }
+        }
+        if (l_frame_blocks != NULL)
+            out("vs compiling 0x%02x: %llu blocks, %.1f ms in all from frame 660 (%.3f ms per block)", l_opt.vs_stage,
+                (unsigned long long)blocks, compile / 1e4, blocks ? compile / 1e4 / blocks : 0.0);
+        out("vs timing 0x%02x: %d frames from 660, %.3f ms/frame, over 16.7 ms %d, over 33 ms %d", l_opt.vs_stage,
+            l_frame - 660, total / 1e4 / (l_frame - 660), over16, over33);
+        if (listed)
+            out("vs frames over 12 ms (frame:ms, blocks compiled and ms compiling):%s", line);
+    }
 }
 
 int znx_bench_run(const struct znx_host* host, const struct znx_options* options)
@@ -598,6 +686,7 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
      * game): RDRAM is allocated anew, and first_frame_setup must run again, or the core keeps its
      * speed limiter and the old RDRAM pointer is hashed. */
     l_rdram = NULL;
+    l_vs_done = 0;
     l_rb_done = 0;
     l_hash_ns = l_emu_ns = l_progress_ns = 0;
     l_frame_begin = 0;
@@ -623,6 +712,12 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
         return 1;
     if (l_opt.frames > 0) {   /* a run without an end keeps no per-frame times */
         l_frame_us10 = calloc((size_t)l_opt.frames, sizeof(*l_frame_us10));
+        l_dynarec_stats = l_host->sym(host->core, "DebugDynarecStats");
+        if (l_dynarec_stats != NULL) {
+            l_frame_blocks = calloc((size_t)l_opt.frames, sizeof(*l_frame_blocks));
+            l_frame_compile_us10 = calloc((size_t)l_opt.frames, sizeof(*l_frame_compile_us10));
+            memset(l_dyn_last, 0, sizeof(l_dyn_last));
+        }
         if (l_frame_us10 == NULL)
             return 1;
     }

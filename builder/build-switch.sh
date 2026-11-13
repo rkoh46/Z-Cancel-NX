@@ -134,7 +134,7 @@ FRONT_GAME="switch/game_switch.c switch/vidext_switch.c switch/input_switch.c ga
 # The start screen (menu/): the menu itself, its EGL screen shared with the game, ROM detection, the
 # Remix builder (libcurl with the system's TLS service, minizip and md5.c from the core's tree, the
 # xdelta3 decoder from ref/xdelta) and the online hook.
-FRONT_GAME="$FRONT_GAME switch/screen_switch.c switch/menu_switch.c menu/menu.c menu/draw.c menu/catalog.c menu/patcher.c menu/settings.c menu/online.c"
+FRONT_GAME="$FRONT_GAME switch/screen_switch.c switch/menu_switch.c switch/sysfont_switch.c menu/menu.c menu/draw.c menu/catalog.c menu/patcher.c menu/settings.c menu/online.c"
 # Online play (docs/PLAN.md "Netplay on the Switch"): the online screens, the Lobby row's hook, the match
 # overlay and the n02 socket's non-blocking switch; the C++ netplay code is built below (NET_SOURCES).
 FRONT_GAME="$FRONT_GAME menu/lobby_entry.c switch/overlay_switch.c net/p2p/socket_switch.c"

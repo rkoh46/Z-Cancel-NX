@@ -1,0 +1,61 @@
+Recompiler: time spent compiling, readable by the front end
+
+new_recompile_block now adds its running time to rollback_stats.recompile_us (it only counted
+blocks), and DebugDynarecStats exports the totals (blocks compiled, microseconds, pages of compiled
+code invalidated, dirty re-checks) so the front end can say what a slow frame was spent on.
+No change to emulated state.
+
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
+@@ -8935,8 +8935,23 @@
+ #endif
+ }
+ 
++/* Time spent compiling, for the front end's frame-time reports (DebugDynarecStats): recompile_us is
++ * otherwise never filled in. The timer stops when new_recompile_block returns, wherever it returns. */
++#include <time.h>
++static uint64_t recompile_now_us(void)
++{
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
++}
++static void recompile_timer_stop(uint64_t* begin)
++{
++  rollback_stats.recompile_us += recompile_now_us() - *begin;
++}
++
+ int new_recompile_block(int addr)
+ {
++  uint64_t recompile_begin __attribute__((cleanup(recompile_timer_stop))) = recompile_now_us();
+ #if defined(RECOMPILER_DEBUG) && !defined(RECOMP_DBG)
+   recomp_dbg_block(addr);
+ #endif
+--- a/mupen64plus-core/src/api/debugger.c
++++ b/mupen64plus-core/src/api/debugger.c
+@@ -224,6 +224,25 @@
+ #endif
+ }
+ 
++/* Z-Cancel NX: totals since the core started: blocks compiled, microseconds spent compiling them,
++ * pages of compiled code discarded because the game wrote over them, and re-checks of discarded
++ * blocks. All zero with an interpreter. */
++#ifdef NEW_DYNAREC
++#include "device/r4300/new_dynarec/new_dynarec.h"
++#endif
++EXPORT void CALL DebugDynarecStats(unsigned long long* out)
++{
++    out[0] = out[1] = out[2] = out[3] = 0;
++#ifdef NEW_DYNAREC
++    struct new_dynarec_rollback_stats stats;
++    new_dynarec_rollback_stats_get(&stats);
++    out[0] = stats.recompile_count;
++    out[1] = stats.recompile_us;
++    out[2] = stats.block_invalidate_count;
++    out[3] = stats.verify_dirty_count;
++#endif
++}
++
+ EXPORT void * CALL DebugMemGetPointer(m64p_dbg_memptr_type mem_ptr_type)
+ {
+     switch (mem_ptr_type)
