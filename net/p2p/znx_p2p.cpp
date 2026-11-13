@@ -134,6 +134,7 @@ const znx_p2p_session_hooks* g_hooks = nullptr;
 znx_p2p_session_hooks g_hooks_copy;
 std::atomic<int> g_visible{0};
 std::atomic<int> g_rollbacks{0}, g_deepest{0}, g_live_ping{-1}, g_live_delay{0};
+std::atomic<long long> g_live_wait_us{0};   /* held for the other player's input so far (GekkoNet's count) */
 std::atomic<float> g_live_ahead{0};
 std::atomic<double> g_speed{1.0};
 int g_depth = 0;
@@ -766,10 +767,11 @@ bool end_visible_hook(void*)
 {
     const int visible = ++g_visible;
     idle_compile();
-    if (visible % 30 == 0) {
+    {
         RollbackLagStats lag;
         rmgk_gekko::lag_stats(lag);
-        if (!lag.peers.empty()) {
+        g_live_wait_us = rmgk_gekko::total_wait_us();   /* every frame: the front end takes it off its frame times */
+        if (visible % 30 == 0 && !lag.peers.empty()) {
             g_live_ping = lag.peers[0].pingMs;
             g_live_ahead = lag.peers[0].framesAhead;
         }
@@ -1343,6 +1345,7 @@ int run_rmgk_session(void* core, const struct znx_p2p_session_hooks* hooks, int 
     g_rollbacks = 0;
     g_deepest = 0;
     g_live_ping = -1;
+    g_live_wait_us = 0;
     g_live_delay = delay;
     g_live_ahead = 0;
     g_speed = 1.0;
@@ -1624,6 +1627,7 @@ extern "C" void znx_p2p_live(struct znx_p2p_live* live)
     live->frames = g_visible.load();
     live->frames_ahead = g_live_ahead.load();
     live->speed = g_speed.load();
+    live->waited_ms = g_live_wait_us.load() / 1000.0;
 }
 
 extern "C" int znx_p2p_visible_frames(void) { return g_visible.load(); }

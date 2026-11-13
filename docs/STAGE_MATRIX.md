@@ -756,3 +756,39 @@ build/stage-research/src/bench_core.c -o build/stage-research/bin/znx-bench-sr`,
 
 `build/stage-research/sweep.py` ran the stage and fighter sweeps (`sweep-stages.tsv`, `sweep-chars.tsv`),
 `scan.py` the cursor sweep of the Remix character select.
+
+## Results on a Switch, 2026-11-13
+
+Erista console at 1785 MHz, `matrix=<file>` in the ini (switch/game_switch.c), four level 9 CPUs,
+fighters 0 to 3, 1,800 to 3,000 timed frames a stage from frame 660. Times are the emulation thread's
+CPU time per frame, picture included.
+
+| Run | Stages | Slowest stage: average / 99 % of frames under | Frames over 16.7 ms |
+|---|---|---|---|
+| Vanilla, before compiling ahead | 14 | 5.6 / 10.4 ms | 5 to 12 a match |
+| +EXTRA 0.6.0, before | 161 | 6.9 / 11.8 ms | 1,797 in all (649 over 33 ms) |
+| Vanilla, compiling ahead, vsync on | 14 | 5.8 / 6.9 ms | 0 (worst frame 9.9 ms) |
+| +EXTRA 0.6.0, compiling ahead, vsync on | 161 | 6.9 / 8.5 ms | 0 (worst frame 14.2 ms) |
+| Remix 2.0.1, compiling ahead, vsync on | 144 of 145 | 6.8 / 8.7 ms | 2, both a shader compiled for the first time |
+| Every fighter, four at a time on Dream Land | 56 matches | 99 % under 8.3 ms | 21, all first-time shaders |
+
+What the "before" frames were: the recompiler meeting a block for the first time (about 0.5 ms each,
+about 1,200 a match). What is left after: a shader GLideN64 has not built on this console before (60 to
+210 ms, once per console per shader). The app now ships the 62 combiner keys these runs needed
+(assets/shaders); on a console with its own lists deleted, three matches that had hitched ran with no
+frame over 16.7 ms and none shown late.
+
+Not closed:
+- With vsync on, in about 40 % of matches one frame (rarely two) near the start of the fight is handed
+  to the display 9 to 12 ms later than its turn (gap 25 to 30 ms between two swaps instead of 16.7; never
+  33). The emulation thread is not busy during it (under 12 ms of CPU): the time is spent blocked in a GL
+  call before the swap. Not yet traced.
+- Remix 2.0.1 stage 0xD7 (Autumn How to Play), the last case of that run, has no result: the app closed
+  without a line in the log.
+- Online (console hosting over Wi-Fi, a Mac joining with 30 ms of added latency each way): all 15
+  checkpoints of 9,000 frames identical on both sides. Frames the session did not hold for the other
+  player's input: no frame over 11.3 ms while there were no rollbacks; with rollbacks, 13 frames of
+  23 to 36 ms, because frames re-run after a rollback still drew their display lists. Patch 0013 leaves
+  the drawing out of those frames; it passes the rollback stress test on the Mac and has not run on a
+  console yet (rollback_stress=K,D in the ini does it with the picture on). The console's Wi-Fi link
+  itself spiked to 119 ms with the app idle, and the session held 12 to 27 s of a 150 s match for it.

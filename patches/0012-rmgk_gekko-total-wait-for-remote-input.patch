@@ -1,0 +1,52 @@
+rmgk_gekko: the time spent waiting for remote input, as a running total
+
+begin_frame spins while the prediction window is full. rmgk_gekko::total_wait_us() is the sum of
+those waits, exact at every frame (the lag meter folds its own count into reports later), so the
+front end can tell a frame the network held from one that was slow. Nothing else changes.
+
+--- a/RMG-Core/rmgk_gekko.cpp
++++ b/RMG-Core/rmgk_gekko.cpp
+@@ -448,6 +448,8 @@
+ // many times it has run: the time a frame had to spare (rmgk_gekko::last_present_sleep_us).
+ std::atomic<long long> g_RollbackPresentLastSleepUs{0};
+ std::atomic<unsigned long long> g_RollbackPresentCalls{0};
++// Z-Cancel NX: all the time begin_frame has spun waiting for remote input (rmgk_gekko::total_wait_us).
++std::atomic<long long> g_ZnxWaitTotalUs{0};
+ std::chrono::steady_clock::time_point g_RollbackPresentLastSwapTime;
+ std::chrono::steady_clock::time_point g_RollbackPresentTargetTime;
+ std::chrono::steady_clock::time_point g_RollbackPresentHookReturnTime;
+@@ -3475,6 +3477,7 @@
+             std::chrono::duration_cast<std::chrono::microseconds>(
+                 std::chrono::steady_clock::now() - traceWaitBegin).count();
+         lag_meter_waited(traceWaitUs);
++        g_ZnxWaitTotalUs.fetch_add(traceWaitUs, std::memory_order_relaxed);
+ 
+         summaryWaitUs += traceWaitUs;
+         summaryMaxWaitUs =
+@@ -4597,6 +4600,15 @@
+         intervalAfterWaitUs);
+ #else
+     return;
++#endif
++}
++
++CORE_EXPORT long long rmgk_gekko::total_wait_us(void)
++{
++#ifdef RMGK_HAVE_GEKKONET
++    return g_ZnxWaitTotalUs.load(std::memory_order_relaxed);
++#else
++    return 0;
+ #endif
+ }
+ 
+--- a/RMG-Core/rmgk_gekko.hpp
++++ b/RMG-Core/rmgk_gekko.hpp
+@@ -209,6 +209,8 @@
+     // frame was late) and, in *calls, how many times it has waited or found itself late: what a
+     // front end may spend between frames without delaying one.
+     static long long last_present_sleep_us(unsigned long long* calls);
++    // Z-Cancel NX: microseconds spent waiting for remote input since the program started.
++    static long long total_wait_us(void);
+ 
+     // Buffered rollback-pacing trace hook used by VidExt.cpp.
+     // No-op unless Rollback -> Logging -> Pacing Trace is enabled.

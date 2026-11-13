@@ -202,6 +202,7 @@ struct znx_p2p_live {
     int ping, delay, rollbacks, deepest, frames;
     float frames_ahead;
     double speed;               /* the time sync's speed scale */
+    double waited_ms;           /* held so far for the other player's input (the prediction window was full) */
 };
 void znx_p2p_live(struct znx_p2p_live* live);
 int znx_p2p_visible_frames(void);

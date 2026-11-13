@@ -102,6 +102,10 @@ static bool ini_key(const char* key, const char* value, void* user)
     else if (!strcmp(key, "stick_range")) s->stick_range = atoi(value);
     else if (!strcmp(key, "verbose")) s->options.verbose = atoi(value);
     else if (!strcmp(key, "menu")) s->menu = atoi(value) != 0;
+    else if (!strcmp(key, "rollback_stress")) {   /* rollback_stress=K,D: every K frames rewind D and re-run them, compared */
+        int k, d;
+        if (sscanf(value, "%d ,%d", &k, &d) == 2 && k > d && d > 0) { s->options.stress_every = k; s->options.stress_depth = d; s->options.rb_a = s->options.rb_b = -1; }
+    }
     else if (!strcmp(key, "matrix")) snprintf(s->matrix, sizeof(s->matrix), "%s", value);
     else if (!strcmp(key, "net_overlay")) s->net_overlay = atoi(value) != 0;
     else if (!strcmp(key, "net_vsync")) s->net_vsync = atoi(value) != 0;
@@ -263,7 +267,8 @@ static int net_begin(void* user)
  * frames on the clock. "late" is a frame shown more than 25 ms after the one before it. */
 static struct {
     uint64_t last_cpu, last_wall, sum, worst;
-    uint32_t count, over16, over33, late;
+    double last_waited, waited;   /* ms held for the other player's input: taken off the frame times */
+    uint32_t count, over16, over33, late, held, all_held;
     uint32_t all_count, all_over16, all_over33, all_late;
     uint64_t all_worst;
 } l_nt;
@@ -271,29 +276,43 @@ static struct {
 static void net_time_frame(void)
 {
     const uint64_t cpu = thread_cpu_ns(), wall = armTicksToNs(armGetSystemTick());
+    struct znx_p2p_live live;
+    znx_p2p_live(&live);
     if (l_nt.last_cpu != 0) {
-        const uint64_t ns = cpu > l_nt.last_cpu ? cpu - l_nt.last_cpu : 0;
-        l_nt.count++;
-        l_nt.sum += ns;
-        if (ns > l_nt.worst) l_nt.worst = ns;
-        if (ns > 16666667ull) l_nt.over16++;
-        if (ns > 33333333ull) l_nt.over33++;
+        uint64_t ns = cpu > l_nt.last_cpu ? cpu - l_nt.last_cpu : 0;
+        const uint64_t held = (uint64_t)((live.waited_ms - l_nt.last_waited) * 1e6);
+        ns = ns > held ? ns - held : 0;   /* the session spins while it waits: that is the network, not work */
+        l_nt.waited += live.waited_ms - l_nt.last_waited;
+        if (held > 0) {
+            l_nt.held++;   /* a frame the session held for the other player's input is the network's, not judged here */
+        } else {
+            l_nt.count++;
+            l_nt.sum += ns;
+            if (ns > l_nt.worst) l_nt.worst = ns;
+            if (ns > 16666667ull) l_nt.over16++;
+            if (ns > 33333333ull) l_nt.over33++;
+        }
     }
     l_nt.last_cpu = cpu;
     l_nt.last_wall = wall;
+    l_nt.last_waited = live.waited_ms;
 }
 
 static void net_time_report(int frames)
 {
-    if (l_nt.count == 0) return;
+    if (l_nt.count + l_nt.held == 0) return;
     l_nt.late = znx_vidext_take_late(NULL);
-    znx_log("online timing %d: %u frames, %.2f ms/frame, worst %.2f, over 16.7 ms %u, over 33 ms %u, shown late %u",
-            frames, l_nt.count, l_nt.sum / 1e6 / l_nt.count, l_nt.worst / 1e6, l_nt.over16, l_nt.over33, l_nt.late);
+    znx_log("online timing %d: %u frames not held, %.2f ms/frame, worst %.2f, over 16.7 ms %u, over 33 ms %u; %u frames held "
+            "%.0f ms for the other player; shown late %u", frames, l_nt.count, l_nt.count ? l_nt.sum / 1e6 / l_nt.count : 0.0,
+            l_nt.worst / 1e6, l_nt.over16, l_nt.over33, l_nt.held, l_nt.waited, l_nt.late);
+    l_nt.all_held += l_nt.held;
+    l_nt.held = 0;
     l_nt.all_count += l_nt.count; l_nt.all_over16 += l_nt.over16; l_nt.all_over33 += l_nt.over33;
     l_nt.all_late += l_nt.late;
     if (l_nt.worst > l_nt.all_worst) l_nt.all_worst = l_nt.worst;
     l_nt.count = l_nt.over16 = l_nt.over33 = l_nt.late = 0;
     l_nt.sum = l_nt.worst = 0;
+    l_nt.waited = 0;
 }
 
 static int net_end(void* user)
@@ -398,8 +417,8 @@ static int net_session_run(void)
     znx_vidext_take_late(NULL);
     const int result = znx_online_run_session(l_core_lib, &hooks);
     net_time_report(znx_p2p_visible_frames());
-    znx_log("online timing, whole match: %u frames, worst %.2f ms, over 16.7 ms %u, over 33 ms %u, shown late %u",
-            l_nt.all_count, l_nt.all_worst / 1e6, l_nt.all_over16, l_nt.all_over33, l_nt.all_late);
+    znx_log("online timing, whole match: %u frames not held, worst %.2f ms, over 16.7 ms %u, over 33 ms %u; %u held; shown late %u",
+            l_nt.all_count, l_nt.all_worst / 1e6, l_nt.all_over16, l_nt.all_over33, l_nt.all_held, l_nt.all_late);
     return result;
 }
 

@@ -1,0 +1,38 @@
+Core: frames that are not shown do not draw their display list
+
+After a rollback the frames re-run to catch up have video output off (M64FRAME_OUTPUT_VIDEO), but the
+RSP plugin still handed each display list to the video plugin, which drew it for nothing: 3 to 4 ms
+of a 5 ms frame on a Switch, so a 7-frame rollback cost 25 to 35 ms. For those frames the core now
+only raises the DP interrupt, which is all the video plugin does to emulated state.
+
+--- a/mupen64plus-core/src/plugin/plugin.c
++++ b/mupen64plus-core/src/plugin/plugin.c
+@@ -494,6 +494,19 @@
+     return M64ERR_SUCCESS;
+ }
+ 
++/* Z-Cancel NX: a frame whose picture is not shown (one re-run after a rollback: M64FRAME_OUTPUT_VIDEO
++ * off) does not have its display list drawn, which on a Switch is most of such a frame's cost. What
++ * the video plugin does to emulated state is kept: it raises the DP interrupt when the list's full
++ * sync is reached (every list the game's scheduler sends ends in one; CheckInterrupts is empty in
++ * this core), exactly what the null video plugin does for every list. */
++static void znx_process_dlist(void)
++{
++    if (main_frame_video_enabled())
++        gfx.processDList();
++    else
++        *gfx_info.MI_INTR_REG |= MI_INTR_DP;
++}
++
+ static m64p_error plugin_start_rsp(void)
+ {
+     /* fill in the RSP_INFO data structure */
+@@ -519,7 +532,7 @@
+     rsp_info.DPC_PIPEBUSY_REG = &g_dev.dp.dpc_regs[DPC_PIPEBUSY_REG];
+     rsp_info.DPC_TMEM_REG = &g_dev.dp.dpc_regs[DPC_TMEM_REG];
+     rsp_info.CheckInterrupts = EmptyFunc;
+-    rsp_info.ProcessDlistList = gfx.processDList;
++    rsp_info.ProcessDlistList = znx_process_dlist;
+     rsp_info.ProcessAlistList = audio.processAList;
+     rsp_info.ProcessRdpList = gfx.processRDPList;
+     rsp_info.ShowCFB = gfx.showCFB;
