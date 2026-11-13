@@ -121,3 +121,22 @@ Put the ROM at `sdmc:/switch/z-cancel-nx/rom.z64`; output goes to nxlink or the 
   rollback test passes: the console should print the same hashes.
 - Known cost to watch: loading a state invalidates the whole 32 MB code cache (`invalidate_all_pages`), a data
   and instruction cache flush of all of it on every rollback.
+
+### First run on the console (Erista, 2091 MHz), 2026-11-12
+
+`NX_IP=<console> tools/nx-run.sh` with `build/switch/znx-bench.nro`, vanilla US ROM, no picture, 7,200 frames.
+
+- It ran on the first attempt: the recompiler's code cache inside the image with a writable view from
+  `svcMapProcessMemory` works under hbloader with a game's memory (the core got its full 512 MB layout).
+- All twelve RDRAM hashes (every 600 frames to 7,200) equal the Mac ARM64 build's: the Switch and the Mac
+  emulate bit for bit the same. The open cross-architecture question is only ARM64 against x86-64.
+- Speed: 0.96 ms per frame over the intro, 0.80 ms per frame in the CPU demo fight (1,157 frames per
+  second overall). Worst single frames: 177 ms at frame 1,647 and 25.6 ms at 5,010 (scene loads; to be
+  attributed).
+- Rollback: save 1.76 ms (8,438,120 bytes), load 15.5 ms, re-running 60 frames 92 ms (1.54 ms per frame,
+  which includes recompiling after the load); the re-run is exact (61 of 61 hashes).
+- Verdict: go. The emulation itself leaves room (0.8 ms of 16.7). The rollback load does not: 15.5 ms
+  spends a whole frame before anything is re-run. The load invalidates the entire 32 MB code cache
+  (`invalidate_all_pages`), and the frames after it pay for recompiling. First optimisation target: keep
+  compiled blocks across a rollback load when the code they came from did not change, then cut the 8.4 MB
+  copies. A five-frame rollback has to fit in about 8 ms to leave room for the frame itself and the picture.
