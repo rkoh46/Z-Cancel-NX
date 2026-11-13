@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- Frames re-run after a rollback are 11-17 % cheaper on the console (the recompiler now links
+  conditional exits on ARM64; faster audio commands that give the same bytes). A full seven-frame
+  rollback now fits beside a normal frame on average in all three games.
+- Menus: digits in checksums and addresses are evenly spaced; Settings sits directly under the games.
+
 ## 0.1.0
 
 First release.
