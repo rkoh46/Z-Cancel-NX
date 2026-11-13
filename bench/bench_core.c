@@ -151,12 +151,12 @@ static uint64_t hash_rdram(void)
 /* A much faster checksum of RDRAM for comparing a re-run with its first pass (four independent
  * 64-bit lanes over 8-byte words). Not printed: the "hash" lines stay FNV-1a so they compare
  * across builds and with earlier logs. */
-static uint64_t check_rdram(void)
+static uint64_t check_rdram_range(uint32_t from, uint32_t to, uint64_t seed)
 {
     uint64_t begin = znx_now_ns();
-    uint64_t a = 0x9e3779b97f4a7c15ull, b = 0xc2b2ae3d27d4eb4full, c = 0x165667b19e3779f9ull, d = 0x27d4eb2f165667c5ull;
+    uint64_t a = 0x9e3779b97f4a7c15ull ^ seed, b = 0xc2b2ae3d27d4eb4full, c = 0x165667b19e3779f9ull, d = 0x27d4eb2f165667c5ull;
     const uint8_t* p = l_rdram;
-    for (uint32_t i = 0; i < RDRAM_SIZE; i += 32) {
+    for (uint32_t i = from; i < to; i += 32) {
         uint64_t w[4];
         memcpy(w, p + i, 32);
         a = (a ^ w[0]) * 0x9fb21c651e98df25ull; a ^= a >> 29;
@@ -167,6 +167,8 @@ static uint64_t check_rdram(void)
     l_hash_ns += znx_now_ns() - begin;
     return a ^ (b * 3) ^ (c * 5) ^ (d * 7);
 }
+
+static uint64_t check_rdram(void) { return check_rdram_range(0, RDRAM_SIZE, 0); }
 
 /* ---- callbacks from the core ---- */
 
@@ -361,6 +363,14 @@ static void frame_done(void)
         l_rb_hashes[l_frame - l_opt.rb_a] = check_rdram();
     if (l_opt.hash_every > 0 && l_frame % l_opt.hash_every == 0)
         out("hash %d %016llx", l_frame, (unsigned long long)hash_rdram());
+    if (l_opt.check_every > 0 && l_frame % l_opt.check_every == 0) {
+        /* check <frame> <whole RDRAM> <RDRAM without [skip_lo, skip_hi)> */
+        uint32_t lo = (uint32_t)l_opt.check_skip_lo & ~31u, hi = (uint32_t)l_opt.check_skip_hi & ~31u;
+        uint64_t whole = check_rdram();
+        uint64_t rest = hi > lo && hi <= RDRAM_SIZE
+            ? check_rdram_range(0, lo, 1) ^ (check_rdram_range(hi, RDRAM_SIZE, 2) * 11) : whole;
+        out("check %d %016llx %016llx", l_frame, (unsigned long long)whole, (unsigned long long)rest);
+    }
     if (l_opt.progress_every > 0 && l_frame % l_opt.progress_every == 0) {
         out("progress %d of %d, %.3f ms/frame over the last %d", l_frame, l_opt.frames,
             l_progress_ns / 1e6 / l_opt.progress_every, l_opt.progress_every);

@@ -170,3 +170,23 @@ The periodic hashes are the same as in a run without any rollback, on both machi
 Switch for the worst ordinary case (save 1.7 + a 7-frame rollback 8.6 + the frame itself 1.0): about
 11 ms of 16.7, before any picture. Save and load are now both an 8.4 MB copy; copying only pages that
 changed is the next step if the picture needs the room.
+
+### ARM64 against x86-64 in a real match, 2026-11-12
+
+`bench/inputs/ssb-usa-vs-mash.txt` drives the menus from power-on into a VS match (P1 Donkey Kong, P2
+Kirby, default stage; the character select was scripted against `sMNPlayersVSSlots` at 0x8013BA88 from
+ssb-decomp-re) and then both players mash seeded pseudo-random sticks and buttons. The match runs from
+frame 5,201 to the results screen at 16,520.
+
+Both Mac builds, 18,000 frames, `--check-every 1 --check-skip 0x80040500 0x80040E00` (a fast checksum
+of RDRAM per frame, whole and without that 2.3 KB range):
+
+- whole RDRAM differs on 3,101 of 18,000 frames (first at 266);
+- without the range it differs on 3 frames (2,337 during the intro, one more before the match, 5,941 in
+  the match), each equal again on the next frame.
+
+So everything outside the saved thread contexts is the same on ARM64 and x86-64 for the whole match, and
+what does differ never propagates: a divergence that reached game logic would persist, not vanish a frame
+later. This is the evidence that inputs-only rollback between a Switch and a PC can hold for vanilla.
+Still open: the three stray frames (probably a register save somewhere else), Smash Remix, and RMG-K's
+own x86-64 build (GCC/MinGW, not Clang under Rosetta) which only step 5 can test.

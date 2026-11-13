@@ -48,6 +48,8 @@ static void usage(void)
         "  --inputs FILE        lines \"frame player buttons_hex\" (player 1-4)\n"
         "  --hash-every K       print \"hash <frame> <fnv1a64 of RDRAM>\" every K frames, default 60, 0 = never\n"
         "  --rollback-test A B  save at frame A, run to B, load, re-run A..B and compare every frame\n"
+        "  --check-every K      print \"check <frame> <whole> <rest>\": fast RDRAM checksums, whole and without --check-skip\n"
+        "  --check-skip LO HI   the RDRAM range left out of <rest> (hex addresses)\n"
         "  --rollback-stress K D  every K frames rewind the last D frames and re-run them, comparing every frame\n"
         "  --cpu MODE           2 dynamic recompiler in a rollback session, what RMG-K runs (default);\n"
         "                       0 pure or 1 cached interpreter, run without the rollback session\n"
@@ -74,6 +76,8 @@ int main(int argc, char** argv)
         else if (!strcmp(a, "--hash-every") && i + 1 < argc) o.hash_every = atoi(argv[++i]);
         else if (!strcmp(a, "--cpu") && i + 1 < argc) o.emumode = atoi(argv[++i]);
         else if (!strcmp(a, "--rollback-test") && i + 2 < argc) { o.rb_a = atoi(argv[++i]); o.rb_b = atoi(argv[++i]); }
+        else if (!strcmp(a, "--check-every") && i + 1 < argc) o.check_every = atoi(argv[++i]);
+        else if (!strcmp(a, "--check-skip") && i + 2 < argc) { o.check_skip_lo = strtol(argv[++i], NULL, 16) & 0x7fffff; o.check_skip_hi = strtol(argv[++i], NULL, 16) & 0x7fffff; }
         else if (!strcmp(a, "--rollback-stress") && i + 2 < argc) { o.stress_every = atoi(argv[++i]); o.stress_depth = atoi(argv[++i]); }
         else if (!strcmp(a, "--watch") && i + 1 < argc) o.watch = strtol(argv[++i], NULL, 16) & 0x7fffff;
         else if (!strcmp(a, "--dump-ram") && i + 2 < argc) { o.dump_frame = atoi(argv[++i]); o.dump_path = argv[++i]; }
