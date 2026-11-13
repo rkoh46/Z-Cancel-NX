@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-/* znx-net: the callbacks RMG-K's n02 P2P core (n02/core/p2p_core.cpp, compiled unchanged from
+/* The callbacks RMG-K's n02 P2P core (n02/core/p2p_core.cpp, compiled unchanged from
  * ref/RMG-K) makes into its user interface. In RMG-K they go through n02_callbacks.cpp to the Qt
- * dialog (KailleraP2PDialog); here they go to znx-net.cpp. Also the two globals p2p_core.cpp
+ * dialog (KailleraP2PDialog); here they go to net/p2p/znx_p2p.cpp, which plays the dialog's part
+ * for znx-net and the Switch program alike. Also the two globals p2p_core.cpp
  * takes from n02_client.cpp. */
 
 #include <cstdarg>
@@ -55,7 +56,7 @@ void p2p_hosted_game_callback(char* game)
 
 void p2p_ping_callback(int ping)
 {
-    (void)ping;
+    znx_net_ping(ping);
 }
 
 void p2p_peer_left_callback()
@@ -80,9 +81,7 @@ int p2p_getSelectedDelay()
 
 void p2p_ssrv_packet_recv_callback(char* cmd, int len, void* sadr)
 {
-    /* Super-server and NAT traversal replies (p2plist.smash64.net, nat.smash64.net): this step
-     * talks to neither. */
-    (void)cmd;
-    (void)len;
-    (void)sadr;
+    /* Super-server and NAT traversal datagrams (p2plist.smash64.net, nat.smash64.net, a peer's
+     * PUNCH): net/p2p/znx_p2p.cpp handles them as KailleraP2PDialog::onSsrvPacketReceived does. */
+    znx_net_ssrv(cmd, len, sadr);
 }

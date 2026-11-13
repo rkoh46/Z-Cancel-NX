@@ -60,10 +60,18 @@ if [ "${1:-}" != "--in-container" ]; then
         "${run[@]}" bash builder/build-switch.sh --in-container selftest </dev/null
         exec "${run[@]}" sh -c 'cat > /tmp/rom.z64 && build/switch-selftest/znx-selftest /tmp/rom.z64 "$@"' sh "${@:3}" < "$2"
     fi
+    if [ "${1:-}" = "--selftest-net" ]; then
+        # The Switch build's netplay code (net/, net/p2p/, n02, GekkoNet, rmgk_gekko, the core with its __SWITCH__
+        # paths) compiled by the container's GCC for Linux ARM64 and run as znx-net there: a peer for znx-net on
+        # the Mac. The Mac is host.docker.internal from inside the container.
+        [ -f "${2:-}" ] || { echo "usage: $0 --selftest-net ROM [znx-net options without --rom]" >&2; exit 64; }
+        "${run[@]}" bash builder/build-switch.sh --in-container selftest </dev/null
+        exec "${run[@]}" sh -c 'cat > /tmp/rom.z64 && build/switch-selftest/znx-net-linux --rom /tmp/rom.z64 "$@"' sh "${@:3}" < "$2"
+    fi
     case "${1:-}" in
         "") what=switch ;;
         game|all) what="$1" ;;
-        *) echo "usage: $0 [game|all] | --selftest ROM [FRAMES]" >&2; exit 64 ;;
+        *) echo "usage: $0 [game|all] | --selftest ROM [FRAMES] | --selftest-net ROM [ZNX-NET OPTIONS]" >&2; exit 64 ;;
     esac
     exec "${run[@]}" bash builder/build-switch.sh --in-container "$what" </dev/null
 fi
@@ -125,6 +133,9 @@ FRONT_GAME="switch/game_switch.c switch/vidext_switch.c switch/input_switch.c ga
 # Remix builder (libcurl with the system's TLS service, minizip and md5.c from the core's tree, the
 # xdelta3 decoder from ref/xdelta) and the online hook.
 FRONT_GAME="$FRONT_GAME switch/screen_switch.c switch/menu_switch.c menu/menu.c menu/draw.c menu/catalog.c menu/patcher.c menu/settings.c menu/online.c"
+# Online play (docs/PLAN.md "Netplay on the Switch"): the online screens, the Lobby row's hook, the match
+# overlay and the n02 socket's non-blocking switch; the C++ netplay code is built below (NET_SOURCES).
+FRONT_GAME="$FRONT_GAME menu/lobby_entry.c switch/overlay_switch.c net/p2p/socket_switch.c"
 if [ "$TARGET" = selftest ]; then
     ARCH="-fPIE"
     # zlib: Debian's runtime library with devkitPro's copy of the two headers.
@@ -143,7 +154,7 @@ CORE_FLAGS="$COMMON -I$CORE/src -I$GEN -I$CORE/subprojects/md5 -I$CORE/subprojec
 RSP_FLAGS="$COMMON -I$RSP/src -I$CORE/src/api"
 FRONT_FLAGS="$ARCH -O2 -g -Wall -ffunction-sections -D__SWITCH__ -I$CORE/src/api -I$GEN -Ibench -Igame -Iswitch $FRONT_INC $PORT_INC"
 MENU_DEPS="-I$CORE/subprojects/md5 -I$CORE/subprojects/minizip -Iref/xdelta/xdelta3"
-[ "$TARGET" = selftest ] || FRONT_FLAGS="$FRONT_FLAGS -Imenu $MENU_DEPS -isystem $DEVKITPRO/portlibs/switch/include/freetype2"
+[ "$TARGET" = selftest ] || FRONT_FLAGS="$FRONT_FLAGS -Imenu -Inet $MENU_DEPS -isystem $DEVKITPRO/portlibs/switch/include/freetype2"
 # GLideN64: RMG-K's CMake options that matter (MUPENPLUSAPI, TXFILTER_LIB) plus EGL on a
 # "Linux" as far as its #ifdefs go. gnu++17 as its CMakeLists asks; the ARMv8 CRC32
 # instructions for its texture checksums (-march has +crc).
@@ -251,6 +262,7 @@ if [ -n "$WITH_BENCH" ]; then
     queue bench/video-null.c "$OBJ/video-null.o" "$COMMON -I$CORE/src/api"
     LIBS="$LIBS video_null"
 fi
+[ "$TARGET" = selftest ] && LIBS="$LIBS input_net"
 if [ -n "$WITH_GAME" ]; then
     # RMG-K's tree has no .git of its own inside GLideN64, so its build gets an empty Revision.h.
     mkdir -p "$GEN/gliden64"
@@ -266,7 +278,7 @@ if [ -n "$WITH_GAME" ]; then
     LIBS="$LIBS gliden64"
     # The audio plugin is this project's own (switch/audio_switch.c), linked like the others.
     queue switch/audio_switch.c "$OBJ/audio-switch.o" "$COMMON -I$CORE/src/api -Iswitch -isystem $DEVKITPRO/libnx/include"
-    LIBS="$LIBS audio"
+    LIBS="$LIBS audio input_net"
 fi
 FRONT_COMMON_OBJS="$(front_objects "$FRONT_COMMON")"
 FRONT_BENCH_OBJS=""; FRONT_GAME_OBJS=""
@@ -286,6 +298,59 @@ if [ -n "$WITH_GAME" ]; then
     done
 fi
 
+# RMG-K's P2P rollback netplay, the same sources znx-net builds on the Mac (builder/build-mac.sh): GekkoNet
+# without asio, the n02 P2P client, the session driver rmgk_gekko.cpp and RMG-Core's core wrappers, all from
+# build/src unchanged (patches/0007 only lets the state slot size be set: 10 MiB here, the state is 8.4 MB),
+# plus the glue in net/ and the lobby/session code in net/p2p/. The input plugin the session samples the
+# local controller through (net/input-net.c) is linked like the other plugins.
+NET_OBJS=""
+if [ -n "$WITH_GAME" ] || [ "$TARGET" = selftest ]; then
+    GEK="$SRC/GekkoLib"; N02="$SRC/n02"; RMGC="$SRC/RMG-Core"
+    NET_DEFS="-D__SWITCH__"
+    [ "$TARGET" = selftest ] && NET_DEFS=""
+    NET_CXX="$ARCH -O2 -g -fno-strict-aliasing -ffunction-sections $NET_DEFS -DNDEBUG -w $FRONT_INC $PORT_INC"
+    GEK_FLAGS="$NET_CXX -std=gnu++17 -DGEKKONET_STATIC -DGEKKONET_NO_ASIO -I$GEK/include -I$GEK/thirdparty"
+    N02_FLAGS="$NET_CXX -std=gnu++20 -D__cdecl= -I$N02"
+    # k_socket.cpp: its POSIX branch (the WSAStartup guard tests "linux"), and FIONBIO through fcntl
+    # (net/p2p/socket_switch.c)
+    KSOCK_FLAGS="$N02_FLAGS -Dlinux=1 -Dioctl=znx_ioctl"
+    # the self-test: Linux's FIONBIO works; sendto and bind through znx-net's network simulator instead
+    [ "$TARGET" = selftest ] && KSOCK_FLAGS="$N02_FLAGS -Dlinux=1 -Dsendto=znx_netsim_sendto -Dbind=znx_netsim_bind"
+    RMGC_FLAGS="$NET_CXX -std=gnu++20 -D__cdecl= -DRMGK_HAVE_GEKKONET -DRMGK_HAVE_P2P_TRANSPORT -I$RMGC -I$GEK/include -I$N02"
+    RBN_FLAGS="$RMGC_FLAGS -DCoreRollbackSaveGameStateInto=rmgk_CoreRollbackSaveGameStateInto -DCoreRollbackLoadGameState=rmgk_CoreRollbackLoadGameState -DCoreRollbackRunFrame=rmgk_CoreRollbackRunFrame -DCoreRollbackSetTimesyncScale=rmgk_CoreRollbackSetTimesyncScale"
+    GLUE_FLAGS="$RMGC_FLAGS -Ibench -I$CORE/src/api"
+    net_queue() {   # <source> <object> <flags> [compiler]
+        queue "$1" "$2" "$3" "${4:-g++}"
+        NET_OBJS="$NET_OBJS $2"
+    }
+    for f in "$GEK"/src/*.cpp; do net_queue "$f" "$OBJ/net/gekko/$(basename "${f%.cpp}").o" "$GEK_FLAGS"; done
+    for f in core/p2p_core.cpp core/p2p_instruction.cpp stats.cpp errr.cpp; do
+        net_queue "$N02/$f" "$OBJ/net/n02/$(basename "${f%.cpp}").o" "$N02_FLAGS"
+    done
+    net_queue "$N02/common/k_socket.cpp" "$OBJ/net/n02/k_socket.o" "$KSOCK_FLAGS"
+    net_queue "$RMGC/rmgk_gekko.cpp" "$OBJ/net/rmgc/rmgk_gekko.o" "$RMGC_FLAGS -DRMGK_GEKKO_STATE_CAPACITY=10485760u"
+    net_queue "$RMGC/RollbackNetcode.cpp" "$OBJ/net/rmgc/RollbackNetcode.o" "$RBN_FLAGS"
+    for f in Error.cpp m64p/Api.cpp m64p/CoreApi.cpp m64p/ConfigApi.cpp; do
+        net_queue "$RMGC/$f" "$OBJ/net/rmgc/$(basename "${f%.cpp}").o" "$RMGC_FLAGS"
+    done
+    for f in net/n02_glue.cpp net/rmgk_glue.cpp net/p2p/znx_p2p.cpp net/p2p/http_list.cpp net/p2p/library_static.cpp; do
+        o="$OBJ/net/glue/$(basename "${f%.cpp}").o"
+        # the glue's headers are this repository's: rebuild when one changes
+        for h in net/znx_net.h net/p2p/znx_p2p.h; do [ -f "$o" ] && [ "$h" -nt "$o" ] && rm -f "$o"; done
+        net_queue "$f" "$o" "$GLUE_FLAGS"
+    done
+    queue net/input-net.c "$OBJ/input-net.o" "$COMMON -I$CORE/src/api"
+    if [ "$TARGET" = selftest ]; then
+        # znx-net itself, with the linked-in tables in place of dlopen, its network simulator, md5.c, and
+        # linux_main.c (code cache, caches, memory) with its main() renamed
+        o="$OBJ/net/glue/znx-net.o"; [ -f "$o" ] && [ net/p2p/znx_p2p.h -nt "$o" ] && rm -f "$o"
+        net_queue net/znx-net.cpp "$o" "$GLUE_FLAGS -DZNX_STATIC_LIBS -Inet -I$CORE/subprojects/md5"
+        net_queue net/netsim.cpp "$OBJ/net/glue/netsim.o" "$GLUE_FLAGS"
+        net_queue "$CORE/subprojects/md5/md5.c" "$OBJ/net/md5.o" "$ARCH -O2 -w" gcc
+        net_queue switch/selftest/linux_main.c "$OBJ/net/linux_main_net.o" "$FRONT_FLAGS -Dmain=znx_selftest_main" gcc
+    fi
+fi
+
 tr '\n' '\0' < "$CMDS" | xargs -0 -r -n 1 -P "$JOBS" sh -c
 
 # ---- one relocatable object per library, internals made local ----
@@ -295,6 +360,7 @@ ${P}ld -r -o "$OBJ/lib_rsp_hle.o" $RSP_OBJS
 [ -n "$WITH_BENCH" ] && ${P}ld -r -o "$OBJ/lib_video_null.o" "$OBJ/video-null.o"
 [ -n "$WITH_GAME" ] && ${P}ld -r --force-group-allocation -o "$OBJ/lib_gliden64.o" $GLN_OBJS
 [ -n "$WITH_GAME" ] && ${P}ld -r -o "$OBJ/lib_audio.o" "$OBJ/audio-switch.o"
+{ [ -n "$WITH_GAME" ] || [ "$TARGET" = selftest ]; } && ${P}ld -r -o "$OBJ/lib_input_net.o" "$OBJ/input-net.o"
 for lib in $LIBS; do
     ${P}objcopy --localize-hidden "$OBJ/lib_$lib.o"
 done
@@ -324,9 +390,10 @@ tables() {
         [ "$lib" != core ] && prefix="znxp_${lib}_"
         # The table holds functions only. The core's SDL stand-ins are visible because SDL's
         # headers say so; they are not part of the mupen64plus API.
-        awk -v p="$prefix" '$1 == "FUNC" && $2 !~ /^SDL_/ { print "void " p $2 "(void);" }' "$GEN/exports_$lib.txt" >> "$tables.new"
+        # (an input plugin's SDL_KeyDown/SDL_KeyUp are its API, so the filter is the core's only)
+        awk -v p="$prefix" -v l="$lib" '$1 == "FUNC" && (l != "core" || $2 !~ /^SDL_/) { print "void " p $2 "(void);" }' "$GEN/exports_$lib.txt" >> "$tables.new"
         echo "static const struct znx_static_sym syms_$lib[] = {" >> "$tables.new"
-        awk -v p="$prefix" '$1 == "FUNC" && $2 !~ /^SDL_/ { print "    { \"" $2 "\", " p $2 " }," }' "$GEN/exports_$lib.txt" >> "$tables.new"
+        awk -v p="$prefix" -v l="$lib" '$1 == "FUNC" && (l != "core" || $2 !~ /^SDL_/) { print "    { \"" $2 "\", " p $2 " }," }' "$GEN/exports_$lib.txt" >> "$tables.new"
         echo "    { NULL, NULL } };" >> "$tables.new"
         echo "static const struct znx_static_lib lib_$lib = { \"$lib\", syms_$lib };" >> "$tables.new"
         list="$list &lib_$lib,"
@@ -350,10 +417,15 @@ if [ -n "$WITH_BENCH" ]; then
     needs video_null PluginStartup PluginGetVersion ProcessDList
     tables bench "core rsp_hle video_null"
 fi
+if [ "$TARGET" = selftest ]; then
+    needs input_net PluginStartup PluginGetVersion InitiateControllers GetKeys ControllerCommand ReadController RomOpen RomClosed SDL_KeyDown SDL_KeyUp znx_input_set_source
+    tables selftestnet "core rsp_hle video_null input_net"
+fi
 if [ -n "$WITH_GAME" ]; then
     needs gliden64 PluginStartup PluginGetVersion InitiateGFX ProcessDList UpdateScreen RomOpen RomClosed
     needs audio PluginStartup PluginGetVersion InitiateAudio AiDacrateChanged AiLenChanged RomOpen RomClosed
-    tables game "core rsp_hle gliden64 audio"
+    needs input_net PluginStartup PluginGetVersion InitiateControllers GetKeys ControllerCommand ReadController RomOpen RomClosed SDL_KeyDown SDL_KeyUp znx_input_set_source
+    tables game "core rsp_hle gliden64 audio input_net"
     # Nothing of the plugin may stay visible under a name the core, another plugin or the
     # front could also define: only its API (renamed above) and C++ library templates (weak).
     stray="$(${P}nm -g --defined-only "$OBJ/lib_gliden64.o" | awk '$2 != "W" && $2 != "V" && $2 != "u" && $3 !~ /^znxp_gliden64_/ { print $3 }')"
@@ -367,9 +439,14 @@ if [ "$TARGET" = selftest ]; then
         $FRONT_COMMON_OBJS "$OBJ/front/static_libs_bench.o" "$OBJ/lib_core.o" "$OBJ/lib_rsp_hle.o" "$OBJ/lib_video_null.o" \
         "$OBJ/front/jit_memory.o" \
         /usr/lib/aarch64-linux-gnu/libz.so.1 -lpthread -lm -o "$OUT/znx-selftest"
+    echo "  LD znx-net-linux"
+    g++ -pie -g -Wl,--gc-sections \
+        $NET_OBJS "$OBJ/front/dynlib_static.o" "$OBJ/front/bench_core.o" "$OBJ/front/static_libs_selftestnet.o" \
+        "$OBJ/lib_core.o" "$OBJ/lib_rsp_hle.o" "$OBJ/lib_video_null.o" "$OBJ/lib_input_net.o" "$OBJ/front/jit_memory.o" \
+        /usr/lib/aarch64-linux-gnu/libz.so.1 -lpthread -lm -o "$OUT/znx-net-linux"
     mkdir -p "$OUT/data" "$OUT/profile"
     cp "$CORE"/data/mupen64plus.ini "$CORE"/data/mupencheat.txt "$OUT/data/"
-    echo "built $OUT/znx-selftest"
+    echo "built $OUT/znx-selftest $OUT/znx-net-linux"
     exit 0
 fi
 
@@ -437,7 +514,7 @@ if [ -n "$WITH_GAME" ]; then
         -Wl,-Map,"$OUT/z-cancel-nx.map" -Wl,--wrap=abort -Wl,--wrap=__assert_func \
         $FRONT_COMMON_OBJS $FRONT_GAME_OBJS "$OBJ/front/static_libs_game.o" \
         "$OBJ/lib_core.o" "$OBJ/lib_rsp_hle.o" "$OBJ/front/jit_memory.o" "$OBJ/lib_gliden64.o" "$OBJ/lib_audio.o" \
-        $MENU_LIB_OBJS \
+        "$OBJ/lib_input_net.o" $MENU_LIB_OBJS $NET_OBJS \
         -L"$DEVKITPRO/portlibs/switch/lib" -L"$DEVKITPRO/libnx/lib" -lEGL -lglapi -ldrm_nouveau \
         -lcurl -Wl,--start-group -lfreetype -lharfbuzz -lpng16 -lbz2 -Wl,--end-group -lz -lnx -lm \
         -o "$OUT/z-cancel-nx.elf"

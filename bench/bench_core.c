@@ -98,6 +98,7 @@ uint64_t znx_bench_stall_ns(void)
 
 int znx_bench_frame(void) { return l_frame; }
 void znx_bench_stop(void) { l_stop = 1; }
+int znx_bench_stop_requested(void) { return l_stop; }
 
 void znx_options_defaults(struct znx_options* o)
 {

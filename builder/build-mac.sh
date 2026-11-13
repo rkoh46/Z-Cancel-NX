@@ -154,8 +154,8 @@ N02_FLAGS="$NET_CXX -std=gnu++20 -D__cdecl= -I$N02"
 # net/netsim.cpp (simulated latency, jitter and loss; the socket bound to loopback only).
 KSOCK_FLAGS="$N02_FLAGS -Dlinux=1 -Dsendto=znx_netsim_sendto -Dbind=znx_netsim_bind"
 RMGC_FLAGS="$NET_CXX -std=gnu++20 -D__cdecl= -DRMGK_HAVE_GEKKONET -DRMGK_HAVE_P2P_TRANSPORT -I$RMGC -I$GEK/include -I$N02"
-# RollbackNetcode.cpp: three wrappers renamed so net/rmgk_glue.cpp can watch saves, loads and re-runs.
-RBN_FLAGS="$RMGC_FLAGS -DCoreRollbackSaveGameStateInto=rmgk_CoreRollbackSaveGameStateInto -DCoreRollbackLoadGameState=rmgk_CoreRollbackLoadGameState -DCoreRollbackRunFrame=rmgk_CoreRollbackRunFrame"
+# RollbackNetcode.cpp: four wrappers renamed so net/rmgk_glue.cpp can watch saves, loads, re-runs and the time sync.
+RBN_FLAGS="$RMGC_FLAGS -DCoreRollbackSaveGameStateInto=rmgk_CoreRollbackSaveGameStateInto -DCoreRollbackLoadGameState=rmgk_CoreRollbackLoadGameState -DCoreRollbackRunFrame=rmgk_CoreRollbackRunFrame -DCoreRollbackSetTimesyncScale=rmgk_CoreRollbackSetTimesyncScale"
 GLUE_FLAGS="$RMGC_FLAGS -Wall -Wno-unused-function -Ibench -I$CORE/src/api -I$CORE/subprojects/md5"
 : > "$CMDS"
 NET_OBJS=""
@@ -179,6 +179,10 @@ for f in Error.cpp Library.cpp m64p/Api.cpp m64p/CoreApi.cpp m64p/ConfigApi.cpp;
     queue_cxx "$RMGC/$f" "$OBJ/net/rmgc/$(basename "${f%.cpp}").o" "$RMGC_FLAGS"
 done
 for f in net/*.cpp; do queue_cxx "$f" "$OBJ/net/glue/$(basename "${f%.cpp}").o" "$GLUE_FLAGS" net/znx_net.h; done
+# The lobby and session code the Switch program runs too (net/p2p/: the dialog's part, connect codes,
+# public list, the session).
+# (library_static.cpp and socket_switch.c are the Switch's stand-ins for dlsym and FIONBIO: not here)
+for f in net/p2p/znx_p2p.cpp net/p2p/http_list.cpp; do queue_cxx "$f" "$OBJ/net/p2p/$(basename "${f%.cpp}").o" "$GLUE_FLAGS" net/p2p/znx_p2p.h; done
 tr '\n' '\0' < "$CMDS" | xargs -0 -n 1 -P "$JOBS" sh -c
 echo "  LD znx-net"
 clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -c bench/bench_core.c -I"$CORE/src/api" -o "$OBJ/net/bench_core.o"
@@ -230,13 +234,51 @@ if [ "${2:-}" = game ]; then
     done
     clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -w $MENU_DEPS -Imenu -c menu/xdelta_apply.c -o "$MENU_OBJ/xdelta_apply.o"
     echo "  CC znx-game"
-    clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -I"$CORE/src/api" -Ibench -Igame -Imenu $MENU_DEPS $FT_FLAGS \
+    # The online screens drive the same lobby code as znx-net (net/p2p/, n02, GekkoNet, rmgk_gekko): its
+    # objects from above, without znx-net's main.
+    GAME_NET_OBJS=""
+    for o in $NET_OBJS; do [ "$o" = "$OBJ/net/glue/znx-net.o" ] || GAME_NET_OBJS="$GAME_NET_OBJS $o"; done
+    clang -arch "$ARCH" -mmacosx-version-min=11.0 -O2 -Wall -I"$CORE/src/api" -Ibench -Igame -Imenu -Inet $MENU_DEPS $FT_FLAGS \
         -DZNX_VERSION="\"$(cat VERSION)\"" \
         game/mac/znx-game-mac.c game/mac/vidext_cgl.c game/mac/menu_mac.c game/game_core.c bench/bench_core.c \
-        menu/menu.c menu/draw.c menu/catalog.c menu/patcher.c menu/settings.c menu/online.c \
+        menu/menu.c menu/draw.c menu/catalog.c menu/patcher.c menu/settings.c menu/online.c menu/lobby_entry.c \
         "$MENU_OBJ"/md5.o "$MENU_OBJ"/unzip.o "$MENU_OBJ"/ioapi.o "$MENU_OBJ"/xdelta_apply.o \
-        $FT_LIBS -lcurl -framework OpenGL -lz -o "$OUT/znx-game"
+        $GAME_NET_OBJS $FT_LIBS -lcurl -framework OpenGL -lz -lc++ -o "$OUT/znx-game"
     mkdir -p "$OUT/romfs/fonts"
     cp assets/fonts/BarlowSemiCondensed-Medium.ttf "$OUT/romfs/fonts/"
     echo "built $OUT/znx-game"
 fi
+
+# znx-lobby-test: RMG-K's rollback lobby client (net/lobby/, see docs/PLAN.md, "RMG-K lobby, in
+# detail") with libjuice 1.7.3 for ICE, compiled from RMG-K's copy (ref/RMG-K/Source/3rdParty/
+# libjuice, MPL-2.0, copied to build/src/libjuice unchanged) as RMG-K builds it (NO_SERVER, no
+# Nettle), and GekkoNet from the znx-net objects above. The test runs two clients against the
+# local mock server (net/lobby/test/mock_lobby.py) on 127.0.0.1:
+#   build/mac-<arch>/znx-lobby-test --mock net/lobby/test/mock_lobby.py
+JUICE="$SRC/libjuice"
+rsync -a --exclude .git --exclude test --exclude fuzzer "ref/RMG-K/Source/3rdParty/libjuice/" "$JUICE/"
+JUICE_FLAGS="-arch $ARCH -mmacosx-version-min=11.0 -O2 -std=gnu11 -w -DJUICE_STATIC -DUSE_NETTLE=0 -DNO_SERVER -DRELEASE=1 -I$JUICE/include -I$JUICE/include/juice -I$JUICE/src"
+LOBBY_FLAGS="-arch $ARCH -mmacosx-version-min=11.0 -O2 -std=gnu++17 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -DJUICE_STATIC -DGEKKONET_STATIC -I$JUICE/include -I$GEK/include -I$SRC/RMG-Core -Inet/lobby"
+: > "$CMDS"
+LOBBY_OBJS=""
+for f in addr agent crc32 const_time conn conn_poll conn_thread conn_mux base64 hash hmac ice juice log random server stun timestamp tcp turn udp; do
+    o="$OBJ/lobby/juice/$f.o"
+    mkdir -p "$(dirname "$o")"
+    if [ ! -f "$o" ] || [ "$JUICE/src/$f.c" -nt "$o" ] || [ "$0" -nt "$o" ] || [ -n "${REBUILD:-}" ]; then
+        echo "echo '  CC libjuice/$f.c' && clang $JUICE_FLAGS -c $JUICE/src/$f.c -o $o" >> "$CMDS"
+    fi
+    LOBBY_OBJS="$LOBBY_OBJS $o"
+done
+for f in net/lobby/*.cpp net/lobby/test/znx-lobby-test.cpp; do
+    o="$OBJ/lobby/$(basename "${f%.cpp}").o"
+    mkdir -p "$(dirname "$o")"
+    if [ ! -f "$o" ] || [ "$f" -nt "$o" ] || [ "$0" -nt "$o" ] || [ -n "${REBUILD:-}" ] || \
+       [ -n "$(find net/lobby -maxdepth 1 -name '*.h' -newer "$o" 2>/dev/null)" ]; then
+        echo "echo '  CXX $f' && clang++ $LOBBY_FLAGS -c $f -o $o" >> "$CMDS"
+    fi
+    LOBBY_OBJS="$LOBBY_OBJS $o"
+done
+tr '\n' '\0' < "$CMDS" | xargs -0 -n 1 -P "$JOBS" sh -c
+echo "  LD znx-lobby-test"
+clang++ -arch "$ARCH" -mmacosx-version-min=11.0 -o "$OUT/znx-lobby-test" $LOBBY_OBJS "$OBJ"/net/gekko/*.o -lpthread
+echo "built $OUT/znx-lobby-test"

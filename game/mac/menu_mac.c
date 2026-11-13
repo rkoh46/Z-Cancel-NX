@@ -5,12 +5,18 @@
  *
  *   znx-game --menu-shot OUT.png [--menu-keys "down,down,a,shot=x.png,job"] [--menu-base DIR]
  *            [--menu-build GAME,STEP,DONE,TOTAL[,download]] [--menu-notice "title|text|detail"]
+ *            [--menu-text "first|second"] [--menu-online GAME,SCREEN]
  *
  * --menu-base is the folder that stands in for sdmc:/switch/z-cancel-nx (default: menu-sd next to
  * the program). Keys: up down left right a b x y plus minus l r zl zr; "hold-minus" holds Minus for
  * a second; "wait" lets 30 frames pass; "job" waits for a build to finish (it really runs: the
  * patches in DIR/patches are applied, a download goes to ZNX_PATCH_URL_OVERRIDE if that is set);
- * "shot=FILE" saves the screen at that point. OUT.png is the screen after the last key. */
+ * "shot=FILE" saves the screen at that point; "sleep=MS" keeps drawing frames for MS milliseconds of real
+ * time (the online screens wait for the network: the lobby runs for real, against whatever local test
+ * servers the base folder's z-cancel-nx.ini names). --menu-text answers the system keyboard, one entry
+ * per time it opens. --menu-online shows an online screen with made-up content (online.h
+ * znx_online_debug: lobby, lobby-mismatch, host, host-ip, joining, list, list-empty). OUT.png is the
+ * screen after the last key. */
 
 #define GL_SILENCE_DEPRECATION 1
 #include <OpenGL/OpenGL.h>
@@ -37,6 +43,26 @@
 #define H 720
 
 static GLuint l_fbo;
+static char l_texts[8][128];
+static int l_text_count, l_text_next;
+
+void znx_log_line(const char* line)
+{
+    fprintf(stderr, "%s\n", line);
+}
+
+/* The system keyboard, answered from --menu-text. */
+static int keyboard(int kind, const char* header, const char* guide, const char* initial, char* out, size_t out_size)
+{
+    (void)guide;
+    if (l_text_next >= l_text_count) {
+        printf("menu: keyboard \"%s\" (kind %d, initial \"%s\") cancelled\n", header, kind, initial ? initial : "");
+        return 0;
+    }
+    snprintf(out, out_size, "%s", l_texts[l_text_next++]);
+    printf("menu: keyboard \"%s\" answered \"%s\"\n", header, out);
+    return 1;
+}
 
 static void* getproc(const char* name)
 {
@@ -128,7 +154,7 @@ static enum znx_menu_action frame(struct znx_menu* menu, uint32_t held)
 
 static const char* action_name(enum znx_menu_action a)
 {
-    return a == ZNX_MENU_PLAY ? "play" : a == ZNX_MENU_QUIT ? "quit" : NULL;
+    return a == ZNX_MENU_PLAY ? "play" : a == ZNX_MENU_QUIT ? "quit" : a == ZNX_MENU_PLAY_ONLINE ? "play online" : NULL;
 }
 
 int znx_menu_mac_main(int argc, char** argv)
@@ -140,6 +166,7 @@ int znx_menu_mac_main(int argc, char** argv)
     const char* build = NULL;
     const char* notice = NULL;
     const char* base_arg = NULL;
+    const char* online = NULL;
     CGLPixelFormatObj format = NULL;
     CGLContextObj context = NULL;
     GLint formats = 0;
@@ -155,6 +182,13 @@ int znx_menu_mac_main(int argc, char** argv)
         else if (!strcmp(argv[i], "--menu-base") && i + 1 < argc) base_arg = argv[++i];
         else if (!strcmp(argv[i], "--menu-build") && i + 1 < argc) build = argv[++i];
         else if (!strcmp(argv[i], "--menu-notice") && i + 1 < argc) notice = argv[++i];
+        else if (!strcmp(argv[i], "--menu-online") && i + 1 < argc) online = argv[++i];
+        else if (!strcmp(argv[i], "--menu-text") && i + 1 < argc) {
+            char copy[1024];
+            snprintf(copy, sizeof(copy), "%s", argv[++i]);
+            for (char* t = strtok(copy, "|"); t != NULL && l_text_count < 8; t = strtok(NULL, "|"))
+                snprintf(l_texts[l_text_count++], sizeof(l_texts[0]), "%s", t);
+        }
         else {
             fprintf(stderr, "znx-game --menu-shot OUT.png [--menu-keys K,K,...] [--menu-base DIR] "
                             "[--menu-build GAME,STEP,DONE,TOTAL[,download]] [--menu-notice \"title|text|detail\"]\n");
@@ -209,6 +243,7 @@ int znx_menu_mac_main(int argc, char** argv)
     }
     config.base_dir = base;
     config.version = ZNX_VERSION;
+    config.keyboard = keyboard;
     menu = znx_menu_create(&config);
     if (notice != NULL) {
         char copy[1200], *title, *text, *detail;
@@ -231,6 +266,13 @@ int znx_menu_mac_main(int argc, char** argv)
         znx_menu_debug_build(menu, game, downloads, step, done, total);
         frame(menu, 0);
     }
+    if (online != NULL) {
+        int game = 0;
+        char which[64] = "";
+        sscanf(online, "%d,%63s", &game, which);
+        znx_menu_debug_online(menu, game, which);
+        frame(menu, 0);
+    }
 
     {
         char copy[2048];
@@ -239,6 +281,12 @@ int znx_menu_mac_main(int argc, char** argv)
             enum znx_menu_action action = ZNX_MENU_NONE;
             if (!strncmp(key, "shot=", 5)) {
                 save_png(key + 5);
+            } else if (!strncmp(key, "sleep=", 6)) {
+                const int ms = atoi(key + 6);
+                for (int t = 0; t < ms && action == ZNX_MENU_NONE; t += 16) {
+                    action = frame(menu, 0);
+                    usleep(16000);
+                }
             } else if (!strcmp(key, "wait")) {
                 for (int i = 0; i < 30; ++i) action = action ? action : frame(menu, 0);
             } else if (!strcmp(key, "job")) {
@@ -261,8 +309,8 @@ int znx_menu_mac_main(int argc, char** argv)
                 if (action == ZNX_MENU_NONE) action = frame(menu, 0);
             }
             if (action_name(action) != NULL) {
-                printf("menu: %s%s%s\n", action_name(action), action == ZNX_MENU_PLAY ? " " : "",
-                       action == ZNX_MENU_PLAY ? znx_menu_rom_path(menu) : "");
+                printf("menu: %s%s%s\n", action_name(action), action != ZNX_MENU_QUIT ? " " : "",
+                       action != ZNX_MENU_QUIT ? znx_menu_rom_path(menu) : "");
                 znx_menu_resume(menu);
             }
         }

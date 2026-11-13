@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-/* The two settings the start screen edits, in <base>/z-cancel-nx.ini, the file the game already
- * reads (switch/game_switch.c): sound=0|1 and stick_range=60..100. Every other line of the file is
- * kept as it is; a key that is missing is added at the end. */
+/* The settings the start screen edits, in <base>/z-cancel-nx.ini, the file the game already reads
+ * (switch/game_switch.c). Every other line of the file is kept as it is; a key that is missing is
+ * added at the end.
+ *
+ *   sound=0|1, stick_range=60..100        this console
+ *   name=<text>                           online: the name the other player sees (n02 LOGN, 31 bytes)
+ *   input_delay=0..9                      online, as host: 0 = Auto (from the ping, as RMG-K), else frames
+ *   public_list=0|1                       online, as host: list the game on RMG-K's public list
+ *   net_overlay=0|1                       online: ping, rollbacks and delay in the corner during a match
+ *   p2p_port=27886                        online, as host: the UDP port (RMG-K's Kaillera port setting)
+ *   p2p_code=, p2p_token=                 the connect code the traversal server gave this console, kept
+ *                                         as RMG-K keeps it (Kaillera P2PStaticCode / ...OwnerToken)
+ *   nat_server=host:port, list_server=host:port   only for tests against a local stand-in; empty = RMG-K's
+ *   net_vsync=0|1                         online: 0 (default) RMG-K's timer pacer with swap interval 0;
+ *                                         1 the display's vsync with a frame dropped or repeated on drift */
 #ifndef ZNX_SETTINGS_H
 #define ZNX_SETTINGS_H
 
@@ -12,6 +24,16 @@
 struct znx_menu_settings {
     int sound;        /* 1 on */
     int stick_range;  /* what a full tilt reads on the N64 axis */
+    char name[32];
+    int input_delay;  /* 0 auto, 1..9 */
+    int public_list;
+    int net_overlay;
+    int p2p_port;
+    char p2p_code[32];
+    char p2p_token[96];
+    char nat_server[128];
+    char list_server[128];
+    int net_vsync;
 };
 
 /* Defaults, then whatever the file says. */

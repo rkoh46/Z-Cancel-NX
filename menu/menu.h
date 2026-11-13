@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 
+#include "online.h"
 #include "settings.h"
 
 /* Buttons, by the Switch's names (a GameCube controller's A, B, X, Y, Start come in as the same). */
@@ -28,13 +29,16 @@
 #define ZNX_BTN_ZL     0x1000u
 #define ZNX_BTN_ZR     0x2000u
 
-enum znx_menu_action { ZNX_MENU_NONE, ZNX_MENU_PLAY, ZNX_MENU_QUIT };
+/* PLAY_ONLINE: both players are ready in an online lobby; run the ROM with znx_p2p_run_session as the
+ * session, then call znx_menu_online_finished. */
+enum znx_menu_action { ZNX_MENU_NONE, ZNX_MENU_PLAY, ZNX_MENU_QUIT, ZNX_MENU_PLAY_ONLINE };
 
 struct znx_menu;
 
 struct znx_menu_config {
     const char* base_dir;   /* sdmc:/switch/z-cancel-nx */
     const char* version;    /* shown small in the corner */
+    znx_keyboard_fn keyboard;   /* the system keyboard (names, connect codes, addresses); NULL: none */
 };
 
 struct znx_menu* znx_menu_create(const struct znx_menu_config* config);
@@ -57,8 +61,15 @@ const char* znx_menu_rom_path(const struct znx_menu* menu);
 int znx_menu_game(const struct znx_menu* menu);
 void znx_menu_get_settings(const struct znx_menu* menu, struct znx_menu_settings* settings);
 
+/* After an online match (ZNX_MENU_PLAY_ONLINE): back to the screen before the match if the other player
+ * is still there, else a message saying how it ended. Call before showing the menu again. */
+void znx_menu_online_finished(struct znx_menu* menu);
+
 /* 1 while a ROM is being built (the build screen is up). */
 int znx_menu_busy(const struct znx_menu* menu);
+
+/* Preview only: an online screen with made-up content (online.h znx_online_debug). */
+void znx_menu_debug_online(struct znx_menu* menu, int game, const char* which);
 
 /* Preview only: shows the build screen with made-up progress (no thread, nothing written). */
 void znx_menu_debug_build(struct znx_menu* menu, int game, int downloads, int step, uint64_t done, uint64_t total);

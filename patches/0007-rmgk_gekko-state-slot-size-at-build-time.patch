@@ -1,0 +1,23 @@
+rmgk_gekko: the size of a rollback state slot can be set at build time
+
+GekkoNet allocates every state slot at the size it is given (prediction window + 2 slots and
+one more), and RMG-K gives 24 MiB per slot: about 240 MB for a 7-frame window. The core's
+rollback state is 8,438,120 bytes, so on the Switch that is mostly unused memory the console
+does not have to spare. The size is local (GekkoNet never sends it), so it can differ between
+the two players. Without RMGK_GEKKO_STATE_CAPACITY nothing changes: the Mac build keeps 24 MiB;
+builder/build-switch.sh passes 10 MiB.
+
+--- a/RMG-Core/rmgk_gekko.cpp
++++ b/RMG-Core/rmgk_gekko.cpp
+@@ -70,7 +70,10 @@
+ 
+ namespace
+ {
+-constexpr unsigned int kGekkoStateCapacity = 24u * 1024u * 1024u;
++#ifndef RMGK_GEKKO_STATE_CAPACITY
++#define RMGK_GEKKO_STATE_CAPACITY (24u * 1024u * 1024u)
++#endif
++constexpr unsigned int kGekkoStateCapacity = RMGK_GEKKO_STATE_CAPACITY;
+ constexpr int kGekkoMaxLoggedFrames = 600;
+ constexpr int kGekkoWaitSleepUs = 100;
+ // Lobby matches leave player drops to the lobby (MATCH_PEER_LEFT). GekkoNet's

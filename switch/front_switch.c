@@ -100,6 +100,12 @@ void znx_front_print(int is_error, const char* line)
     emit(line);
 }
 
+/* menu/online.h and net/p2p: the online lobby's lines, from its own thread */
+void znx_log_line(const char* line)
+{
+    emit(line);
+}
+
 /* ---- leaving when the emulation thread cannot be joined ---- */
 
 /* Returning to the Homebrew Menu with a thread still running would leave it executing code

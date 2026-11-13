@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-/* znx-net: a headless RMG-K P2P rollback session between two copies of this program.
+/* znx-net: a headless RMG-K P2P rollback session, against another copy of this program or the
+ * Switch program, with the lobby and session code the Switch runs (net/p2p/znx_p2p.cpp).
  *
- *   znx-net --rom ROM --host PORT          --inputs FILE --player 1
- *   znx-net --rom ROM --join 127.0.0.1:PORT --inputs FILE --player 2
+ *   znx-net --rom ROM --host PORT              --inputs FILE --player 1
+ *   znx-net --rom ROM --join IP:PORT|CODE      --inputs FILE --player 2
+ *   znx-net --fetch-list HOST:PORT             (prints the public list, then exits)
  *
  * Everything that is on the wire is RMG-K's own code, compiled unchanged from ref/RMG-K (see
  * docs/PLAN.md, "RMG-K P2P rollback, in detail"):
@@ -13,23 +15,33 @@
  *     callbacks, input latching, deferred saves, time sync and the presentation pacer) and its
  *     core wrappers (RMG-Core/RollbackNetcode.cpp);
  *   - GekkoNet (GekkoLib), built without asio.
- * This file plays the part of RMG-K's Qt dialog (KailleraP2PDialog: host or join, announce or
- * take the rollback settings, ready, start), of CoreStartEmulation (bench/bench_core.c sets the
- * core up the way a session does) and of the controller (an input plugin fed from a script).
+ * net/p2p/znx_p2p.cpp plays the part of RMG-K's Qt dialog (host or join, connect codes, the public
+ * list, announce or take the rollback settings, ready, start, DROP) and runs the session; this file
+ * plays CoreStartEmulation (bench/bench_core.c sets the core up the way a session does) and the
+ * controller (an input plugin fed from a script), and prints the check lines.
  *
  * Output (stdout):
  *   check <frame> <whole> <rest>   RDRAM checksums after <frame> frames (the bench's "check" line),
  *                                  every --check-every frames and after the last one; printed
  *                                  only once that frame is final (no later input can roll it back)
+ *   code <CODE>                    host with --nat: the connect code, once the server gave it
+ *   lobby: ...                     the peer, ping and agreed delay before the match
  *   summary lines at the end: frames, wall time, frames per second, rollbacks
  * Diagnostics go to stderr. */
 
 #include <arpa/inet.h>
-#include <dlfcn.h>
 #include <libgen.h>
-#include <mach-o/dyld.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef ZNX_STATIC_LIBS
+/* The Linux self-test of the Switch build (builder/build-switch.sh --selftest-net): the core and the
+ * plugins are linked in and found through switch/dynlib_static.c's tables, as on the console. */
+extern "C" void* znx_static_lib(const char* name);
+extern "C" void* osal_dynlib_getproc(void* lib, const char* name);
+#else
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -53,10 +65,10 @@ extern "C" {
 #include "m64p_debugger.h"
 #include "m64p_frontend.h"
 
-#include "core/p2p_core.h"
 #include "m64p/Api.hpp"
 #include "rmgk_gekko.hpp"
 
+#include "p2p/znx_p2p.h"
 #include "znx_net.h"
 
 namespace
@@ -68,11 +80,11 @@ using Clock = std::chrono::steady_clock;
 struct Options {
     const char* rom = nullptr;
     bool host = false;
-    int port = 0;                 /* host: port to listen on; joiner: the host's port */
-    std::string join_ip;
+    int port = 0;                 /* host: port to listen on */
+    std::string join;             /* joiner: ip:port or a connect code */
     const char* inputs = nullptr;
     int player = 0;               /* which player's lines of the script this side plays */
-    int delay = 2;
+    int delay = 2;                /* host: 0 = automatic from the ping, as RMG-K's default */
     int prediction = 7;
     int frames = 17000;
     int check_every = 60;
@@ -83,9 +95,14 @@ struct Options {
     bool pace = true;
     bool verbose = false;
     bool gekko_log = false;
+    bool bind_any = false;        /* listen on every interface (a LAN test against the Switch) */
+    bool enlist = false;
+    std::string nat, list;        /* host:port of the traversal and list servers (tests: a local mock) */
     const char* name = nullptr;
-    std::string app = "RMG-K v0.9.16";   /* RMG-K's "RMG-K " + CORE_VERSION (git tag) */
+    std::string app = ZNX_P2P_APP;
     int lobby_timeout_s = 60;
+    const char* code_file = nullptr;   /* host: keeps the connect code and token between runs */
+    int ready_after_s = 0;        /* press Ready this long after the peer arrived (lets the automatic delay settle) */
 };
 
 Options g_opt;
@@ -135,16 +152,7 @@ uint32_t script_value(int frame)
 
 /* ---- session state ---- */
 
-std::mutex g_lobby_mutex;
-bool g_peer_joined = false, g_hosted_game_known = false, g_got_mode = false, g_mode_rollback = false;
-bool g_got_delay = false, g_got_prediction = false;
-int g_host_delay = -1, g_host_prediction = 0;
-std::string g_hosted_game, g_peer_name, g_peer_app;
-std::atomic<int> g_game_player{0};       /* set by p2p_game_callback: 1 host, 2 joiner */
-std::atomic<bool> g_local_drop{false};   /* our own p2p_drop_game is calling back */
-std::atomic<bool> g_peer_dropped{false};
-
-int g_session_delay = 2, g_session_prediction = 7, g_local_player = 1;
+int g_session_delay = 2;
 std::string g_goodname;
 std::string g_log_dir;
 
@@ -152,8 +160,6 @@ void* g_core = nullptr;
 const uint8_t* g_rdram = nullptr;
 bool g_first_frame = true;
 
-/* frames */
-std::atomic<int> g_visible{0};           /* visible frames completed */
 int g_max_saved = -1;                    /* newest GekkoNet frame whose post-frame state was saved */
 int g_final = -1;                        /* newest frame known final */
 std::map<int, std::pair<uint64_t, uint64_t>> g_pending_checks;   /* frame -> checksums, not yet final */
@@ -161,6 +167,7 @@ int g_checks_printed = 0;
 std::atomic<bool> g_done{false};         /* every frame below --frames is final */
 Clock::time_point g_done_time;
 std::atomic<bool> g_stop_failed{false};
+int g_visible = 0;
 
 /* rollback statistics, from the wrapped core calls */
 int g_rollbacks = 0, g_resim_frames = 0, g_depth = 0, g_max_depth = 0, g_depth_hist[16];
@@ -177,6 +184,22 @@ void note(const char* format, ...)
     std::fprintf(stderr, "znx-net[%s]: %s\n", g_opt.host ? "host" : "join", line);
 }
 
+void p2p_log(const char* line, void*)
+{
+    note("%s", line);
+}
+
+/* ---- the libraries: dlopen on the Mac, the linked-in tables in the self-test ---- */
+
+void* lib_sym(void* lib, const char* name)
+{
+#ifdef ZNX_STATIC_LIBS
+    return osal_dynlib_getproc(lib, name);
+#else
+    return dlsym(lib, name);
+#endif
+}
+
 /* ---- the controller ---- */
 
 uint32_t input_source(int control)
@@ -190,18 +213,18 @@ uint32_t input_source(int control)
     return frame < 0 ? 0 : script_value(frame + g_session_delay);
 }
 
-/* ---- the frame hooks (rmgk_gekko's debug hooks: start and end of every visible frame) ---- */
+/* ---- the session hooks ---- */
 
-bool begin_frame_hook(void*)
+int begin_visible(void*)
 {
     if (g_first_frame) {
         g_first_frame = false;
         /* RDRAM exists once the emulation runs */
-        auto get_pointer = (ptr_DebugMemGetPointer)dlsym(g_core, "DebugMemGetPointer");
+        auto get_pointer = (ptr_DebugMemGetPointer)lib_sym(g_core, "DebugMemGetPointer");
         g_rdram = get_pointer != nullptr ? (const uint8_t*)get_pointer(M64P_DBG_PTR_RDRAM) : nullptr;
         if (g_rdram == nullptr) {
             note("no RDRAM pointer");
-            return false;
+            return 0;
         }
         /* as znx-bench: video and audio output on (null plugins), no core limiter, no host events */
         m64p::Core.DoCommand(M64CMD_FRAME_OUTPUT_SET, M64FRAME_OUTPUT_VIDEO | M64FRAME_OUTPUT_AUDIO, nullptr);
@@ -211,65 +234,85 @@ bool begin_frame_hook(void*)
      * so the same pacer runs here, once per visible frame. */
     if (g_opt.pace)
         rmgk_gekko::pace_before_present();
-    return true;
+    return 1;
 }
 
-bool end_frame_hook(void*)
+int end_visible(void*)
 {
     const int visible = ++g_visible;
     if (visible % 1200 == 0) {
-        RollbackLagStats lag;
-        rmgk_gekko::lag_stats(lag);
+        struct znx_p2p_live live;
+        znx_p2p_live(&live);
         const double s = std::chrono::duration<double>(Clock::now() - g_session_begin).count();
-        int ping = -1;
-        float ahead = 0;
-        if (!lag.peers.empty()) {
-            ping = lag.peers[0].pingMs;
-            ahead = lag.peers[0].framesAhead;
-        }
         note("progress: %d frames in %.1f s, final up to %d, rollbacks %d (deepest %d), ping %d ms, frames ahead %.2f",
-            visible, s, g_final + 1, g_rollbacks, g_max_depth, ping, ahead);
+            visible, s, g_final + 1, g_rollbacks, g_max_depth, live.ping, live.frames_ahead);
     }
-    return true;
+    if (g_done.load()) {
+        /* Final here. Keep running (and sending our inputs) until the peer is final too: it says
+         * so with n02's DROP. */
+        if (znx_p2p_peer_dropped() || Clock::now() - g_done_time > std::chrono::seconds(10)) {
+            if (!znx_p2p_peer_dropped())
+                note("no DROP from the peer within 10 s of finishing; stopping");
+            znx_p2p_stop_game();
+        }
+    } else if (znx_p2p_peer_dropped()) {
+        note("the peer left the game before every frame was final");
+        g_stop_failed = true;
+        znx_p2p_stop_game();
+    }
+    return 1;
 }
 
-/* ---- the control thread: what RMG-K's dialog timer does while a rollback game runs ---- */
-
-std::atomic<bool> g_control_running{false};
-
-void control_thread()
+void state_saved(int frame, void*)
 {
-    int last_visible = -1;
-    Clock::time_point last_progress = Clock::now();
-    while (g_control_running.load()) {
-        /* KailleraP2PDialog::onStepTimer: n02 CHAT/DROP/EXIT/PING while GekkoNet owns the game */
-        p2p_rollback_process_control();
-        const auto now = Clock::now();
-        const int visible = g_visible.load();
-        if (visible != last_visible) {
-            last_visible = visible;
-            last_progress = now;
-        }
-        if (g_done.load()) {
-            /* Final here. Keep running (and sending our inputs) until the peer is final too:
-             * it says so with n02's DROP. */
-            if (g_peer_dropped.load() || now - g_done_time > std::chrono::seconds(10)) {
-                if (!g_peer_dropped.load())
-                    note("no DROP from the peer within 10 s of finishing; stopping");
-                rmgk_gekko::request_stop();
-            }
-        }
-        else if (now - last_progress > std::chrono::seconds(30)) {
-            note("no frame for 30 s (stalled at %d visible frames); stopping", visible);
-            g_stop_failed = true;
-            rmgk_gekko::request_stop();
-        }
-        else if (g_peer_dropped.load()) {
-            note("the peer left the game before every frame was final");
-            g_stop_failed = true;
-            rmgk_gekko::request_stop();
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    if (frame > g_max_saved)
+        g_max_saved = frame;
+    const int after = frame + 1;   /* GekkoNet frame F completed = F + 1 frames, the bench's count */
+    if (after > g_opt.frames || g_rdram == nullptr)
+        return;
+    if (after % g_opt.check_every != 0 && after != g_opt.frames)
+        return;
+    uint64_t whole, rest;
+    znx_check_rdram(g_rdram, g_opt.check_skip_lo, g_opt.check_skip_hi, &whole, &rest);
+    g_pending_checks[frame] = { whole, rest };
+}
+
+void state_loaded(int, void*)
+{
+    if (g_depth > 0)
+        g_depth_hist[std::min(g_depth, 15)]++;
+    g_rollbacks++;
+    g_depth = 0;
+}
+
+void frame_resimulated(void*)
+{
+    g_resim_frames++;
+    g_depth++;
+    g_max_depth = std::max(g_max_depth, g_depth);
+}
+
+void end_frame(int confirmed, void*)
+{
+    if (g_depth > 0) {
+        g_depth_hist[std::min(g_depth, 15)]++;
+        g_depth = 0;
+    }
+    const int final_frame = std::min(confirmed, g_max_saved);
+    if (final_frame > g_final)
+        g_final = final_frame;
+    while (!g_pending_checks.empty() && g_pending_checks.begin()->first <= g_final) {
+        const auto& entry = *g_pending_checks.begin();
+        std::printf("check %d %016llx %016llx\n", entry.first + 1,
+            (unsigned long long)entry.second.first, (unsigned long long)entry.second.second);
+        g_checks_printed++;
+        g_pending_checks.erase(g_pending_checks.begin());
+    }
+    if (!g_done.load() && g_final >= g_opt.frames - 1) {
+        g_done_time = Clock::now();
+        g_done = true;
+        note("every frame up to %d is final; telling the peer (n02 DROP)", g_opt.frames);
+        znx_p2p_send_drop();
     }
 }
 
@@ -277,45 +320,25 @@ void control_thread()
 
 int run_session()
 {
-    if (!m64p::Core.Hook(g_core)) {
-        note("cannot hook RMG-K's core wrapper: %s", m64p::Core.GetLastError().c_str());
-        return 1;
-    }
-
-    char peer_ip[128] = {};
-    int peer_port = 0;
-    if (!p2p_core_get_peer_endpoint(peer_ip, sizeof(peer_ip), &peer_port)) {
-        note("no peer endpoint");
-        return 1;
-    }
-    /* CoreStartEmulation, the GEKKO| branch (Emulation.cpp:1135-1170) */
-    if (!rmgk_gekko::set_deterministic(true)) {
-        note("set_deterministic failed");
-        return 1;
-    }
-    if (!rmgk_gekko::start_p2p_session("rmgk-gekko", 2, (int)sizeof(uint32_t), g_local_player,
-            (unsigned short)p2p_core_get_port(), peer_ip, (unsigned short)peer_port,
-            g_session_delay, g_session_prediction)) {
-        note("start_p2p_session failed");
-        return 1;
-    }
-    rmgk_gekko::set_debug_hooks(nullptr, begin_frame_hook, end_frame_hook, nullptr);
-    note("session: player %d, delay %d, prediction window %d, peer %s:%d, local port %d",
-        g_local_player, g_session_delay, g_session_prediction, peer_ip, peer_port, p2p_core_get_port());
+    struct znx_p2p_session_hooks hooks;
+    std::memset(&hooks, 0, sizeof(hooks));
+    hooks.begin_visible = begin_visible;
+    hooks.end_visible = end_visible;
+    hooks.state_saved = state_saved;
+    hooks.state_loaded = state_loaded;
+    hooks.frame_resimulated = frame_resimulated;
+    hooks.end_frame = end_frame;
+    hooks.stop_on_peer_drop = 0;
+    hooks.verbose_log = g_opt.gekko_log;
+    hooks.log_dir = g_log_dir.c_str();
 
     g_session_begin = Clock::now();
-    g_control_running = true;
-    std::thread control(control_thread);
-    const bool ok = rmgk_gekko::execute();
+    const int result = znx_p2p_run_session(g_core, &hooks);
     const double wall = std::chrono::duration<double>(Clock::now() - g_session_begin).count();
-    g_control_running = false;
-    control.join();
+    char end_text[256];
+    const int end = znx_p2p_last_end(end_text, sizeof(end_text));
 
-    RollbackLagStats lag;
-    rmgk_gekko::lag_stats(lag);
-    rmgk_gekko::close_session();
-
-    const int visible = g_visible.load();
+    const int visible = g_visible;
     std::printf("frames %d visible, final up to %d, %d check lines\n", visible, g_final + 1, g_checks_printed);
     std::printf("wall %.3f s, %.2f frames per second\n", wall, wall > 0 ? visible / wall : 0.0);
     std::printf("rollbacks %d, re-simulated frames %d, deepest %d frames\n", g_rollbacks, g_resim_frames, g_max_depth);
@@ -324,25 +347,19 @@ int run_session()
         if (g_depth_hist[i] != 0)
             std::printf(" %d:%d", i, g_depth_hist[i]);
     std::printf("\n");
-    std::printf("rmgk lag_stats: rollbacks %d, re-simulated frames %d, deepest %d, waited for input %.1f ms (longest %.1f ms), "
-                "slow frames %d, hitches %d\n",
-        lag.match.rollbacks, lag.match.rollbackFrames, lag.match.maxRollbackFrames,
-        lag.match.waitUs / 1000.0, lag.match.longestWaitUs / 1000.0, lag.match.slowFrames, lag.match.hitches);
-    for (const auto& peer : lag.peers)
-        std::printf("rmgk peer slot %d: ping %d ms (avg %.1f, jitter %.1f), frames ahead %.2f\n",
-            peer.slot, peer.pingMs, peer.avgPingMs, peer.jitterMs, peer.framesAhead);
     uint64_t sent, dropped, delayed;
     znx_netsim_stats(&sent, &dropped, &delayed);
     std::printf("netsim: %llu datagrams sent, %llu dropped, %llu delayed\n",
         (unsigned long long)sent, (unsigned long long)dropped, (unsigned long long)delayed);
+    note("session end %d: %s", end, end_text);
 
-    if (!ok)
-        note("execute failed");
+    if (result != 0)
+        note("the session failed");
     if (g_stop_failed.load() || !g_done.load()) {
         note("the session ended before every frame up to %d was final", g_opt.frames);
         return 1;
     }
-    return ok ? 0 : 1;
+    return result;
 }
 
 /* ---- the ROM's GoodName, the game name n02 announces (RMG-K uses the ROM browser's) ---- */
@@ -378,125 +395,223 @@ std::string rom_goodname(const char* rom_path, const std::string& data_dir)
     return std::string("ROM ") + md5;
 }
 
-/* ---- the lobby: what KailleraP2PDialog does in rollback mode ---- */
+/* ---- the lobby: net/p2p/znx_p2p.cpp, driven as the Switch's online screens drive it ---- */
 
-void send_chat(const std::string& text)
+bool split_host_port(const std::string& text, std::string& host, int& port)
 {
-    std::vector<char> buffer(text.begin(), text.end());
-    buffer.push_back(0);
-    p2p_send_chat(buffer.data());
+    const size_t colon = text.rfind(':');
+    if (colon == std::string::npos)
+        return false;
+    host = text.substr(0, colon);
+    port = std::atoi(text.c_str() + colon + 1);
+    return !host.empty() && port > 0 && port <= 65535;
 }
 
-bool parse_int_after(const char* message, const char* prefix, int* value, int* second)
+std::string g_saved_code, g_saved_token;
+
+void save_identity(const char* code, const char* token, void*)
 {
-    if (std::strncmp(message, prefix, std::strlen(prefix)) != 0)
-        return false;
-    const char* rest = message + std::strlen(prefix);
-    *value = std::atoi(rest);
-    if (second != nullptr) {
-        const char* colon = std::strchr(rest, ':');
-        *second = colon != nullptr ? std::atoi(colon + 1) : -1;
+    g_saved_code = code;
+    g_saved_token = token;
+    if (g_opt.code_file != nullptr) {
+        FILE* f = std::fopen(g_opt.code_file, "w");
+        if (f != nullptr) {
+            std::fprintf(f, "%s\n%s\n", code, token);
+            std::fclose(f);
+        }
     }
-    return true;
 }
 
 bool run_lobby()
 {
-    char app[128] = {}, game[128] = {}, name[32] = {};
-    std::snprintf(app, sizeof(app), "%s", g_opt.app.c_str());
-    std::snprintf(name, sizeof(name), "%s", g_opt.name != nullptr ? g_opt.name : (g_opt.host ? "znx-host" : "znx-join"));
-    if (g_opt.host)
-        std::snprintf(game, sizeof(game), "%s", g_goodname.c_str());
-    /* KailleraNetplayDialog.cpp:4319 (host) and :4483 (join): one UDP socket for lobby and game */
-    if (!p2p_core_initialize(g_opt.host, g_opt.host ? g_opt.port : 0, app, game, name)) {
-        note("cannot open the n02 socket");
+    std::string nat_host, list_host;
+    int nat_port = 0, list_port = 0;
+    if (!g_opt.nat.empty() && !split_host_port(g_opt.nat, nat_host, nat_port)) {
+        note("--nat wants HOST:PORT");
         return false;
     }
-    note("n02 socket on port %d (%s \"%s\", %s)", p2p_core_get_port(), g_opt.host ? "hosting" : "joining",
-        g_opt.host ? game : "", app);
+    if (!g_opt.list.empty() && !split_host_port(g_opt.list, list_host, list_port)) {
+        note("--list wants HOST:PORT");
+        return false;
+    }
+    char code_check[32];
+    if (!g_opt.host && znx_p2p_normalize_code(g_opt.join.c_str(), code_check, sizeof(code_check)) && nat_host.empty()) {
+        note("joining by code needs --nat HOST:PORT");
+        return false;
+    }
+    if (g_opt.code_file != nullptr) {
+        std::ifstream f(g_opt.code_file);
+        std::getline(f, g_saved_code);
+        std::getline(f, g_saved_token);
+    }
+    struct znx_p2p_config config;
+    std::memset(&config, 0, sizeof(config));
+    config.host = g_opt.host;
+    config.port = g_opt.port;
+    config.game = g_goodname.c_str();
+    config.username = g_opt.name != nullptr ? g_opt.name : (g_opt.host ? "znx-host" : "znx-join");
+    config.app = g_opt.app.c_str();
+    config.join_target = g_opt.join.c_str();
+    config.delay = g_opt.delay;
+    config.prediction = g_opt.prediction;
+    /* connect codes and the list only against a server named on the command line */
+    config.use_codes = g_opt.host && !nat_host.empty();
+    config.enlist = g_opt.enlist && !list_host.empty();
+    config.nat_host = nat_host.c_str();
+    config.nat_port = nat_port;
+    config.list_host = list_host.c_str();
+    config.list_port = list_port;
+    config.code = g_saved_code.c_str();
+    config.token = g_saved_token.c_str();
+    config.save_identity = save_identity;
+    config.log = p2p_log;
+    char error[256];
+    if (znx_p2p_open(&config, error, sizeof(error)) != 0) {
+        note("%s", error);
+        return false;
+    }
 
     const auto begin = Clock::now();
-    auto last_connect = begin - std::chrono::seconds(1), last_ping = begin;
-    bool announced = false, ready = false;
-    while (g_game_player.load() == 0) {
-        const auto now = Clock::now();
-        if (now - begin > std::chrono::seconds(g_opt.lobby_timeout_s)) {
+    std::string printed_code;
+    bool ready = false, lobby_line = false;
+    Clock::time_point lobby_since{};
+    for (;;) {
+        struct znx_p2p_status s;
+        znx_p2p_status(&s);
+        if (s.code[0] && printed_code != s.code) {
+            printed_code = s.code;
+            std::printf("code %s\n", s.code);
+        }
+        if (s.phase == ZNX_P2P_FAILED) {
+            note("the lobby failed: %s", s.message);
+            return false;
+        }
+        if (s.phase == ZNX_P2P_STARTING || s.phase == ZNX_P2P_IN_GAME)
+            break;
+        if (Clock::now() - begin > std::chrono::seconds(g_opt.lobby_timeout_s)) {
             note("lobby timed out");
             return false;
         }
-        if (!g_opt.host && !p2p_is_connected() && now - last_connect > std::chrono::milliseconds(500)) {
-            char ip[64];
-            std::snprintf(ip, sizeof(ip), "%s", g_opt.join_ip.c_str());
-            p2p_core_connect(ip, g_opt.port);   /* sends LOGN_REQ */
-            last_connect = now;
-        }
-        p2p_step();
-        bool joined, rollback, got_mode, known;
-        {
-            std::lock_guard<std::mutex> lock(g_lobby_mutex);
-            joined = g_peer_joined;
-            rollback = g_mode_rollback;
-            got_mode = g_got_mode;
-            known = g_hosted_game_known;
-        }
-        if (joined && p2p_is_connected() && now - last_ping > std::chrono::seconds(1)) {
-            p2p_ping();   /* the dialog pings once a second in the lobby (onTravTimer) */
-            last_ping = now;
-        }
-        if (g_opt.host && joined && !announced) {
-            /* onPeerJoined / setGameLayer: sendGameLayer, sendRollbackDelaySettings,
-             * sendRollbackPredictionSettings, sendRollbackPacingSettings */
-            send_chat("RMGK:MODE:RB");
-            send_chat("RMGK:RBDELAY:3:" + std::to_string(g_opt.delay));   /* mode 3 = custom */
-            send_chat("RMGK:RBPRED:" + std::to_string(g_opt.prediction));
-            send_chat("RMGK:RBPACE:0");
-            announced = true;
-        }
-        if (!ready && joined && p2p_is_connected()) {
-            /* the player presses Ready: the host at once, the joiner once it knows the host's
-             * game and has been told the rollback layer (onReady needs m_gameName) */
-            if (g_opt.host || (known && got_mode && rollback)) {
-                p2p_set_ready(true);
+        if (s.phase == ZNX_P2P_LOBBY) {
+            if (lobby_since == Clock::time_point{})
+                lobby_since = Clock::now();
+            if (!g_opt.host && s.game_mismatch) {
+                note("the host plays \"%s\", this ROM is \"%s\"", s.host_game, g_goodname.c_str());
+                return false;
+            }
+            /* the player presses Ready: the host once a peer is there and its ping is known, the
+             * joiner once it knows the host's game and has been told the rollback layer */
+            if (!ready && s.can_ready && s.ping >= 0 &&
+                Clock::now() - lobby_since >= std::chrono::seconds(g_opt.ready_after_s)) {
+                if (!lobby_line) {
+                    std::printf("lobby: peer \"%s\"%s, ping %d ms, delay %d%s, prediction %d\n", s.peer_name,
+                        s.app_mismatch ? " (another app version)" : "", s.ping, s.delay, s.delay_auto ? " (auto)" : "",
+                        s.prediction);
+                    lobby_line = true;
+                }
+                znx_p2p_set_ready(1);
                 ready = true;
                 note("ready");
             }
         }
-        usleep(1000);
+        usleep(2000);
     }
-    (void)announced;
+    struct znx_p2p_status s;
+    znx_p2p_status(&s);
+    g_session_delay = s.delay;
+    note("game starts: player %d, peer \"%s\", delay %d, prediction %d", s.player, s.peer_name, s.delay, s.prediction);
+    if (g_opt.inputs != nullptr && g_opt.player != s.player)
+        note("playing the script's player %d from controller slot %d", g_opt.player, s.player);
     return true;
+}
+
+int fetch_list(const std::string& where)
+{
+    std::string host;
+    int port = 0;
+    if (!split_host_port(where, host, port)) {
+        std::fprintf(stderr, "znx-net: --fetch-list wants HOST:PORT\n");
+        return 2;
+    }
+    std::vector<znx_p2p_listing> list(64);
+    char error[256];
+    const int n = znx_p2p_fetch_list(host.c_str(), port, list.data(), (int)list.size(), error, sizeof(error));
+    if (n < 0) {
+        std::fprintf(stderr, "znx-net: %s\n", error);
+        return 1;
+    }
+    for (int i = 0; i < n; i++)
+        std::printf("listing game=\"%s\" app=\"%s\" user=\"%s\" address=%s code=%s\n", list[i].game, list[i].app,
+            list[i].user, list[i].address, list[i].code);
+    std::printf("listings %d\n", n);
+    return 0;
 }
 
 void usage()
 {
     std::fprintf(stderr,
-        "usage: znx-net --rom FILE (--host PORT | --join IP:PORT) [--inputs FILE --player N]\n"
+        "usage: znx-net --rom FILE (--host PORT | --join IP:PORT|CODE) [--inputs FILE --player N]\n"
         "               [--delay D] [--prediction P] [--frames N] [--check-every K] [--check-skip LO HI]\n"
         "               [--sim-latency MS] [--sim-jitter MS] [--sim-loss PCT] [--sim-seed S]\n"
-        "               [--no-pace] [--name NAME] [--app APP] [--gekko-log] [--verbose]\n"
+        "               [--bind-any] [--nat HOST:PORT] [--list HOST:PORT] [--enlist] [--code-file F]\n"
+        "               [--no-pace] [--name NAME] [--app APP] [--lobby-timeout S] [--ready-after S] [--gekko-log] [--verbose]\n"
+        "       znx-net --fetch-list HOST:PORT\n"
         "  An RMG-K P2P rollback session (n02 lobby + GekkoNet over the n02 socket), headless.\n"
-        "  --host PORT          host on this UDP port (player 1); --join IP:PORT joins it (player 2)\n"
+        "  --host PORT          host on this UDP port (player 1); --join IP:PORT or a connect code joins (player 2)\n"
         "  --inputs FILE        the controller script (bench/inputs format); this side plays --player N\n"
-        "  --delay D            input delay in frames, default 2 (the joiner takes the host's, as RMG-K does)\n"
+        "  --delay D            host: input delay in frames, default 2; 0 = from the ping as RMG-K's default\n"
+        "                       (the joiner takes the host's, as RMG-K does)\n"
         "  --prediction P       GekkoNet prediction window, default 7 (likewise)\n"
         "  --frames N           frames to finish (every frame below N final on both sides), default 17000\n"
         "  --check-every K      \"check\" lines every K frames (and after the last), default 60\n"
         "  --sim-latency MS     add MS to every datagram this side sends (so the round trip gains 2*MS)\n"
         "  --sim-jitter MS      +- MS on GekkoNet's datagrams (reordering)\n"
         "  --sim-loss PCT       drop PCT %% of GekkoNet's datagrams\n"
+        "  --bind-any           listen on every interface, and join any address (default: 127.0.0.1 only)\n"
+        "  --nat HOST:PORT      host: get a connect code from this traversal server (RMG-K's is\n"
+        "                       nat.smash64.net:6364); joiner: look codes up there\n"
+        "  --list HOST:PORT     with --enlist, the public list server (RMG-K's: p2plist.smash64.net:27887)\n"
+        "  --ready-after S      press Ready S seconds after the peer arrived (the automatic delay needs ~5 s of pings)\n"
+        "  --code-file F        host: keep the connect code between runs, as RMG-K keeps it in its settings\n"
         "  --no-pace            run as fast as possible instead of RMG-K's 60 Hz presentation pacer\n"
         "  --gekko-log          write RMG-K's verbose GekkoNet log to build/<arch>/profile/net-<side>/Logs\n"
-        "  The socket is bound to 127.0.0.1 only; nothing is sent anywhere but the given peer.\n");
+        "  --fetch-list H:P     GET http://H:P/plist.txt and print the games with a connect code\n"
+        "  Nothing is sent anywhere but the given peer and the servers named on the command line.\n");
     std::exit(2);
 }
 
+#ifdef ZNX_STATIC_LIBS
+#define RTLD_NOW 0
+#define RTLD_GLOBAL 0
+#endif
+
 void* load(const char* dir, const char* name, int flags)
 {
+#ifdef ZNX_STATIC_LIBS
+    (void)dir;
+    (void)flags;
+    static const char* const names[][2] = { { "libmupen64plus.dylib", "core" }, { "znx-video-null.dylib", "video_null" },
+        { "mupen64plus-rsp-hle.dylib", "rsp_hle" }, { "znx-input-net.dylib", "input_net" } };
+    for (const auto& n : names)
+        if (std::strcmp(n[0], name) == 0)
+            return znx_static_lib(n[1]);
+    return nullptr;
+#else
     std::string path = std::string(dir) + "/" + name;
     void* lib = dlopen(path.c_str(), flags);
     if (lib == nullptr)
         std::fprintf(stderr, "znx-net: %s\n", dlerror());
     return lib;
+#endif
+}
+
+void unload(void* lib)
+{
+#ifndef ZNX_STATIC_LIBS
+    dlclose(lib);
+#else
+    (void)lib;
+#endif
 }
 
 void print_line(int is_error, const char* line)
@@ -504,140 +619,16 @@ void print_line(int is_error, const char* line)
     std::fprintf(is_error ? stderr : stdout, "%s\n", line);
 }
 
+bool is_loopback(const std::string& target)
+{
+    char code[32];
+    if (znx_p2p_normalize_code(target.c_str(), code, sizeof(code)))
+        return true;   /* found through the --nat server; the address comes from there */
+    const std::string ip = target.substr(0, target.rfind(':'));
+    return ip == "127.0.0.1" || ip == "localhost";
+}
+
 } // namespace
-
-/* ---- callbacks from the glue ---- */
-
-void znx_net_state_saved(int frame)
-{
-    if (frame > g_max_saved)
-        g_max_saved = frame;
-    const int after = frame + 1;   /* GekkoNet frame F completed = F + 1 frames, the bench's count */
-    if (after > g_opt.frames || g_rdram == nullptr)
-        return;
-    if (after % g_opt.check_every != 0 && after != g_opt.frames)
-        return;
-    uint64_t whole, rest;
-    znx_check_rdram(g_rdram, g_opt.check_skip_lo, g_opt.check_skip_hi, &whole, &rest);
-    g_pending_checks[frame] = { whole, rest };
-}
-
-void znx_net_state_loaded(int frame)
-{
-    (void)frame;
-    if (g_depth > 0) {
-        g_depth_hist[std::min(g_depth, 15)]++;
-    }
-    g_rollbacks++;
-    g_depth = 0;
-}
-
-void znx_net_frame_resimulated(void)
-{
-    g_resim_frames++;
-    g_depth++;
-    g_max_depth = std::max(g_max_depth, g_depth);
-}
-
-void znx_net_end_frame(int confirmed)
-{
-    if (g_depth > 0) {
-        g_depth_hist[std::min(g_depth, 15)]++;
-        g_depth = 0;
-    }
-    const int final_frame = std::min(confirmed, g_max_saved);
-    if (final_frame > g_final)
-        g_final = final_frame;
-    while (!g_pending_checks.empty() && g_pending_checks.begin()->first <= g_final) {
-        const auto& entry = *g_pending_checks.begin();
-        std::printf("check %d %016llx %016llx\n", entry.first + 1,
-            (unsigned long long)entry.second.first, (unsigned long long)entry.second.second);
-        g_checks_printed++;
-        g_pending_checks.erase(g_pending_checks.begin());
-    }
-    if (!g_done.load() && g_final >= g_opt.frames - 1) {
-        g_done_time = Clock::now();
-        g_done = true;
-        note("every frame up to %d is final; telling the peer (n02 DROP)", g_opt.frames);
-        g_local_drop = true;
-        p2p_drop_game();
-        g_local_drop = false;
-    }
-}
-
-int znx_net_visible_frames(void) { return g_visible.load(); }
-const char* znx_net_log_dir(void) { return g_log_dir.c_str(); }
-bool znx_net_verbose_log(void) { return g_opt.gekko_log; }
-
-void znx_net_chat(const char* nick, const char* message)
-{
-    (void)nick;
-    int a, b;
-    std::lock_guard<std::mutex> lock(g_lobby_mutex);
-    if (std::strncmp(message, "RMGK:MODE:", 10) == 0) {
-        g_got_mode = true;
-        g_mode_rollback = std::strcmp(message + 10, "RB") == 0;
-    }
-    else if (parse_int_after(message, "RMGK:RBDELAY:", &a, &b)) {
-        g_got_delay = true;
-        g_host_delay = b >= 0 ? b : 2;
-    }
-    else if (parse_int_after(message, "RMGK:RBPRED:", &a, nullptr)) {
-        g_got_prediction = true;
-        g_host_prediction = a;
-    }
-    else if (std::strncmp(message, "RMGK:", 5) == 0) {
-        /* RMGK:RBPACE: the pacing model; RMG-K ignores it now (rmgk_gekko.cpp reset_gekko_log) */
-    }
-    else {
-        note("chat <%s> %s", nick, message);
-    }
-}
-
-void znx_net_game_started(const char* game, int player)
-{
-    int expected = 0;
-    g_game_player.compare_exchange_strong(expected, player);
-    (void)game;
-}
-
-void znx_net_game_ended(void)
-{
-    if (!g_local_drop.load() && g_game_player.load() != 0)
-        g_peer_dropped = true;
-}
-
-void znx_net_peer_joined(void)
-{
-    std::lock_guard<std::mutex> lock(g_lobby_mutex);
-    g_peer_joined = true;
-}
-
-void znx_net_peer_left(void)
-{
-    g_peer_dropped = true;
-}
-
-void znx_net_peer_info(const char* name, const char* app)
-{
-    std::lock_guard<std::mutex> lock(g_lobby_mutex);
-    g_peer_name = name;
-    g_peer_app = app;
-}
-
-void znx_net_hosted_game(const char* game)
-{
-    std::lock_guard<std::mutex> lock(g_lobby_mutex);
-    g_hosted_game = game;
-    g_hosted_game_known = true;
-}
-
-void znx_net_debug(const char* message)
-{
-    if (g_opt.verbose || std::strstr(message, "alert") != nullptr || std::strstr(message, "drop") != nullptr ||
-        std::strstr(message, "Connection") != nullptr || std::strstr(message, "Peer") != nullptr)
-        note("n02: %s", message);
-}
 
 int main(int argc, char** argv)
 {
@@ -646,13 +637,7 @@ int main(int argc, char** argv)
         auto next = [&]() -> const char* { if (i + 1 >= argc) usage(); return argv[++i]; };
         if (!std::strcmp(a, "--rom")) g_opt.rom = next();
         else if (!std::strcmp(a, "--host")) { g_opt.host = true; g_opt.port = std::atoi(next()); }
-        else if (!std::strcmp(a, "--join")) {
-            std::string target = next();
-            const size_t colon = target.rfind(':');
-            if (colon == std::string::npos) usage();
-            g_opt.join_ip = target.substr(0, colon);
-            g_opt.port = std::atoi(target.c_str() + colon + 1);
-        }
+        else if (!std::strcmp(a, "--join")) g_opt.join = next();
         else if (!std::strcmp(a, "--inputs")) g_opt.inputs = next();
         else if (!std::strcmp(a, "--player")) g_opt.player = std::atoi(next());
         else if (!std::strcmp(a, "--delay")) g_opt.delay = std::atoi(next());
@@ -667,17 +652,26 @@ int main(int argc, char** argv)
         else if (!std::strcmp(a, "--sim-jitter")) g_opt.sim_jitter = std::atoi(next());
         else if (!std::strcmp(a, "--sim-loss")) g_opt.sim_loss = std::atof(next());
         else if (!std::strcmp(a, "--sim-seed")) g_opt.sim_seed = (unsigned)std::strtoul(next(), nullptr, 0);
+        else if (!std::strcmp(a, "--bind-any")) g_opt.bind_any = true;
+        else if (!std::strcmp(a, "--nat")) g_opt.nat = next();
+        else if (!std::strcmp(a, "--list")) g_opt.list = next();
+        else if (!std::strcmp(a, "--enlist")) g_opt.enlist = true;
+        else if (!std::strcmp(a, "--code-file")) g_opt.code_file = next();
         else if (!std::strcmp(a, "--no-pace")) g_opt.pace = false;
         else if (!std::strcmp(a, "--name")) g_opt.name = next();
         else if (!std::strcmp(a, "--app")) g_opt.app = next();
+        else if (!std::strcmp(a, "--lobby-timeout")) g_opt.lobby_timeout_s = std::atoi(next());
+        else if (!std::strcmp(a, "--ready-after")) g_opt.ready_after_s = std::atoi(next());
         else if (!std::strcmp(a, "--gekko-log")) g_opt.gekko_log = true;
         else if (!std::strcmp(a, "--verbose")) g_opt.verbose = true;
+        else if (!std::strcmp(a, "--fetch-list")) return fetch_list(next());
         else usage();
     }
-    if (g_opt.rom == nullptr || g_opt.port <= 0 || g_opt.port > 65535 || g_opt.frames <= 0 || g_opt.check_every <= 0)
+    if (g_opt.rom == nullptr || (g_opt.host ? (g_opt.port <= 0 || g_opt.port > 65535) : g_opt.join.empty()) ||
+        g_opt.frames <= 0 || g_opt.check_every <= 0)
         usage();
-    if (!g_opt.host && g_opt.join_ip != "127.0.0.1" && g_opt.join_ip != "localhost") {
-        std::fprintf(stderr, "znx-net: this build only joins 127.0.0.1\n");
+    if (!g_opt.host && !g_opt.bind_any && !is_loopback(g_opt.join)) {
+        std::fprintf(stderr, "znx-net: without --bind-any this only joins 127.0.0.1\n");
         return 2;
     }
     if (g_opt.inputs != nullptr && (g_opt.player < 1 || g_opt.player > 2))
@@ -685,8 +679,13 @@ int main(int argc, char** argv)
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
     char exe[4096], dir[4096];
+#ifdef ZNX_STATIC_LIBS
+    const ssize_t exe_length = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (exe_length <= 0 || (exe[exe_length] = 0, realpath(exe, dir)) == nullptr) {
+#else
     uint32_t exe_size = sizeof(exe);
     if (_NSGetExecutablePath(exe, &exe_size) != 0 || realpath(exe, dir) == nullptr) {
+#endif
         std::fprintf(stderr, "znx-net: cannot find my own path\n");
         return 1;
     }
@@ -710,32 +709,14 @@ int main(int argc, char** argv)
     sim.jitter_ms = g_opt.sim_jitter;
     sim.loss_pct = g_opt.sim_loss;
     sim.seed = g_opt.sim_seed != 0 ? g_opt.sim_seed : (g_opt.host ? 1u : 2u);
-    sim.loopback_only = 1;
+    sim.loopback_only = g_opt.bind_any ? 0 : 1;
     znx_netsim_configure(&sim);
 
     if (!run_lobby()) {
-        p2p_core_cleanup();
+        znx_p2p_close();
         znx_netsim_shutdown();
         return 1;
     }
-    g_local_player = g_game_player.load();
-    {
-        std::lock_guard<std::mutex> lock(g_lobby_mutex);
-        if (g_opt.host) {
-            g_session_delay = std::clamp(g_opt.delay, 0, 9);
-            g_session_prediction = g_opt.prediction;
-        } else {
-            /* effectiveRollbackFrameDelay / effectiveRollbackPredictionWindow: the host's */
-            g_session_delay = g_got_delay ? g_host_delay : std::clamp(g_opt.delay, 0, 9);
-            g_session_prediction = g_got_prediction && g_host_prediction > 0 ? g_host_prediction
-                : (g_opt.prediction > 0 ? g_opt.prediction : 7);
-            if (g_hosted_game != g_goodname)
-                note("the host plays \"%s\", this ROM is \"%s\"", g_hosted_game.c_str(), g_goodname.c_str());
-        }
-        note("game starts: player %d, peer \"%s\" (%s)", g_local_player, g_peer_name.c_str(), g_peer_app.c_str());
-    }
-    if (g_opt.inputs != nullptr && g_opt.player != g_local_player)
-        note("playing the script's player %d from controller slot %d", g_opt.player, g_local_player);
 
     struct znx_options o;
     znx_options_defaults(&o);
@@ -754,12 +735,12 @@ int main(int argc, char** argv)
     host.input = load(dir, "znx-input-net.dylib", RTLD_NOW);
     if (host.core == nullptr || host.video == nullptr || host.rsp == nullptr || host.input == nullptr)
         return 1;
-    auto set_source = (void (*)(uint32_t (*)(int)))dlsym(host.input, "znx_input_set_source");
+    auto set_source = (void (*)(uint32_t (*)(int)))lib_sym(host.input, "znx_input_set_source");
     if (set_source == nullptr)
         return 1;
     set_source(input_source);
     g_core = host.core;
-    host.sym = dlsym;
+    host.sym = lib_sym;
     host.print = print_line;
     host.data_dir = data_dir.c_str();
     host.user_dir = user_dir.c_str();
@@ -767,12 +748,11 @@ int main(int argc, char** argv)
 
     const int result = znx_bench_run(&host, &o);
 
-    p2p_core_cleanup();
+    znx_p2p_close();
     znx_netsim_shutdown();
-    m64p::Core.Unhook();
-    dlclose(host.input);
-    dlclose(host.rsp);
-    dlclose(host.video);
-    dlclose(host.core);
+    unload(host.input);
+    unload(host.rsp);
+    unload(host.video);
+    unload(host.core);
     return result;
 }

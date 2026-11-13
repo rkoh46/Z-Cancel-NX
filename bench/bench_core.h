@@ -97,6 +97,8 @@ int znx_bench_run(const struct znx_host* host, const struct znx_options* options
 uint64_t znx_bench_stall_ns(void);
 int znx_bench_frame(void);
 void znx_bench_stop(void);
+/* A stop was asked for (a session_run that drives its own frames checks this). */
+int znx_bench_stop_requested(void);
 
 uint64_t znx_now_ns(void);
 

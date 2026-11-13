@@ -568,3 +568,370 @@ screenshots and the log:
 - three games in one session (+EXTRA, vanilla, Remix), each back to the start screen with the quit hold,
   and B on the start screen back to the Homebrew Menu: the core, GLideN64's context and audout restart
   cleanly.
+
+## RMG-K lobby, in detail (read from its source, 2f5454a = tag v0.9.16)
+
+What a Switch build has to reproduce to play in RMG-K's "Join Rollback Netplay" lobby. Paths are
+relative to `ref/RMG-K/Source`. Short names: **LC** `RMG/UserInterface/Dialog/Lobby/LobbyClient.cpp`
+(the WebSocket protocol, Qt), **RLD** `.../Lobby/RollbackLobbyDialog.cpp` (the dialog: start rule,
+delay, match start), **LCD** `.../Lobby/LobbyConnectDialog.cpp`, **ICE** `RMG-Core/LobbyIce.cpp` (the
+libjuice mesh, no Qt), **RG** `RMG-Core/rmgk_gekko.cpp`. The server (`rmgk-lobby`) is not public:
+everything about it below is what the client sends and accepts. `net/lobby/` implements this (end of
+this section).
+
+### The parts
+
+- A WebSocket to the lobby server carries everything that is not gameplay: login, presence, room
+  list, rooms, chat, ICE signalling, match start/end. One JSON text frame per message.
+- An ICE mesh (libjuice 1.7.3, `3rdParty/libjuice`) between the members of a room: one agent per
+  other member, created as soon as both are in the room, not at match start (LC:1154-1240). Pings,
+  the pre-match manifest and GekkoNet's datagrams all travel over it, each datagram prefixed by a
+  channel byte. ICE-capable clients do not open the old UDP "anchor" (port 6364) at all (LC:1037-1038).
+- GekkoNet over the mesh: `rmgk_gekko::start_lobby_session` with the "ice:" adapter (RG:1555-1634,
+  3737-3990), compiled only with `-DNETPLAY` (RG:3808, 3891).
+
+### Server and envelope
+
+- URL: release builds `ws://216.128.157.98:8080/ws`, builds from an untagged commit (`vdev-N`)
+  `ws://64.177.116.159:8080/ws` (LCD:31-35, root `CMakeLists.txt:70-72`); the environment variable
+  `RMGK_LOBBY_URL` overrides it (LCD:40-46). Plain `ws://`: no TLS anywhere.
+- Username 2-20 characters of `[A-Za-z0-9_.-]` (LCD:76-80, 108), remembered in QSettings.
+- Envelope (LC:668-682): `{"type":"<TYPE>","id":"<id>","data":{...}}`, compact. `id` only on HELLO
+  (`"hello-1"`); `data` left out when empty (ROOM_LEAVE, ROOM_START, QUICK_MATCH_CANCEL). Ids are JSON
+  numbers (Qt reads them with `toDouble()`, so they stay below 2^53). Server limit 1 MiB per message
+  (LC:3515). Unknown types are ignored (LC:958).
+
+### Connection state machine (LC:48-55, 580-660, 817-1049)
+
+`Disconnected -> Connecting` (socket opening) `-> Authenticating` (WebSocket open: HELLO sent at once)
+`-> Connected` (HELLO_OK) or `-> Failed` (HELLO_FAIL, socket error). Connect is allowed from
+Disconnected or Failed only, and is refused while a match owns the ICE mesh (HELLO_OK reconfigures it,
+LC:583-591). On HELLO_OK: ICE configured, heartbeat every 15 s starts. A dropped WebSocket clears
+pings, probes and routes (LC:856-900); a running match keeps its ICE agents (teardown deferred until
+the match ends, LC:1282-1321) and plays on without chat (RLD:2628-2640).
+
+### Client -> server
+
+| type | data | when |
+|---|---|---|
+| HELLO | `username`, `clientVersion` (`CORE_VERSION`, the git tag: `"v0.9.16"`), `romHashes` (array of strings; RMG-K 0.9.16 sends `[]`, RLD:2619), `iceSupported:true`, `lateJoin:true`, `saveData:true`, optional `connection` (`"lan"`/`"wifi"`), `anonymous:true`, `tzOffset` (standard UTC offset in seconds, non-zero only), `localIp` (private IPv4) | WebSocket open (LC:817-854) |
+| HEARTBEAT | `away` (bool: no input for 5 min) | every 15 s while Connected (LC:65, 2288-2297) |
+| CHAT_SEND | `channel` (`"lobby"`, `"room"`, `"spectate"`), `message` | (LC:3300-3306) |
+| CHAT_HISTORY | `channel` | (LC:3308-3313) |
+| ROOM_CREATE | `name`, `rom{name,md5,region}`, `maxPlayers` (2-4), `delay`, `prediction`, `pacing` (always 1, RLD:3374-3376), optional `password` | (LC:3359-3379) |
+| ROOM_JOIN | `roomId`, optional `password` | (LC:3381-3388) |
+| ROOM_LEAVE | none | |
+| ROOM_START | none | host, Start button (RLD:4656-4661) |
+| ROOM_UPDATE_DELAY | `delay`, `delayAuto` | own delay changed (each player picks their own; LC:3429-3435, RLD:4896-4945) |
+| ROOM_UPDATE_PREDICTION | `prediction` (1-9), `predictionAuto` | host (LC:3437-3443) |
+| ROOM_UPDATE_LIVE_REPLAY / ROOM_UPDATE_LATE_JOIN | `enabled` | host |
+| ROOM_UPDATE_SAVE_DATA | `enabled`, and when on `label`, `kinds[]`, `bytes`, `hash` | host (LC:3414-3427) |
+| ROOM_KICK | `userId` | host |
+| ROOM_SWAP_SLOTS | `slotA`, `slotB` | host, waiting room (LC:3452-3461) |
+| ICE_SIGNAL | `targetUserId`, `roomId`, `kind` (`"description"`, `"candidate"`, `"gathering_done"`, `"restart"`), `generation`, `value` (SDP text; absent for gathering_done/restart) | ICE (LC:1508-1529, 1425-1437) |
+| MATCH_CONNECTED | `matchId`, `peerUserId` (0) | emulation running (RLD:4472) |
+| MATCH_PUNCH_FAILED | `matchId`, `peerUserId` | legacy path |
+| MATCH_FINISHED | `matchId` | emulation ended, or match start aborted (RLD:4503, 5757-5758) |
+| MATCH_ADMIT / MATCH_ADMIT_SIGNAL | `matchId`,`userId` / `matchId`,`admitId`,`step`,`frame`?,`ok`?,`reason`? or blob chunks `index`,`count`,`data` (base64, 384 KiB) | late join (LC:2102-2147) |
+| BROADCAST_BEGIN / _DATA / _KEYFRAME / _END | `matchId` + `manifest` (base64) / `data`,`frame` / `frame`,`chunkIndex`,`chunkCount`,`data` (64 KiB chunks, "RMGKZ1" zlib) / - | live replay upload (LC:3513-3578, 726-759) |
+| SPECTATE_START / SPECTATE_STOP | `matchId` | |
+| QUICK_MATCH_JOIN / _CANCEL | `rom{name,md5,region}` / - | |
+| ADMIN_AUTH / MOD_ACTION | `password` / `action`,`target`,`duration`?,`reason`? | moderators |
+
+### Server -> client
+
+| type | data (as read) |
+|---|---|
+| HELLO_OK | `userId`, `observedIp`, `region`, `ice{stun{host,port}, turn[{host,port,username,password}]}`, `udpAnchor` (legacy) (LC:963-1039). Missing STUN falls back to `stun.l.google.com:19302`; TURN port defaults to 3478. |
+| HELLO_FAIL | `reason` (`username_taken`, `invalid_hello`, `invalid_payload`, `version_mismatch` = older than 0.9.13 / vdev-2367, `server_full`; RLD:2738-2747), optional `message`. Client closes. |
+| HEARTBEAT_ACK | ignored (`serverTime`) |
+| PRESENCE_FULL | `users[]` |
+| PRESENCE_DELTA | `added[]`, `updated[]`, `removed[]` (ids). A user: `id`, `username`, `state`, `region` (LobbyRegions.hpp codes), `country`, `clientVersion`, `connection`, `anonymous`, `pingToServer`, `currentRoomId`, `currentRoomName`, `searchingRom` (LC:3608-3625) |
+| ROOM_LIST | `rooms[]`: `id`, `name`, `hostId`, `hostName`, `rom{name,md5}`, `players`, `maxPlayers`, `state` (`waiting`/`in_game`), `hasPassword`, `startedAt`, `broadcasting`, `matchId`, `viewerCount`, `lateJoin`, `playerNames[]` (LC:1090-1118). The whole list each time. |
+| ROOM_CREATED / ROOM_CREATE_FAIL | `roomId` / `reason`. The creator then gets ROOM_STATE. |
+| ROOM_JOIN_OK | a full room state (as ROOM_STATE) |
+| ROOM_JOIN_FAIL | `reason` |
+| ROOM_STATE | `id`, `name`, `hostId`, `rom{name,md5,region}`, `maxPlayers`, `state`, `prediction` (1-9, default 7), `predictionAuto`, `pacing`, `liveReplayEnabled`, `inGameSettings`, `lateJoin`, `lateJoinEnabled`, `canStartAlone`, `saveData{enabled,label,kinds[],bytes,hash}`, `players[]`: `userId`, `username`, `slot` (1-4), `frameDelay`, `iceSupported`, `inMatch`, `lateJoin`, `saveData` (RLD:3596-3700, 3770-3910; LC:1154-1240) |
+| ROOM_LEFT | `reason` |
+| CHAT_MSG | `channel`, `fromUserId`, `fromUsername`, `message`, `serverTime`, `admin` (LC:1635-1645) |
+| CHAT_HISTORY_REPLY | `channel`, `messages[]` (same fields) |
+| ICE_SIGNAL | `roomId`, `fromUserId`, `kind`, `generation`, `value` (LC:1323-1413) |
+| MATCH_BEGIN | `matchId`, `peers[]`: `userId`, `username`, `publicIp`, `publicPort`, `localIp`, `slot`, `iceSupported`; `seats` (ports a late-join match emulates, 0 if any member cannot late-join), `keyframeIntervalSec` (LC:2006-2031). Arrives after the ROOM_STATE that set `in_game` (RLD:5849-5851). |
+| MATCH_PEER_LEFT | `matchId`, `userId`, `slot`, `reason`: that port goes idle (RLD:4629) |
+| MATCH_ADMIT_BEGIN / _SIGNAL / _FAIL | late join (LC:2033-2100) |
+| PING_PROBE_REPLY / PING_PROBE_INCOMING | legacy UDP probing (`targetUserId`,`targetEndpoint` / `fromUserId`,`fromEndpoint`) |
+| SPECTATE_BEGIN / _DATA / _KEYFRAME / _END / _FAIL, BROADCAST_VIEWER_COUNT | live replay viewing |
+| QUICK_MATCH_STATUS | `searching`, `queueSize` |
+| ADMIN_AUTH_OK / _FAIL, MOD_NOTICE (`severity`, `text`), MOD_LIST | moderation |
+
+### Rooms, delay, readiness
+
+- There is no "ready" message. The host's Start button is enabled when (RLD:4370-4399): host, room
+  `waiting`, at least 2 seated (or 1 with `canStartAlone`), every pair of seated players has a
+  measured ping (`worstRoomPingMs` complete, LC:3230-3270), and if save data is on every seated
+  player has `saveData:true`.
+- Pings run over the ICE path: every 3 s to each seated peer (RLD:749, 4663-4680) and at once when a
+  peer's ICE connects (RLD:4726-4751). A probe is channel 1 `[op=1][nonce u64 BE]`; the reply is the
+  same with op 2, echoed from libjuice's receive callback (ICE:193-205); RTT measured from the send
+  (ICE:586-599, 210-222). 4 attempts 300 ms apart (LC:147-150, 1907-1949). Non-host pairs: the lower
+  user id reports to the host, channel 1 `[op=3][target u64 BE][rtt u16 BE]` (LC:1475-1495, 1531-1559).
+- Delay is per player: Auto picks from the worst measured ping, -1 -> 2, <=50 ms -> 1, <=100 -> 2,
+  <=150 -> 3, <=220 -> 4, else 5 (RLD:113-121), published with ROOM_UPDATE_DELAY; playing alone uses 0
+  (RLD:5807-5812). Prediction is the room's (host), default 7, range 1-9; a ROOM_STATE during a match
+  changes it live (RLD:3790-3800). Pacing is always 1 ("smooth").
+
+### ICE (ICE, LC:1154-1633)
+
+- Agent config (ICE:415-429): `JUICE_CONCURRENCY_MODE_POLL` (one libjuice thread for all agents),
+  STUN from HELLO_OK, TURN servers from HELLO_OK, local ports alternating per peer between 49152-57343
+  and 57344-65535 so a restart never reuses its port (ICE:57-71). Host candidates: every non-loopback
+  interface (libjuice `udp.c:520-552`).
+- Signalling: `add_peer` creates the agent, queues its local description as a `description` signal
+  and starts gathering (ICE:372-467); each candidate is trickled as a `candidate` signal
+  (`a=candidate:... typ host|srflx|relay`), then `gathering_done`. Signals are sent only while the
+  WebSocket is open and we are in a room (LC:1508). Incoming: candidates before the description are
+  held (ICE:264-276); signals for a peer without an agent yet are queued until it exists (ICE:554-565).
+  Both sides create their description first, so both start controlling and libjuice settles it by ICE
+  role-conflict resolution (seen as "ICE role conflict (both controlling)" in the test).
+- Generations: when an agent fails, the client restarts it with generation+1, telling the peer with an
+  ICE_SIGNAL `kind:"restart"`; signals of an older generation are dropped; a description with a newer
+  generation counts as a restart (LC:1323-1464, 1594-1632). 19 automatic restarts (20 attempts, about
+  3 s each) before the UI shows the failure (LC:160-164). No restarts of agents a match is using.
+- Datagrams: `[channel u8][payload <= 4000 bytes]` (ICE:567-609). Channels (LobbyIce.hpp:16-39):
+  1 ping, 2 pre-match, 3 GekkoNet (first session of a match), 4 lag stats (once a second during a
+  match), 0x10-0x1f GekkoNet after the n-th late join. Unknown channels are dropped (ICE:182-191).
+
+### Match start (RLD:5765-6001, LC:2530-2749)
+
+1. Host sends ROOM_START; server sets the room `in_game` (ROOM_STATE) and sends MATCH_BEGIN to every
+   seated player.
+2. Each client waits until every peer's ICE is connected, re-checking every 100 ms, at most 15 s
+   ("direct ICE negotiation timed out. No TURN relay is configured."); a peer without `iceSupported`
+   fails at once (RLD:5767-5793).
+3. Pre-match sync over channel 2, 10 s limit (LC:2575). The sync authority is the room's host, not
+   seat 1 (LC:279-286). Host: builds the manifest, sends it to every peer that has not acknowledged,
+   all fragments again every 100 ms, until every ACK with the right hash arrived; then applies it
+   itself. Others: reassemble, check sender and FNV-1a, apply, send the ACK 8 times (LC:2733-2739).
+4. `Rollback_PacingMode` = room pacing (RLD:5994), the match takes ownership of the ICE agents
+   (RLD:5999), and emulation starts with the address
+   `LOBBY|<delay>|<prediction>|<slot>,ice,<userId>|...[|seats=N]` (RLD:5920-5943, parsed in
+   `RMG-Core/Emulation.cpp:151-260`): deterministic settings as for P2P (`Emulation.cpp:1069-1078`), saves
+   in memory from the manifest's save section, CPU = new_dynarec, `start_lobby_session` with
+   `players` = the highest occupied seat (or `seats`) (`Emulation.cpp:1168-1215`).
+5. MATCH_CONNECTED once emulation runs (RLD:4472); MATCH_FINISHED when it stops (RLD:4503) or when
+   any step above fails (RLD:5734-5763), which puts the room back to `waiting`.
+
+Pre-match packet formats (all on channel 2; LC:121-129, 418-471):
+
+- manifest packet: `"RMGK"` `06` `senderUserId u64 BE` `manifestHash u64 LE` `manifest`
+- ACK: `"RMGK"` `07` `senderUserId u64 BE` `manifestHash u64 LE` (21 bytes)
+- a manifest packet over 1000 bytes goes as fragments: `"RMGK"` `08` `sender u64 BE` `hash u64 LE`
+  `index u16 LE` `count u16 LE` `totalBytes u32 LE` then bytes `[index*1000, +1000)` of the whole
+  manifest packet (count <= 2048, total <= 2 MiB)
+- manifestHash: FNV-1a 64 over the manifest (LC:247-256)
+- manifest (LC:334-416): `"RMGKPMAN"` `version u32 LE = 1` `sections u32 LE` (bit 0 cheats, always;
+  bit 1 save data) `cheatLen u32` cheats [`saveLen u32` save] and nothing after. Cheats
+  (`RMG-Core/Cheats.cpp:1174-1205`): `"RMGKCHT1"` `count u32`, each cheat: strings (`u32 len` + bytes)
+  name, author, note, `hasOptions u8`, `u32` options (name, `value u32`, `size i32`), `u32` codes
+  (`address u32`, `value i32`, `useOptions u8`, `optionIndex i32`, `optionSize i32`). Save section:
+  Qt `qCompress` (big-endian `u32` raw length + zlib stream) of `"RMGKSAV1"` `u32 3` then for EEPROM,
+  SRAM, FlashRAM `u32 len` + bytes (at most 0x800, 0x8000, 0x20000; `RMG-Core/NetplaySave.cpp:28-31, 402-450`).
+  The empty manifest (no cheats, blank save) is 32 bytes.
+
+### The GekkoNet session of a lobby match (RG:2441-2537, 3737-3990)
+
+Actors = remote players + 1, added in seat order on every peer (empty seats get none and zero
+input); remote addresses `"ice:<userId>"`; input 4 bytes; prediction clamped 1-10, local delay
+0-10; `desync_detection` on, `check_distance` 10, runahead 0; disconnect timeout 30 s
+(`kGekkoLobbyPeerTimeoutMs`, RG:81), because the lobby decides drops (MATCH_PEER_LEFT ->
+`request_disconnect_player`). The adapter sends each GekkoNet packet as one channel-3 datagram and
+receives channel 3 (and drops the previous epoch's channel) (RG:1580-1623). No GekkoNet spectators:
+watching is the server's krec stream (BROADCAST/SPECTATE).
+
+### Timers
+
+| what | value | where |
+|---|---|---|
+| heartbeat | 15 s | LC:65 |
+| ICE event poll (Qt) | 25 ms | LC:549-552 |
+| seat ping refresh | 3 s | RLD:749 |
+| ping retries | 4 attempts, 300 ms | LC:147-150 |
+| ICE attempts | 20 (19 restarts), each a fresh agent | LC:160-164 |
+| wait for ICE after MATCH_BEGIN | 15 s, checked every 100 ms | RLD:5776-5793 |
+| pre-match sync | 10 s; host resend every 100 ms; ACK sent 8 times | LC:2575, 2625, 2735 |
+| GekkoNet peer silence | 30 s | RG:81 |
+| away | 5 min without input | LC:119 |
+
+### What Qt does there, and what replaces it
+
+QWebSocket -> a small RFC 6455 client on a non-blocking BSD socket (`net/lobby/ws.cpp`); QJsonDocument
+-> `net/lobby/json.cpp`; QTimer / the nested `processEvents` loop of the pre-match sync -> deadlines
+checked in `znx_lobby_poll`; QNetworkInterface (localIp, lan/wifi), QTimeZone (tzOffset), QSettings
+(username) -> fields the caller fills; QRandomGenerator -> `random_u64`; `qCompress` -> zlib, needed only
+by whoever applies the save section. LobbyIce.cpp has no Qt; it is followed in `net/lobby/ice_mesh.cpp`.
+
+### net/lobby (built 2026-11-12)
+
+- `znx_lobby.h`: the C API. `znx_lobby_create(config)`, `znx_lobby_connect(lobby, url, username,
+  rom_md5, client_version)`, `znx_lobby_poll(lobby, &event)` (connected, hello failed, disconnected,
+  users, room list, room created/joined/state/left and failures, chat, peer ICE state, peer ping, match
+  begin, match ready, match failed, peer left, notice), readers for users, rooms, the current room
+  (seats with delay, ICE state and ping) and the match (slots, total seats, delay, prediction, peers,
+  manifest), `create_room / join_room / leave_room / send_chat / set_delay / set_prediction /
+  can_start / start_match / swap_seats / kick / set_prematch_manifest / match_started /
+  match_finished`, datagrams `znx_lobby_send / znx_lobby_receive` per channel, and
+  `znx_lobby_gekko_adapter(lobby, 3)` (a GekkoNetAdapter, byte-compatible with RMG-K's "ice:" adapter).
+  Config: STUN (server's / given / off), TURN from the server on/off, the ICE bind address.
+- `lobby.cpp` protocol and state machine; `ws.cpp` WebSocket; `json.cpp`; `ice_mesh.cpp` the mesh on
+  libjuice; `net_posix.cpp` the only platform file (sockets, clock); `net_io.h` puts TLS behind a
+  `Stream` interface (no backend: every RMG-K URL is `ws://`); `lobby_gekko.cpp` the adapter;
+  `lobby_ice_rmgk.cpp` defines the three `LobbyIce` functions RG compiled with `-DNETPLAY` calls (send,
+  take_packets, peer_connected; checked with `nm`), forwarding to a bound lobby, so RMG-K's own
+  `start_lobby_session` can run over this library unchanged.
+- Left out: late join (HELLO says `lateJoin:false`, so the server sends `seats:0`), spectating and
+  live replay, quick match, moderation, lag-stats reports (channel 4), the legacy UDP anchor.
+  `saveData` in HELLO is off unless the caller sets `config.save_data` (it must then apply the
+  manifest's save section).
+- libjuice 1.7.3 from RMG-K's tree, copied to `build/src/libjuice` and compiled unchanged with RMG-K's
+  options (`NO_SERVER`, `USE_NETTLE=0`); MPL-2.0 (THIRD_PARTY_NOTICES.md).
+
+Test: `bash builder/build-mac.sh arm64` builds `build/mac-arm64/znx-lobby-test`;
+`build/mac-arm64/znx-lobby-test` (from the repo root) starts `net/lobby/test/mock_lobby.py` (a mock of the
+server side above, Python standard library, 127.0.0.1 only) and runs two clients in one process with no
+STUN, no TURN and ICE bound to 127.0.0.1. Result: every step passes: upgrade and HELLO_OK, presence,
+create, room list, join, room chat, ICE through the relayed signals (`127.0.0.1:51241 -> 127.0.0.1:51242`,
+host candidates), pings both ways, published delays in ROOM_STATE, the start rule (host yes, guest no),
+MATCH_BEGIN, pre-match sync of a 6 kB manifest (7 fragments) received byte for byte, 200 datagrams each
+way, then a GekkoNet session of 1200 frames between the two over the lobby adapter (a small
+deterministic stand-in game, local delay 0 so remote input is always predicted: 40 to 300 rollbacks per run)
+with identical state checksums on every confirmed frame and no desync event, MATCH_FINISHED back to
+`waiting`, ROOM_LEAVE. Four runs in a row passed.
+
+Not verified against the real server (nothing was sent to it): the server-side field names and
+ordering are inferred from what the client reads; whether the server checks `romHashes`, how it
+orders ROOM_CREATED / ROOM_STATE and MATCH_BEGIN, its rate limits ("flood budget", RLD:4689-4693), and
+what it does with a client that says `lateJoin:false`. Interop with a real RMG-K client (ICE between
+libjuice builds, the manifest, the GekkoNet session with the real emulator) is untested.
+
+Switch integration needs: libjuice on libnx sockets (BSD API, `poll`, pthreads: present in
+devkitPro's newlib; libnx has no `getifaddrs`, so build with `NO_IFADDRS` and check its `SIOCGIFCONF`
+path, or bind the agents to the console's address from `gethostid()` via `config.bind_address`);
+`socketInitialize` with enough UDP buffers for one agent per peer; the libjuice thread (POLL mode);
+calling `znx_lobby_poll` every frame from the UI thread and the adapter from the emulation thread
+(both are locked); RG compiled a second way with `-DNETPLAY` plus `lobby_ice_rmgk.cpp`
+(`znx_lobby_bind_rmgk`) to use RMG-K's own `start_lobby_session`, with `LOBBY|` semantics
+(total seats, slot order) from `znx_lobby_match`; applying the manifest's cheats and save section to
+the core before frame 0 (RMG-Core's `CoreDeserializeNetplayCheats` / `CoreSetNetplaySaveData` have no
+Qt); no TLS (all `ws://`); DNS is not needed (IP literals).
+
+
+## Netplay on the Switch (step 4b), 2026-11-12: built and tested off the console, not yet run on one
+
+`z-cancel-nx.nro` plays RMG-K's "Peer to Peer" rollback mode from the start screen: a game's "Online play"
+row opens Host a game, Join with a code, Join by IP address, Public games and Lobby (the last calls
+`znx_lobby_open`, `menu/lobby_entry.c`, a stub for the lobby work in `net/lobby/`).
+
+### The parts
+
+- `net/p2p/znx_p2p.cpp` (C API in `znx_p2p.h`): what RMG-K keeps in `KailleraP2PDialog`, without Qt, plus the
+  session. One lobby thread polls n02 every millisecond (`p2p_step`; during a match `p2p_rollback_process_control`
+  every 2 ms) and does the dialog's one-second housekeeping (`onTravTimer`). Host: `p2p_core_initialize` on
+  the `p2p_port` setting (27886), connect code from the traversal server (CLAIM|AUTO -> CLAIMOK -> CLAIMACK +
+  HOSTOPEN -> HOSTOK, HOSTKEEP every 10 s, PEER -> ten PUNCH a second for 15 s, HOSTCLOSE when a peer joins,
+  HOSTOPEN again when it leaves; NOAUTH clears the saved code, NOSESSION reopens), code and owner token kept in
+  `z-cancel-nx.ini` (`p2p_code`, `p2p_token`, as RMG-K's `Kaillera_P2PStaticCode`/`OwnerToken`); after four
+  unanswered tries it shows the address from WHATISMYIP and keeps asking every 30 s. Public list (setting, off by
+  default): ENLISP `game|app {CC:code}|user|port` (ENLIST without a code on 27886), every 30 s while waiting,
+  UNENLIST when a peer joins and on leaving; PINGRQ answered. Join: a code (normalised as
+  `normalizeTraversalCode`) sends JOIN every 3 s; HOST -> PUNCH + `p2p_core_connect` every second, the host's
+  address on 27886 after three tries, 15 s in all; IP[:port] logs in every second for 7 s. The public list is
+  `GET /plist.txt` on a plain socket (`http_list.cpp`), parsed as both RMG-K parsers do (lines or one flat pipe
+  stream, four fields per game, only games with ` {CC:` kept); the screen shows only games whose name is the
+  chosen ROM's GoodName.
+- Lobby (`KailleraP2PDialog.cpp:2090-2136, 3195-3256, 3482-3520, 3816-3841`): app string `RMG-K v0.9.16`; the host
+  sends `RMGK:MODE:RB`, `RMGK:RBDELAY:<0 auto|3 custom>:<d>`, `RMGK:RBPRED:0`, `RMGK:RBPACE:1` on join and on
+  ready, and `RBDELAY` again when the automatic delay changes (75th percentile of the last 20 s of pings,
+  first after five pings or 5 s, then every 10 s; `<=50` ms 1 ... `>220` 5); the joiner adopts the host's
+  delay and window, and may press ready only once it knows the host's game, the game is its own and the mode is
+  RB (otherwise the screen says which). The peer's ready state is read from n02's "<name> is ready" lines, as
+  the dialog does. Game names: the GoodName of each MD5 in RMG-K's `mupen64plus.ini`: `Super Smash Bros. (U) [!]`,
+  `SmashRemix2.0.1`, `SmashRemix2.0.1 +EXTRA (0.6.0)` (`menu/online.c`).
+- Session (`znx_p2p_run_session`, the `session_run` of `bench_core.c`): `set_deterministic`, `start_p2p_session(
+  "rmgk-gekko", 2, 4, player, port, peer, delay, window)` (host 1, joiner 2, ports 3-4 unplugged by the core),
+  `execute`. A control thread ends it on the peer's DROP or EXIT, when GekkoNet reports the peer disconnected
+  (5 s of silence), or after 20 s without a frame; the quit hold (or the system closing the program) sends n02
+  DROP (`znx_p2p_leave_game`). After a DROP both stay in the lobby (the screen before the match comes back);
+  after EXIT or a timeout the start screen shows why.
+- Input: `net/input-net.c` is linked as a fifth static plugin (`input_net`); its source polls the console and
+  returns controller 1's word, whichever player this console is. Note: the generated name tables used to drop
+  every `SDL_*` export (meant for the core's SDL stand-ins); an input plugin's `SDL_KeyDown/KeyUp` are its API,
+  and without them the core refuses the plugin ("broken Input plugin"), so the filter is now the core's only.
+- Memory: `patches/0007` lets `RMGK_GEKKO_STATE_CAPACITY` set GekkoNet's slot size; the Switch build passes
+  10 MiB (the state is 8,438,120 bytes): about 100 MB for a 7-frame window instead of 240 MB. Local only.
+- Sockets: `socketInitializeDefault` is already done by `znx_front_begin`. libnx's `ioctl` passes FIONBIO to the
+  bsd service unchanged; whether Horizon honours it is undocumented, while `fcntl(F_SETFL, O_NONBLOCK)` maps to
+  the service's Fcntl (what other homebrew uses). `k_socket.cpp` is compiled with `-Dioctl=znx_ioctl`
+  (`net/p2p/socket_switch.c`), which does FIONBIO with fcntl and logs `net: n02 socket N non-blocking by fcntl:
+  yes|NO` once. `select`, `gethostbyname`, `getaddrinfo` are libnx's. RMG-Core's `Library.cpp` (dlopen) is
+  replaced by `net/p2p/library_static.cpp` (the static name tables).
+
+### Pacing
+
+RMG-K's time sync runs a lagging side up to 1 % fast and an ahead side up to 0.5 % slow. The display's vsync
+cannot do that, so an online match uses RMG-K's own pacer: the core's frame output keeps PACING on, so
+GLideN64's rendering callback calls `rmgk_gekko::pace_before_present` right before the swap (a phase-locked
+deadline at 60 Hz x speed, re-based after a stall), and the core's limiter, at the same speed, paces a frame
+without a swap; the swap interval is 0 (`vidext_switch.c` ignores the plugin's request during a match). Why that
+should not tear: the Switch shows a window through the system compositor (vi/nvnflinger buffer queue); a queued
+buffer is taken whole at the display's refresh, so swap interval 0 can only replace a buffer that was not shown
+yet or let the display repeat the last one, which is what a game at 60.6 Hz or 59.7 Hz must look like on a 60 Hz
+panel anyway (at full correction one repeated or dropped frame every 1.7 s); it never shows two halves. This is
+the expectation, not a measurement: if the console tears, `net_vsync=1` in the ini keeps swap interval 1 and
+follows the same 60 Hz x speed timeline by skipping a swap when this side is a frame behind it (two frames in
+one refresh) or waiting a refresh before a swap when it is a frame ahead (re-anchored after a stall of three
+frames, so a wait for the peer is not caught up in a burst). Local play keeps swap interval 1 and the display.
+
+### Overlay
+
+`net_overlay=1` (Settings, "Match overlay", default off): ping, delay and rollbacks in the black margin left of the
+4:3 picture, drawn by `switch/overlay_switch.c` with the start screen's renderer in GLideN64's context inside the
+buffer swap, after the frame is complete. It writes only the window's framebuffer, never RDRAM; every piece of
+OpenGL state it touches is read before and restored after, so GLideN64's state cache stays true.
+
+### Tests (Mac M5 and the container; no public host contacted)
+
+- Two Mac processes, the same lobby/session code, vanilla US ROM, `bench/inputs/ssb-usa-vs-mash.txt`, 60 ms +- 20
+  each way, 2 % of GekkoNet's datagrams lost, host on automatic delay (`--delay 0 --ready-after 7`): the host's
+  automatic delay went from 2 to 3 (ping 139 ms) and the joiner adopted it; 284 of 284 check lines identical,
+  `check 17000 2c0196363c2d2922 976c1aa7e40df3c7` on both (the bench's reference); 59.82 fps over 284 s;
+  1,176 / 1,234 rollbacks, deepest 3.
+- Connect codes and the public list against `tools/mock-smash64.py` (a local stand-in written from the client's
+  side of the protocol): CLAIM, CLAIMOK, CLAIMACK, HOSTOPEN, HOSTOK, ENLISP with ` {CC:ZNX@7}`, plist.txt with
+  the listing, JOIN `znx7` (typed lowercase, normalised to ZNX@7), PEER + HOST, HOSTCLOSE + UNENLIST on join;
+  code and token saved and reused. 10 of 10 check lines identical.
+- `builder/build-switch.sh --selftest-net ROM ...`: the netplay code compiled by the container's GCC for Linux
+  ARM64 (with the core's `__SWITCH__` paths and the static tables) as `znx-net-linux`, joining znx-net on the
+  Mac through the container's NAT (`host.docker.internal`), 30 ms +- 10 each way, 1 % loss: 284 of 284 check
+  lines identical, `check 17000 2c0196363c2d2922 976c1aa7e40df3c7` on both, 59.9 / 58.9 fps, 694 / 691 rollbacks.
+  The first try found the name-table `SDL_*` bug above (the input plugin refused); the bench still gives
+  `hash 3600 1499ebb25c8606c4`.
+- Start screen previews from the real code against the mock server and znx-net (`build/menu-preview/online/`).
+
+Untested: everything on the console (sockets, fcntl, swkbd, pacing and tearing, the overlay over GLideN64,
+memory), real RMG-K on the other end, the real nat/list servers (the mock follows the client, not the server),
+a rematch after a DROP (the code path exists; GekkoNet's session is closed and started again).
+
+### Switch against Mac over a real LAN, 2026-11-12
+
+The console (Wi-Fi) hosted from the online screen; `znx-net --join <console>:27886 --bind-any` on the Mac
+(Ethernet) joined, played P2 with the mash script while sys-botbase pressed buttons for P1 on the console.
+With `rdram_check=1` the console logs the same final-frame `check` lines as `znx-net`:
+
+- 9,000 frames, ping 33 ms, delay 1 (auto); console 88 rollbacks (177 frames re-run, deepest 7), Mac 92
+  (deepest 7); all 15 check lines identical on both sides;
+- the pre-match screen, ready, start, the peer leaving ("Mac left. Waiting for another player."), and B
+  back out to the Homebrew Menu all worked; with the code server unreachable the host card shows the
+  address after a few seconds;
+- Mac hosting and the console joining by IP did not connect: macOS's application firewall blocks
+  incoming UDP to the unsigned `znx-net`. The console's "Could not join / Nobody answered" screen is
+  what showed. Not a console problem; the firewall setting was left alone.

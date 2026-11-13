@@ -479,6 +479,28 @@ void znx_draw_begin(unsigned framebuffer, int width, int height, uint32_t clear)
     g.count = 0;
 }
 
+void znx_draw_begin_over(unsigned framebuffer, int width, int height)
+{
+    /* znx_draw_begin without the clear: drawing over a finished picture (the match overlay) */
+    g.width = width;
+    g.height = height;
+    p_glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    p_glViewport(0, 0, width, height);
+    p_glDisable(GL_DEPTH_TEST);
+    p_glDisable(GL_CULL_FACE);
+    p_glDisable(GL_SCISSOR_TEST);
+    p_glEnable(GL_BLEND);
+    p_glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    p_glUseProgram(g.program);
+    p_glUniform2f(g.u_screen, 1280.0f, 720.0f);
+    p_glUniform1i(g.u_atlas, 0);
+    p_glActiveTexture(GL_TEXTURE0);
+    p_glBindTexture(GL_TEXTURE_2D, g.atlas);
+    p_glBindVertexArray(g.vao);
+    p_glBindBuffer(GL_ARRAY_BUFFER, g.vbo);
+    g.count = 0;
+}
+
 void znx_draw_end(void)
 {
     flush();

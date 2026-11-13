@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-/* znx-net: the pieces of the program that RMG-K's own sources call back into (through the glue in
- * rmgk_glue.cpp and n02_glue.cpp). Everything here runs on the emulation thread unless noted. */
+/* What RMG-K's own sources call back into (through the glue in rmgk_glue.cpp and n02_glue.cpp),
+ * implemented by net/p2p/znx_p2p.cpp for znx-net and the Switch program. Everything here runs on the
+ * emulation thread unless noted. */
 #ifndef ZNX_NET_H
 #define ZNX_NET_H
 
@@ -24,6 +25,11 @@ void znx_net_peer_left(void);
 void znx_net_peer_info(const char* name, const char* app);
 void znx_net_hosted_game(const char* game);
 void znx_net_debug(const char* message);
+void znx_net_ping(int ping);                                         /* a lobby PING echo, ms */
+void znx_net_ssrv(const char* data, int len, const void* from);     /* traversal/list datagram, from a sockaddr_in */
+
+/* rmgk_glue.cpp: RollbackNetcode's CoreRollbackSetTimesyncScale, the time sync's speed for the next frames. */
+void znx_net_timesync_scale(double scale);
 
 /* netsim.c: artificial latency, jitter and loss on the n02 socket (k_socket.cpp's sendto and
  * bind are renamed to these when it is compiled for znx-net). */

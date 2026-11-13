@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <switch.h>
 
@@ -75,6 +76,41 @@ static uint32_t buttons(u64 held)
     if (held & HidNpadButton_ZL) b |= ZNX_BTN_ZL;
     if (held & HidNpadButton_ZR) b |= ZNX_BTN_ZR;
     return b;
+}
+
+int znx_switch_keyboard(int kind, const char* header, const char* guide, const char* initial, char* out, size_t out_size)
+{
+    /* The system keyboard applet (libnx swkbd). It takes over the screen until the player is done; the
+     * menu's context stays current meanwhile and the next frame draws over whatever the applet left. */
+    SwkbdConfig keyboard;
+    Result rc = swkbdCreate(&keyboard, 0);
+    if (R_FAILED(rc)) {
+        znx_log("menu: the keyboard does not open: 0x%08x", rc);
+        return 0;
+    }
+    swkbdConfigMakePresetDefault(&keyboard);
+    if (kind == 2) {
+        /* an address: digits, with "." and ":" on the two extra keys */
+        swkbdConfigSetType(&keyboard, SwkbdType_NumPad);
+        swkbdConfigSetLeftOptionalSymbolKey(&keyboard, ".");
+        swkbdConfigSetRightOptionalSymbolKey(&keyboard, ":");
+    } else {
+        swkbdConfigSetType(&keyboard, SwkbdType_Normal);
+    }
+    swkbdConfigSetHeaderText(&keyboard, header);
+    swkbdConfigSetGuideText(&keyboard, guide);
+    swkbdConfigSetInitialText(&keyboard, initial != NULL ? initial : "");
+    swkbdConfigSetStringLenMax(&keyboard, kind == 0 ? 31 : kind == 1 ? 12 : 21);
+    swkbdConfigSetBlurBackground(&keyboard, true);
+    out[0] = '\0';
+    rc = swkbdShow(&keyboard, out, out_size);
+    swkbdClose(&keyboard);
+    if (R_FAILED(rc)) {
+        out[0] = '\0';
+        return 0;   /* cancelled (0x5d59) or failed */
+    }
+    znx_log("menu: keyboard \"%s\": %u characters", header, (unsigned)strlen(out));
+    return out[0] != '\0';
 }
 
 enum znx_menu_action znx_menu_switch_run(struct znx_menu* menu)
@@ -146,6 +182,6 @@ enum znx_menu_action znx_menu_switch_run(struct znx_menu* menu)
     znx_draw_shutdown();
     eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroyContext(display, context);
-    znx_log("menu: %s", action == ZNX_MENU_PLAY ? "play" : "quit");
+    znx_log("menu: %s", action == ZNX_MENU_PLAY ? "play" : action == ZNX_MENU_PLAY_ONLINE ? "play online" : "quit");
     return action;
 }

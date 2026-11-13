@@ -23,6 +23,7 @@
  * its own display and surface as before. */
 
 #include <stdbool.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -33,6 +34,7 @@
 
 #include "m64p_types.h"
 #include "bench_core.h"
+#include "overlay_switch.h"
 #include "screen_switch.h"
 #include "vidext_switch.h"
 #include "znx_switch.h"
@@ -53,6 +55,22 @@ static int l_swap_interval = 1, l_samples = 0;
 static uint64_t l_swap_ns;   /* inside eglSwapBuffers since the last take */
 static int l_swaps;
 static uint64_t l_paced_at;  /* end of the last swap or paced wait */
+
+/* An online match (see vidext_switch.h and docs/PLAN.md "Netplay on the Switch", pacing). */
+static enum znx_net_present l_present = ZNX_PRESENT_LOCAL;
+static int l_overlay;
+static char l_overlay_labels[4][24], l_overlay_values[4][24];
+static int l_overlay_count;
+static volatile double l_speed = 1.0;
+static double l_base_hz = 60.0;
+static double l_ideal;              /* frames the 60 Hz x speed timeline has reached since the anchor */
+static double l_frames;             /* visible frames since the anchor */
+static uint64_t l_timeline_at;      /* when l_ideal was last advanced */
+static int l_skip_next;             /* ZNX_PRESENT_VSYNC: behind by a frame: do not show the next one */
+static int l_hold_next;             /* ahead by a frame: show the next one a refresh later */
+static int l_swapped_this_frame;
+static int l_cooldown;              /* frames before the next skip/hold decision: the last one must show first */
+static unsigned l_skipped, l_held, l_rebased;
 
 static const char* egl_error(void)
 {
@@ -82,6 +100,8 @@ static const char* egl_error(void)
 
 static void destroy_context(void)
 {
+    if (l_context != EGL_NO_CONTEXT)
+        znx_overlay_shutdown();       /* its OpenGL objects live in this context */
     if (l_shared) {
         eglMakeCurrent(l_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         if (l_context != EGL_NO_CONTEXT)
@@ -253,6 +273,10 @@ static m64p_error vidext_set_mode(int width, int height, int bits_per_pixel, int
         destroy_context();
         return M64ERR_SYSTEM_FAIL;
     }
+    if (l_present == ZNX_PRESENT_TIMER)
+        l_swap_interval = 0;          /* RMG-K's timer decides when a frame is shown, not the display */
+    else if (l_present == ZNX_PRESENT_VSYNC)
+        l_swap_interval = 1;
     if (!eglSwapInterval(l_display, l_swap_interval))
         znx_log("video: swap interval %d refused: %s", l_swap_interval, egl_error());
     l_width = width;
@@ -318,6 +342,8 @@ static m64p_error vidext_gl_set_attribute(m64p_GLattr attribute, int value)
     case M64P_GL_CONTEXT_PROFILE_MASK: l_profile = value; break;
     case M64P_GL_MULTISAMPLESAMPLES: l_samples = value; break;
     case M64P_GL_SWAP_CONTROL:
+        if (l_present != ZNX_PRESENT_LOCAL)
+            break;                    /* an online match keeps its own (znx_vidext_set_netplay) */
         l_swap_interval = value;
         if (l_context != EGL_NO_CONTEXT)
             eglSwapInterval(l_display, value);
@@ -354,6 +380,28 @@ static m64p_error vidext_gl_swap_buffers(void)
     uint64_t begin, end;
     if (l_surface == EGL_NO_SURFACE)
         return M64ERR_NOT_INIT;
+    l_swapped_this_frame = 1;
+    if (l_present == ZNX_PRESENT_VSYNC && l_skip_next) {
+        /* behind the timeline by a frame: this one is not shown, so the next comes a refresh sooner */
+        l_skip_next = 0;
+        l_skipped++;
+        return M64ERR_SUCCESS;
+    }
+    if (l_overlay && l_overlay_count > 0) {
+        const char* labels[4];
+        const char* values[4];
+        for (int i = 0; i < l_overlay_count; ++i) {
+            labels[i] = l_overlay_labels[i];
+            values[i] = l_overlay_values[i];
+        }
+        znx_overlay_draw(l_width, l_height, labels, values, l_overlay_count);
+    }
+    if (l_present == ZNX_PRESENT_VSYNC && l_hold_next) {
+        /* ahead by a frame: the display shows the last frame once more while this one waits a refresh */
+        l_hold_next = 0;
+        l_held++;
+        svcSleepThread((s64)REFRESH_NS);
+    }
     begin = znx_now_ns();
     if (!eglSwapBuffers(l_display, l_surface)) {
         static int reported;
@@ -451,4 +499,82 @@ void znx_vidext_pace_without_swap(void)
     now = znx_now_ns();
     /* Behind by more than a refresh: start counting from now instead of catching up. */
     l_paced_at = now > due + REFRESH_NS ? now : due;
+}
+
+/* ---- an online match ---- */
+
+void znx_vidext_set_netplay(enum znx_net_present mode, int overlay)
+{
+    const char* hz = getenv("RMGK_ROLLBACK_PRESENT_HZ_EFFECTIVE");
+    l_present = mode;
+    l_overlay = overlay && mode != ZNX_PRESENT_LOCAL;
+    l_overlay_count = 0;
+    l_speed = 1.0;
+    l_base_hz = hz != NULL && atof(hz) >= 30.0 && atof(hz) <= 240.0 ? atof(hz) : 60.0;
+    l_ideal = l_frames = 0;
+    l_timeline_at = 0;
+    l_skip_next = l_hold_next = 0;
+    l_cooldown = 0;
+    if (mode != ZNX_PRESENT_VSYNC && (l_skipped || l_held || l_rebased))
+        znx_log("video: the last online match showed %u frames twice, skipped %u, re-anchored %u times",
+                l_held, l_skipped, l_rebased);
+    l_skipped = l_held = l_rebased = 0;
+    if (mode == ZNX_PRESENT_TIMER)
+        l_swap_interval = 0;
+    else
+        l_swap_interval = 1;
+}
+
+void znx_vidext_set_overlay(const char* const* labels, const char* const* values, int count)
+{
+    if (count > 4)
+        count = 4;
+    for (int i = 0; i < count; ++i) {
+        snprintf(l_overlay_labels[i], sizeof(l_overlay_labels[i]), "%s", labels[i]);
+        snprintf(l_overlay_values[i], sizeof(l_overlay_values[i]), "%s", values[i]);
+    }
+    l_overlay_count = count;
+}
+
+void znx_vidext_set_speed(double scale)
+{
+    l_speed = scale < 0.99 ? 0.99 : scale > 1.01 ? 1.01 : scale;
+}
+
+void znx_vidext_net_frame_end(void)
+{
+    const uint64_t now = znx_now_ns();
+    double drift;
+    if (l_present != ZNX_PRESENT_VSYNC)
+        return;
+    if (l_timeline_at == 0) {
+        l_timeline_at = now;
+        l_swapped_this_frame = 0;
+        return;
+    }
+    /* The timeline RMG-K's pacer would follow: base rate x the time sync's speed. */
+    l_ideal += (double)(now - l_timeline_at) * 1e-9 * l_base_hz * l_speed;
+    l_timeline_at = now;
+    l_frames += 1.0;
+    drift = l_frames - l_ideal;    /* > 0: this side runs ahead of its timeline; < 0: behind */
+    if (drift > 3.0 || drift < -3.0) {
+        /* a stall (waiting for the peer, a scene load): start counting again, no catching up */
+        l_ideal = l_frames;
+        l_rebased++;
+    } else if (l_cooldown > 0) {
+        l_cooldown--;
+    } else if (drift <= -1.0) {
+        l_skip_next = 1;           /* the next frame is not shown: two frames in one refresh */
+        l_cooldown = 2;
+    } else if (drift >= 1.0) {
+        l_hold_next = 1;           /* the next frame waits a refresh: one frame over two refreshes */
+        l_cooldown = 2;
+    }
+    if (!l_swapped_this_frame && drift > 0) {
+        /* no swap to wait in (a scene loading): wait out the timeline by the clock */
+        const double wait_s = drift / (l_base_hz * l_speed);
+        if (wait_s > 0 && wait_s < 0.05)
+            svcSleepThread((s64)(wait_s * 1e9));
+    }
+    l_swapped_this_frame = 0;
 }

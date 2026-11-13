@@ -25,6 +25,9 @@ int znx_draw_init(void* (*getproc)(const char* name), const void* font_data, siz
 void znx_draw_shutdown(void);
 
 void znx_draw_begin(unsigned framebuffer, int width, int height, uint32_t clear);
+/* The same without clearing: for drawing over a finished picture. The caller saves and restores the
+ * OpenGL state it shares with another renderer (switch/overlay_switch.c). */
+void znx_draw_begin_over(unsigned framebuffer, int width, int height);
 void znx_draw_end(void);
 
 void znx_draw_rect(float x, float y, float w, float h, float radius, uint32_t color);

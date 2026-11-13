@@ -4,9 +4,9 @@
  * directory, the frame counter, the netplay-save tracker and the n02 .krec recorder. Each is the
  * smallest stand-in that keeps the P2P path's behaviour; none of them touches the wire protocol.
  *
- * Three of RMG-K's own core wrappers (RMG-Core/RollbackNetcode.cpp, also compiled unchanged) are
+ * Four of RMG-K's own core wrappers (RMG-Core/RollbackNetcode.cpp, also compiled unchanged) are
  * renamed with -D when that file is compiled (rmgk_CoreRollback...) and wrapped here, so znx-net
- * sees every rollback save, load and re-simulated frame: that is where the per-frame checksums
+ * sees every rollback save, load, re-simulated frame and time-sync speed: that is where the per-frame checksums
  * for the "check" lines and the rollback statistics come from. The wrappers call RMG-K's code
  * first and change nothing it returns. */
 
@@ -30,6 +30,7 @@
 bool rmgk_CoreRollbackSaveGameStateInto(CoreRollbackState& state, unsigned char* buffer, int capacity, int frame);
 bool rmgk_CoreRollbackLoadGameState(const CoreRollbackState& state);
 bool rmgk_CoreRollbackRunFrame(int flags);
+bool rmgk_CoreRollbackSetTimesyncScale(double scale);
 
 bool CoreRollbackSaveGameStateInto(CoreRollbackState& state, unsigned char* buffer, int capacity, int frame)
 {
@@ -52,6 +53,14 @@ bool CoreRollbackRunFrame(int flags)
     const bool ok = rmgk_CoreRollbackRunFrame(flags);
     if (ok)
         znx_net_frame_resimulated();
+    return ok;
+}
+
+bool CoreRollbackSetTimesyncScale(double scale)
+{
+    /* the time sync's speed (apply_gekko_frame_pacing): the Switch's vsync presenter follows it */
+    const bool ok = rmgk_CoreRollbackSetTimesyncScale(scale);
+    znx_net_timesync_scale(scale);
     return ok;
 }
 
