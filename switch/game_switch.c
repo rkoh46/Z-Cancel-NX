@@ -44,7 +44,9 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <dirent.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -441,6 +443,65 @@ static void read_settings(struct settings* settings)
 
 /* One game, as the program ran before it had a start screen; online, the match the lobby agreed on.
  * Returns znx_front_run's result. */
+/* The shipped shader lists (romfs:/data/shaders/GLideN64.<hash of the ROM's name>.OpenGL.keys: combiner
+ * keys, one hex number a line after a format line and a count) are merged into this console's own in
+ * profile/shaders, so the picture plugin compiles those shaders at start and not in the middle of a match.
+ * This Mesa cannot save compiled programs, only which ones were needed. */
+#define SEED_MAX 4096
+static int seed_read(const char* path, char format[32], uint64_t* keys, int count)
+{
+    char line[64];
+    int row = 0;
+    FILE* file = fopen(path, "r");
+    if (file == NULL) return count;
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (row == 0) snprintf(format, 32, "%s", line);
+        else if (row > 1 && count < SEED_MAX) {
+            const uint64_t key = strtoull(line, NULL, 16);
+            int i = 0;
+            while (i < count && keys[i] != key) ++i;
+            if (i == count) keys[count++] = key;
+        }
+        row++;
+    }
+    fclose(file);
+    return count;
+}
+
+static int seed_compare(const void* a, const void* b)
+{
+    const uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : x > y;
+}
+
+static void seed_shader_keys(void)
+{
+    static uint64_t keys[SEED_MAX];
+    struct dirent* entry;
+    DIR* dir = opendir("romfs:/data/shaders");
+    if (dir == NULL) return;
+    mkdir(ZNX_BASE_DIR "/profile", 0777);
+    mkdir(ZNX_BASE_DIR "/profile/shaders", 0777);
+    while ((entry = readdir(dir)) != NULL) {
+        char from[512], to[512], format[32] = "", shipped_format[32] = "";
+        int own, all;
+        if (strstr(entry->d_name, ".keys") == NULL) continue;
+        snprintf(from, sizeof(from), "romfs:/data/shaders/%s", entry->d_name);
+        snprintf(to, sizeof(to), ZNX_BASE_DIR "/profile/shaders/%s", entry->d_name);
+        own = seed_read(to, format, keys, 0);
+        all = seed_read(from, shipped_format, keys, own);
+        if (all == own || (own > 0 && strcmp(format, shipped_format) != 0)) continue;
+        qsort(keys, all, sizeof(keys[0]), seed_compare);
+        FILE* file = fopen(to, "w");
+        if (file == NULL) continue;
+        fprintf(file, "%s0x%08x\n", shipped_format, all);
+        for (int i = 0; i < all; ++i) fprintf(file, "0x%016llx\n", (unsigned long long)keys[i]);
+        fclose(file);
+        znx_log("shaders: %d shipped keys added to %s (%d in all)", all - own, entry->d_name, all);
+    }
+    closedir(dir);
+}
+
 static int play(const char* rom_path, bool have_romfs, bool online)
 {
     static struct settings settings;
@@ -543,6 +604,7 @@ int main(int argc, char** argv)
     znx_front_begin(PROGRAM, "latest.log", false);
     have_romfs = znx_front_romfs();
     read_settings(&settings);
+    if (have_romfs) seed_shader_keys();
 
     if (settings.matrix[0]) {
         /* Lines: <rom file in the app's folder> <stage> <f1,f2[,f3,f4]> <frames> [label...]; # comments.

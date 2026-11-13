@@ -9,10 +9,9 @@
 # Usage: builder/build-switch.sh            znx-bench (REBUILD=1 recompiles everything)
 #        builder/build-switch.sh game       z-cancel-nx
 #        builder/build-switch.sh all        both
-#            The core's assert()s stay in, unlike in the Mac build: on a console a failed one
-#            ends the run with a line in the log, where a silent wrong branch would be a crash
-#            with no explanation. They cost nothing measurable (self-test: same fps either way);
-#            ZNX_NDEBUG=1 builds without them.
+#            The core's assert()s are off, as in RMG-K's builds and the Mac build: Smash Remix reaches
+#            one the recompiler marks FIXME, and a console that closes where a PC plays on cannot
+#            cross-play. ZNX_ASSERTS=1 builds with them, for debugging.
 #        builder/build-switch.sh --selftest ROM [FRAMES]
 #            The same recipe built for the container's own Linux (ARM64) and run there:
 #            build/switch-selftest/znx-selftest. It executes what can be executed without a
@@ -56,7 +55,7 @@ if [ "${1:-}" != "--in-container" ]; then
     command -v docker >/dev/null || { echo "docker not found (start Colima)" >&2; exit 69; }
     docker image inspect "$IMAGE" >/dev/null 2>&1 || {
         echo "Docker image $IMAGE not found: build it with Melee-NX-NetPlay's builder/docker.sh image" >&2; exit 69; }
-    run=(docker run --rm -i -v "$ROOT:/project" -w /project -e REBUILD="${REBUILD:-}" -e ZNX_NDEBUG="${ZNX_NDEBUG:-}" ${ZNX_COMPACT:+-e ZNX_COMPACT=1} "$IMAGE")
+    run=(docker run --rm -i -v "$ROOT:/project" -w /project -e REBUILD="${REBUILD:-}" -e ZNX_ASSERTS="${ZNX_ASSERTS:-}" ${ZNX_COMPACT:+-e ZNX_COMPACT=1} "$IMAGE")
     if [ "${1:-}" = "--selftest" ]; then
         [ -f "${2:-}" ] || { echo "usage: $0 --selftest ROM [FRAMES]" >&2; exit 64; }
         "${run[@]}" bash builder/build-switch.sh --in-container selftest </dev/null
@@ -151,8 +150,10 @@ if [ "$TARGET" = selftest ]; then
     FRONT_COMMON="switch/selftest/linux_main.c switch/dynlib_static.c bench/bench_core.c"
     FRONT_BENCH=""
 fi
-ASSERTS=""
-[ -n "${ZNX_NDEBUG:-}" ] && ASSERTS="-DNDEBUG"
+# Like RMG-K's own builds (the core's Makefile adds -DNDEBUG unless DEBUG=1): the recompiler has assertions
+# marked FIXME that real Remix code reaches, and a PC plays on through them. ZNX_ASSERTS=1 keeps them.
+ASSERTS="-DNDEBUG"
+[ -n "${ZNX_ASSERTS:-}" ] && ASSERTS=""
 COMMON="$ARCH -O3 -g -ffp-contract=off -fno-strict-aliasing -ffunction-sections -fvisibility=hidden -D__SWITCH__ $ASSERTS -w"
 # zlib is devkitPro's static portlib (the Mac build links the system's); minizip is the core's own copy.
 CORE_FLAGS="$COMMON -I$CORE/src -I$GEN -I$CORE/subprojects/md5 -I$CORE/subprojects/xxhash -I$CORE/subprojects/minizip -I$OUT/include $ZLIB_INC -DM64P_PARALLEL -DUSE_SDL3 -DNOCRYPT -DNOUNCRYPT -DDYNAREC -DNEW_DYNAREC=4 -DNO_KEYBINDINGS -DACCURATE_FPU_BEHAVIOR -DIOAPI_NO_64"
@@ -502,6 +503,10 @@ cp "$CORE"/data/mupen64plus.ini "$CORE"/data/mupencheat.txt "$OUT/romfs/data/"
 # checksums of blocks, no game code) as romfs:/data/warm: compiled ahead of need from the first start.
 mkdir -p "$OUT/romfs/data/warm"
 rm -f "$OUT"/romfs/data/warm/warm-*.bin
+# Shader lists the same way (assets/shaders: combiner keys seen on a console across the stage matrix).
+mkdir -p "$OUT/romfs/data/shaders"
+rm -f "$OUT"/romfs/data/shaders/*.keys
+cp assets/shaders/*.keys "$OUT/romfs/data/shaders/" 2>/dev/null || true
 cp assets/warm/warm-*.bin "$OUT/romfs/data/warm/" 2>/dev/null || echo "note: no warm lists in assets/warm (tools/make_warm_list.sh makes them)"
 # The start screen's font (SIL OFL 1.1) as romfs:/fonts; the licences of what the start screen adds as
 # romfs:/licenses (THIRD_PARTY_NOTICES.md).

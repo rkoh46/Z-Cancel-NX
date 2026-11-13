@@ -55,6 +55,7 @@ static int l_swap_interval = 1, l_samples = 0;
 static uint64_t l_swap_ns;   /* inside eglSwapBuffers since the last take */
 static int l_swaps;
 static uint64_t l_shown_at, l_shown_longest;   /* end of the last swap; the longest gap between two since the last take */
+static struct { int frame; float before_ms, swap_ms; } l_late_list[12];   /* the first few, for the log */
 static unsigned l_shown_late;                  /* gaps over 25 ms: a refresh went by without a new frame */
 static uint64_t l_paced_at;  /* end of the last swap or paced wait */
 
@@ -416,7 +417,14 @@ static m64p_error vidext_gl_swap_buffers(void)
     l_swaps++;
     if (l_shown_at != 0) {
         const uint64_t gap = end - l_shown_at;
-        if (gap > 25000000ull) l_shown_late++;
+        if (gap > 25000000ull) {
+            if (l_shown_late < 12) {
+                l_late_list[l_shown_late].frame = znx_bench_frame();
+                l_late_list[l_shown_late].before_ms = (float)((begin - l_shown_at) / 1e6);
+                l_late_list[l_shown_late].swap_ms = (float)((end - begin) / 1e6);
+            }
+            l_shown_late++;
+        }
         if (gap > l_shown_longest) l_shown_longest = gap;
     }
     l_shown_at = end;
@@ -495,6 +503,14 @@ uint64_t znx_vidext_take_swap_ns(void)
 unsigned znx_vidext_take_late(uint64_t* longest_ns)
 {
     const unsigned late = l_shown_late;
+    if (late > 0 && longest_ns != NULL) {   /* a report: where the late ones were, and whether the time went before or inside the swap */
+        char line[512];
+        int used = 0;
+        for (unsigned i = 0; i < late && i < 12; ++i)
+            used += snprintf(line + used, sizeof(line) - used, " %d:%.1f+%.1f", l_late_list[i].frame,
+                             l_late_list[i].before_ms, l_late_list[i].swap_ms);
+        znx_log("video: shown late (frame:ms before the swap+ms inside it):%s", line);
+    }
     if (longest_ns != NULL) *longest_ns = l_shown_longest;
     l_shown_late = 0;
     l_shown_longest = 0;
