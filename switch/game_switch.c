@@ -127,6 +127,9 @@ static struct {
     uint32_t count, over16, over33;
     uint64_t sum_ns, worst_ns;
     int worst_frame;
+    uint64_t last_wall, worst_wall;   /* on the clock, frame to frame: with vsync a late frame is 33 ms */
+    uint32_t late;
+    int worst_wall_frame;
     uint16_t* ms100;           /* each timed frame in 1/100 ms, for the percentiles */
 } l_mx;
 
@@ -134,9 +137,15 @@ static void matrix_frame(int frames)
 {
     const uint64_t now = thread_cpu_ns();
     const uint64_t ns = l_mx.last_ns != 0 && now > l_mx.last_ns ? now - l_mx.last_ns : 0;
+    const uint64_t wall = armTicksToNs(armGetSystemTick());
+    const uint64_t between = l_mx.last_wall != 0 ? wall - l_mx.last_wall : 0;
     l_mx.last_ns = now;
-    if (frames <= MX_SETTLE || l_mx.count >= MX_MAX)
+    l_mx.last_wall = wall;
+    (void)between;
+    if (frames <= MX_SETTLE || l_mx.count >= MX_MAX) {
+        znx_vidext_take_late(NULL);   /* shown frames are counted from here */
         return;
+    }
     if (l_mx.ms100 != NULL)
         l_mx.ms100[l_mx.count] = ns / 10000 > 65535 ? 65535 : (uint16_t)(ns / 10000);
     l_mx.count++;
@@ -267,7 +276,6 @@ static void net_time_frame(void)
         if (ns > l_nt.worst) l_nt.worst = ns;
         if (ns > 16666667ull) l_nt.over16++;
         if (ns > 33333333ull) l_nt.over33++;
-        if (wall - l_nt.last_wall > 25000000ull) l_nt.late++;
     }
     l_nt.last_cpu = cpu;
     l_nt.last_wall = wall;
@@ -276,6 +284,7 @@ static void net_time_frame(void)
 static void net_time_report(int frames)
 {
     if (l_nt.count == 0) return;
+    l_nt.late = znx_vidext_take_late(NULL);
     znx_log("online timing %d: %u frames, %.2f ms/frame, worst %.2f, over 16.7 ms %u, over 33 ms %u, shown late %u",
             frames, l_nt.count, l_nt.sum / 1e6 / l_nt.count, l_nt.worst / 1e6, l_nt.over16, l_nt.over33, l_nt.late);
     l_nt.all_count += l_nt.count; l_nt.all_over16 += l_nt.over16; l_nt.all_over33 += l_nt.over33;
@@ -384,6 +393,7 @@ static int net_session_run(void)
     /* peer to peer (znx_p2p_run_session) or a lobby match (net/lobby_play.h): the same hooks, pacing,
      * overlay, quit hold and checkpoints */
     memset(&l_nt, 0, sizeof(l_nt));
+    znx_vidext_take_late(NULL);
     const int result = znx_online_run_session(l_core_lib, &hooks);
     net_time_report(znx_p2p_visible_frames());
     znx_log("online timing, whole match: %u frames, worst %.2f ms, over 16.7 ms %u, over 33 ms %u, shown late %u",
@@ -555,6 +565,7 @@ int main(int argc, char** argv)
             label[strcspn(label, "\r\n")] = 0;
             snprintf(rom, sizeof(rom), ZNX_BASE_DIR "/%s", rom_name);
             l_mx.last_ns = 0; l_mx.count = l_mx.over16 = l_mx.over33 = 0;
+            l_mx.last_wall = l_mx.worst_wall = 0; l_mx.late = 0; l_mx.worst_wall_frame = 0;
             l_mx.sum_ns = l_mx.worst_ns = 0; l_mx.worst_frame = 0;
             l_mx.on = 1; l_mx.stage = stage; l_mx.frames = frames;
             {
@@ -573,10 +584,11 @@ int main(int argc, char** argv)
                 p99 = l_mx.ms100[(uint64_t)l_mx.count * 99 / 100];
                 p999 = l_mx.ms100[(uint64_t)l_mx.count * 999 / 1000];
             }
-            znx_log("matrix\t%s\t0x%02x\t%s\t%s\texit %d\tframes %u\tavg %.2f\tp50 %.2f\tp99 %.2f\tp99.9 %.2f\tworst %.2f at %d\tover16.7 %u\tover33 %u",
+            { uint64_t gap = 0; l_mx.late = znx_vidext_take_late(&gap); l_mx.worst_wall = gap; }
+            znx_log("matrix\t%s\t0x%02x\t%s\t%s\texit %d\tframes %u\tavg %.2f\tp50 %.2f\tp99 %.2f\tp99.9 %.2f\tworst %.2f at %d\tover16.7 %u\tover33 %u\tshown late %u\tlongest gap %.2f",
                     rom_name, stage, fighters, label, code, l_mx.count,
                     l_mx.count ? l_mx.sum_ns / 1e6 / l_mx.count : 0.0, p50 / 100.0, p99 / 100.0, p999 / 100.0,
-                    l_mx.worst_ns / 1e6, l_mx.worst_frame, l_mx.over16, l_mx.over33);
+                    l_mx.worst_ns / 1e6, l_mx.worst_frame, l_mx.over16, l_mx.over33, l_mx.late, l_mx.worst_wall / 1e6);
             cases++;
         }
         if (file != NULL)

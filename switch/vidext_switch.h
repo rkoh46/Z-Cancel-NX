@@ -12,6 +12,7 @@ void* znx_vidext_functions(void);
  * Called on the emulation thread, like everything that touches the context. */
 uint64_t znx_vidext_take_swap_ns(void);
 int znx_vidext_take_swaps(void);
+unsigned znx_vidext_take_late(uint64_t* longest_ns);
 
 /* For a frame in which the plugin did not swap: waits until one display refresh after the
  * last swap or the last call of this, so the game keeps its 60 Hz without a swap to wait in. */
