@@ -7,6 +7,14 @@ netplay that plays against PC players on [RMG-K](https://github.com/Jay-Day/RMG-
 
 You bring your own ROM. Nothing from a game is in this repository or in a release.
 
+| | |
+|---|---|
+| ![Start screen](docs/images/start.jpg) | ![Online play](docs/images/online.jpg) |
+| ![Lobby rooms](docs/images/lobby.jpg) | ![A lobby room](docs/images/room.jpg) |
+
+Screenshots from a Switch: the start screen, the online menu, RMG-K's lobby and a room waiting to
+start. The menus follow the console's own light or dark theme.
+
 ## What you need
 
 - A Switch running Atmosphere, with the Homebrew Menu.
@@ -68,16 +76,22 @@ A PC player on RMG-K v0.9.16 joins the same way from its Peer to Peer or lobby w
 
 Tested on an Erista (first model) Switch:
 
-- Offline play with picture, sound and controllers, for all three games.
-- Rollback: a 7-frame rollback costs about 9 ms; rewinding and re-running gives the identical
-  state every time, in all three games.
-- The Switch produces the same emulated state as a Mac running the same core, checked every
-  600 frames through full matches.
-- Online play, hosting and joining by address and through the lobby, against a Mac build of the
-  same code on a local network.
+- All three games play with picture, sound and controllers. Every stage of all three was run with
+  four level 9 CPUs: no frame of game work over 16.7 ms once each shader has been built (the app
+  ships the shader list, so that happens at start).
+- Rollback: rewinding and re-running gives the identical state every time, in all three games. A
+  rollback of up to five frames fits inside one frame; a full seven-frame rollback (about 120 ms of
+  lag) can make one frame late.
+- The Switch produces the same emulated state as a Mac running the same core, checked every 600
+  frames through full matches, also with added lag and packet loss.
+- Online: hosting and joining by address and through the lobby, against a Mac build of the same code
+  on a local network.
 
-Not yet tested: matches against RMG-K on a Windows PC over the internet, and the community's
-connect-code, public-list and lobby servers. Reports are welcome.
+Known issues:
+- With vsync, a few moments in some matches show one frame about 10 ms late (the graphics driver
+  waits); never two frames.
+- Not yet tested in a match against RMG-K on a Windows PC, or through the community's connect-code,
+  public-list and lobby servers. Reports are welcome.
 
 Frame-time measurements for every stage are in [docs/STAGE_MATRIX.md](docs/STAGE_MATRIX.md).
 
