@@ -1,0 +1,299 @@
+RSP HLE: faster audio commands, same bytes
+
+Frames re-run after a rollback still run the audio microcode (its state and output are in RDRAM);
+about a fifth of such a frame went to the alist commands. Each command below now has a fast form
+used only where it gives exactly the bytes of the original loop, which stays for every other case:
+- envmix_lin (ENVMIXER of the naudio ABI): the two volume ramps in closed form (until the target is
+  reached value + k*step stays between value and target, inside 32 bits), the four gains of a run of
+  samples first, then each output row mixed on its own, which the compiler vectorizes. Taken when all
+  ranges are inside alist_buffer, the input is apart from the outputs and the outputs are apart from
+  each other or the same buffer.
+- resample: the loop without the wrap of sample() when every position it touches is inside
+  alist_buffer and nothing wraps; the four taps as one dot product of eight with the taps placed at
+  the swizzled positions of the samples (zeros elsewhere). Reads and writes keep their order.
+- mix (apart ranges), clear and move (whole words, apart ranges): plain loops, memset, memcpy.
+- adpcm_compute_residuals with count 8 (every ADPCM frame): constant bounds, the triangular dot
+  products as columns, sums in uint32_t (the same bits as the int32_t sums, which wrap).
+All are integer arithmetic. Checked with a randomized differential test against the original
+functions (1,000,000 cases, overlapping, unaligned and out-of-range ones included) built with clang
+on arm64 and x86-64 and with GCC on Linux ARM64, and with the full-match hashes.
+
+--- a/mupen64plus-rsp-hle/src/alist.c
++++ b/mupen64plus-rsp-hle/src/alist.c
+@@ -48,6 +48,72 @@
+     *a = tmp;
+ }
+ 
++/* Z-Cancel NX: faster forms of the hot audio commands for the common case, used only when they are
++ * certain to give the same bytes as the loops they stand in for: every range lies inside alist_buffer
++ * (no wrap, no running past its end), and ranges that one command reads and writes do not overlap,
++ * so that the order in which samples are processed cannot matter. Otherwise the original loop runs. */
++#define ZN_ALIST_SIZE ((size_t)sizeof(((struct hle_t*)0)->alist_buffer))
++#define ZN_CHUNK 256
++
++static int zn_inside(uint16_t dmem, size_t bytes)
++{
++    return (size_t)dmem + bytes <= ZN_ALIST_SIZE;
++}
++
++static int zn_apart(uint16_t a, uint16_t b, size_t bytes)
++{
++    return (size_t)a + bytes <= b || (size_t)b + bytes <= a;
++}
++
++/* dst[i] += src[i] * gain[i] >> 15, clamped: sample_mix for a row of samples */
++static void zn_mix_row(int16_t* __restrict dst, const int16_t* __restrict src, const int16_t* __restrict gain, size_t n)
++{
++    size_t i;
++    for (i = 0; i < n; ++i)
++        dst[i] = clamp_s16(dst[i] + ((src[i] * gain[i]) >> 15));
++}
++
++/* ramp_step() n times, the volumes written in buffer order: vol[k^S] is what step k+1 returns.
++ * Until the target is reached, value + k*step lies between value and target, both inside int32_t
++ * (each is an int16_t << 16, or an int32_t from the saved state), so it is computed in 32 bits
++ * modulo 2^32 and is exact; from the step that reaches the target on, ramp_step() returns the
++ * target. n is even. */
++static void zn_ramp_run(struct ramp_t* ramp, size_t n, int16_t* vol)
++{
++    const int64_t v = ramp->value, st = ramp->step, t = ramp->target;
++    const uint32_t uv = (uint32_t)v, us = (uint32_t)st;
++    const int16_t tv = (int16_t)(t >> 16);
++    int64_t first; /* the step (from 1) on which ramp_step() finds the target reached */
++    size_t p, before;
++
++    if (st > 0)
++        first = (v + st >= t) ? 1 : (t - v + st - 1) / st;
++    else if (st < 0)
++        first = (v + st <= t) ? 1 : (v - t - st - 1) / -st;
++    else
++        first = (v <= t) ? 1 : INT64_MAX;
++
++    before = (first - 1 < (int64_t)n) ? (size_t)(first - 1) : n; /* steps that do not reach it */
++    for (p = 0; p < n; ++p) {
++        const uint32_t k = (uint32_t)(p ^ S) + 1;
++        const int16_t ramped = (int16_t)((int32_t)(uv + k * us) >> 16);
++        vol[p] = (k <= before) ? ramped : tv;
++    }
++    if (before < n) {
++        ramp->value = t;
++        ramp->step = 0;
++    } else
++        ramp->value = (int32_t)(uv + (uint32_t)n * us);
++}
++
++/* the same with one gain */
++static void zn_mix_const(int16_t* __restrict dst, const int16_t* __restrict src, int16_t gain, size_t n)
++{
++    size_t i;
++    for (i = 0; i < n; ++i)
++        dst[i] = clamp_s16(dst[i] + ((src[i] * gain) >> 15));
++}
++
+ static int16_t* sample(struct hle_t* hle, unsigned pos)
+ {
+     return (int16_t*)hle->alist_buffer + ((pos ^ S) & 0xfff);
+@@ -146,6 +212,12 @@
+ 
+ void alist_clear(struct hle_t* hle, uint16_t dmem, uint16_t count)
+ {
++    /* whole 32-bit words: the byte swizzle (S8) stays inside each word */
++    if ((dmem & 3) == 0 && (count & 3) == 0 && zn_inside(dmem, count)) {
++        memset(hle->alist_buffer + dmem, 0, count);
++        return;
++    }
++
+     while(count != 0) {
+         *alist_u8(hle, dmem++) = 0;
+         --count;
+@@ -173,6 +245,13 @@
+ 
+ void alist_move(struct hle_t* hle, uint16_t dmemo, uint16_t dmemi, uint16_t count)
+ {
++    /* whole words, ranges apart (a forward byte copy over an overlap is not a memmove) */
++    if (((dmemo | dmemi | count) & 3) == 0 && zn_inside(dmemo, count) && zn_inside(dmemi, count)
++     && zn_apart(dmemo, dmemi, count)) {
++        memcpy(hle->alist_buffer + dmemo, hle->alist_buffer + dmemi, count);
++        return;
++    }
++
+     while (count != 0) {
+         *alist_u8(hle, dmemo++) = *alist_u8(hle, dmemi++);
+         --count;
+@@ -482,6 +561,44 @@
+     }
+ 
+     count >>= 1;
++    /* Fast form: the gains of a run of samples first (the ramps are sequential), then each output
++     * row mixed on its own. Sample k touches index k^S of every buffer and nothing else, so rows may
++     * be done one after the other when the input is apart from all outputs and the outputs are
++     * apart from each other or the very same buffer (then its updates keep their order: dl, dr,
++     * wl, wr). count even keeps k^S below count. */
++    {
++        const size_t bytes = (size_t)count * 2;
++        const uint16_t o[4] = { dmem_dl, dmem_dr, dmem_wl, dmem_wr };
++        int fast = (count & 1) == 0 && ((dmemi | dmem_dl | dmem_dr | dmem_wl | dmem_wr) & 1) == 0
++                && zn_inside(dmemi, bytes);
++        int a, b;
++        for (a = 0; fast && a < 4; ++a) {
++            fast = zn_inside(o[a], bytes) && zn_apart(dmemi, o[a], bytes);
++            for (b = 0; fast && b < a; ++b)
++                fast = o[a] == o[b] || zn_apart(o[a], o[b], bytes);
++        }
++        if (fast) {
++            int16_t gains[4][ZN_CHUNK];
++            size_t base;
++            for (base = 0; base < count; base += ZN_CHUNK) {
++                const size_t n = (count - base < ZN_CHUNK) ? count - base : ZN_CHUNK;
++                int16_t l_vol[ZN_CHUNK], r_vol[ZN_CHUNK];
++                zn_ramp_run(&ramps[0], n, l_vol);
++                zn_ramp_run(&ramps[1], n, r_vol);
++                for (k = 0; k < n; ++k) {
++                    gains[0][k] = clamp_s16((l_vol[k] * dry + 0x4000) >> 15);
++                    gains[1][k] = clamp_s16((r_vol[k] * dry + 0x4000) >> 15);
++                    gains[2][k] = clamp_s16((l_vol[k] * wet + 0x4000) >> 15);
++                    gains[3][k] = clamp_s16((r_vol[k] * wet + 0x4000) >> 15);
++                }
++                zn_mix_row(dl + base, in + base, gains[0], n);
++                zn_mix_row(dr + base, in + base, gains[1], n);
++                zn_mix_row(wl + base, in + base, gains[2], n);
++                zn_mix_row(wr + base, in + base, gains[3], n);
++            }
++            count = 0;
++        }
++    }
+     for(k = 0; k < count; ++k) {
+         int16_t  gains[4];
+         int16_t* buffers[4];
+@@ -573,6 +690,12 @@
+ 
+     count >>= 1;
+ 
++    if (zn_inside(dmemo, (size_t)count * 2) && zn_inside(dmemi, (size_t)count * 2)
++     && zn_apart(dmemo, dmemi, (size_t)count * 2)) {
++        zn_mix_const(dst, src, gain, count);
++        return;
++    }
++
+     while(count != 0) {
+         sample_mix(dst, *src, gain);
+ 
+@@ -642,6 +765,27 @@
+     *dram_u16(hle, address + 8) = pitch_accu;
+ }
+ 
++/* RESAMPLE_LUT's four taps of each phase placed at the buffer positions of samples i..i+3 counted
++ * from i & ~1, for i even ([0]) and odd ([1]), on a little-endian host (S == 1): sample k is at k^1. */
++static int16_t zn_resample_weights[64][2][8];
++static int zn_resample_weights_ready;
++
++static void zn_resample_weights_init(void)
++{
++    int phase, k;
++    if (zn_resample_weights_ready)
++        return;
++    for (phase = 0; phase < 64; ++phase) {
++        const int16_t* lut = RESAMPLE_LUT + phase * 4;
++        memset(zn_resample_weights[phase], 0, sizeof(zn_resample_weights[phase]));
++        for (k = 0; k < 4; ++k) {
++            zn_resample_weights[phase][0][(0 + k) ^ 1] = lut[k];       /* i even: position (i+k)^1 - i */
++            zn_resample_weights[phase][1][((1 + k) ^ 1) - 0] = lut[k]; /* i odd: (i+k)^1 - (i-1) */
++        }
++    }
++    zn_resample_weights_ready = 1;
++}
++
+ void alist_resample(
+         struct hle_t* hle,
+         bool init,
+@@ -666,6 +810,56 @@
+         alist_resample_reset(hle, ipos, &pitch_accu);
+     else
+         alist_resample_load(hle, address, ipos, &pitch_accu);
++
++    /* Z-Cancel NX: the same loop without the wrap of sample() when every sample it reads and writes is
++     * inside alist_buffer: ipos does not wrap (dmemi >= 8), pitch_accu never overflows (it is below
++     * 0x10000 after each step), and the last input read and the last output stay below 0x800. Reads
++     * and writes keep their order (an output the loop reads back later is read back here too). */
++    if (count != 0 && dmemi >= 8 && pitch <= 0xffff0000u && pitch_accu < 0x10000) {
++        const uint64_t last = (uint64_t)ipos + ((pitch_accu + (uint64_t)(count - 1) * pitch) >> 16) + 3;
++        const uint32_t olast = (uint32_t)opos + count - 1;
++        if (last < 0x800 && olast < 0x800) {
++            const int16_t* const in = (const int16_t*)hle->alist_buffer;
++            int16_t* const out = (int16_t*)hle->alist_buffer;
++            uint32_t i = ipos, o = opos, accu = pitch_accu;
++            /* The four samples i..i+3 are at buffer positions (i..i+3)^S, all within the eight positions
++             * from i & ~1 on: one dot product of eight with the taps placed where each sample is (zero
++             * elsewhere), which the compiler vectorizes. Same products, same sum. Needs those eight
++             * positions inside alist_buffer. */
++            if (S == 1 && last + 4 < 0x800) {
++                zn_resample_weights_init();
++                while (count != 0) {
++                    const int16_t* x = in + (i & ~1u);
++                    const int16_t* w = zn_resample_weights[(accu & 0xfc00) >> 10][i & 1];
++                    int32_t sum = 0;
++                    int j;
++                    for (j = 0; j < 8; ++j)
++                        sum += x[j] * w[j];
++                    out[o ^ S] = clamp_s16(sum >> 15);
++                    ++o;
++                    accu += pitch;
++                    i += accu >> 16;
++                    accu &= 0xffff;
++                    --count;
++                }
++            }
++            while (count != 0) {
++                const int16_t* lut = RESAMPLE_LUT + ((accu & 0xfc00) >> 8);
++                out[o ^ S] = clamp_s16( (
++                    (in[ i      ^ S] * lut[0]) +
++                    (in[(i + 1) ^ S] * lut[1]) +
++                    (in[(i + 2) ^ S] * lut[2]) +
++                    (in[(i + 3) ^ S] * lut[3]) ) >> 15);
++                ++o;
++                accu += pitch;
++                i += accu >> 16;
++                accu &= 0xffff;
++                --count;
++            }
++            ipos = (uint16_t)i;
++            pitch_accu = accu;
++        }
++    }
+ 
+     while (count != 0) {
+         const int16_t* lut = RESAMPLE_LUT + ((pitch_accu & 0xfc00) >> 8);
+--- a/mupen64plus-rsp-hle/src/audio.c
++++ b/mupen64plus-rsp-hle/src/audio.c
+@@ -119,6 +119,31 @@
+ 
+     assert(count <= 8);
+ 
++    /* Z-Cancel NX: the 8-sample case (every ADPCM frame) with constant bounds, so that the compiler can
++     * unroll and vectorize it. Sums in uint32_t: the same bits as the int32_t sums below (which wrap on
++     * every target this runs on), in any order. All of src and the codebook entry are read before dst
++     * is written, which is the same only when dst overlaps neither. */
++    if (count == 8 && (dst + 8 <= src || src + 8 <= dst) && (dst + 8 <= cb_entry || cb_entry + 16 <= dst)) {
++        /* rdot(i, book2, src) = sum over k < i of src[k] * book2[i-1-k]: column k is book2 moved down
++         * by k + 1, read out of a copy with eight zeros in front */
++        int16_t padded[16] = { 0 };
++        uint32_t accu[8];
++        size_t k;
++        for (i = 0; i < 8; ++i)
++            padded[8 + i] = book2[i];
++        for (i = 0; i < 8; ++i)
++            accu[i] = ((uint32_t)(int32_t)src[i] << 11) + (uint32_t)(book1[i] * l1) + (uint32_t)(book2[i] * l2);
++        for (k = 0; k < 7; ++k) {
++            const int32_t x = src[k];
++            const int16_t* const column = padded + 7 - k;
++            for (i = 0; i < 8; ++i)
++                accu[i] += (uint32_t)(x * column[i]);
++        }
++        for (i = 0; i < 8; ++i)
++            dst[i] = clamp_s16((int32_t)accu[i] >> 11);
++        return;
++    }
++
+     for(i = 0; i < count; ++i) {
+         int32_t accu = (int32_t)src[i] << 11;
+         accu += book1[i]*l1 + book2[i]*l2 + rdot(i, book2, src);

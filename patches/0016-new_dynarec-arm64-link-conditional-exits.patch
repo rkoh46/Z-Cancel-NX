@@ -1,0 +1,162 @@
+new_dynarec arm64: link exits taken by a conditional branch
+
+On ARM64 the recompiler linked a block's exit to the block it jumps to only when the exit was an
+unconditional b; an exit taken by a b.cond (reach +/- 1 MB, the code cache is 32 MB) stayed on its
+stub, so every time it was taken the code called dyna_linker -> dynamic_linker, which looked the
+target up again in the jump_in list of its page. In steady play that was 8 to 15 % of the emulation
+thread on the Mac (dynamic_linker alone), and the same on every frame re-run after a rollback.
+
+The stub of such an exit now starts with one extra word, a nop while the exit is unlinked and
+"b target" once it is linked (b reaches 128 MB). The b.cond keeps jumping to its stub. Linking writes
+that word (at compile time in pass 9, when a shadow compiled ahead is adopted, and in
+dynamic_linker/dynamic_linker_ds), and the jump_out entry names the stub, so kill_pointer (back to the
+nop) and get_pointer (the b's target) undo and read it like any other link. warm_same_code skips the
+word, as it skips linked jumps. Host control flow only: the block run next is the one the linker
+would have returned, with the same cycle count; x86-64 already linked these exits.
+
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/arm64/assem_arm64.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/arm64/assem_arm64.c
+@@ -364,10 +364,42 @@
+   intptr_t ptr_rx=((intptr_t)ptr-(intptr_t)base_addr)+(intptr_t)base_addr_rx;
+   cache_flush((void*)ptr_rx, (void*)(ptr_rx+4));
+   return ptr2;
++}
++
++/* Z-Cancel NX: exits taken by a conditional branch (b.cond reaches only +/- 1 MB) are linked
++ * through their stub instead of being left to call the linker every time. Such a stub starts
++ * with one extra word: a nop while the exit is unlinked, "b target" once it is linked (b reaches
++ * +/- 128 MB, the whole code cache). The b.cond itself always jumps to the stub. The linked word
++ * is recognised by not being the movz an ordinary stub starts with. */
++#define COND_STUB_NOP 0xd503201fu
++static int is_cond_stub(const void *stub)
++{
++  const u_int w=*(const u_int *)stub;
++  return w==COND_STUB_NOP||(w&0xFC000000)==0x14000000;
++}
++
++/* src: a b.cond (write view) whose stub has the extra word; links it to addr (write view).
++ * Returns the stub, or NULL when src is not such a branch. Does not flush the cache. */
++static void *link_cond_stub(void *src, void *addr)
++{
++  u_int *ptr=(u_int *)src;
++  u_int *stub;
++  intptr_t offset;
++  if((*ptr&0xff000010)!=0x54000000) return NULL;
++  stub=(u_int *)((intptr_t)ptr+(((intptr_t)(int)(*ptr<<8))>>13<<2));
++  if(!is_cond_stub(stub)) return NULL;
++  offset=(intptr_t)addr-(intptr_t)stub;
++  assert(offset>=-134217728LL&&offset<134217728LL);
++  *stub=0x14000000|((offset>>2)&0x3ffffff);
++  return stub;
+ }
+ 
+ static void *kill_pointer(void *stub)
+ {
++  if(is_cond_stub(stub)) {
++    *(u_int *)stub=COND_STUB_NOP;
++    return stub;
++  }
+   int *ptr=(int *)((intptr_t)stub+8);
+   assert((*ptr&0x9f000000)==0x10000000); //adr
+   int offset=(((signed int)(*ptr<<8)>>13)<<2)|((*ptr>>29)&0x3);
+@@ -379,6 +411,11 @@
+ 
+ static intptr_t get_pointer(void *stub)
+ {
++  if(is_cond_stub(stub)) {
++    const u_int w=*(const u_int *)stub;
++    if(w==COND_STUB_NOP) return (intptr_t)stub;
++    return (intptr_t)stub+(((intptr_t)(int)(w<<6))>>4);
++  }
+   int *ptr=(int *)((intptr_t)stub+8);
+   assert((*ptr&0x9f000000)==0x10000000); //adr
+   int offset=(((signed int)(*ptr<<8)>>13)<<2)|((*ptr>>29)&0x3);
+@@ -3147,6 +3184,7 @@
+   u_char *ptr=(u_char *)addr;
+ #endif
+   assert(((ptr[3]&0xfc)==0x14)||((ptr[3]&0xff)==0x54)); //b or b.cond
++  if((*(u_int *)addr&0xff000010)==0x54000000) output_w32(COND_STUB_NOP); // see link_cond_stub
+ 
+   emit_movz_lsl16(((u_int)target>>16)&0xffff,1);
+   emit_movk((u_int)target&0xffff,1);
+--- a/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
++++ b/mupen64plus-core/src/device/r4300/new_dynarec/new_dynarec.c
+@@ -2611,6 +2611,14 @@
+     if((*ptr&0xfc000000)==0x14000000) { //b
+       add_link(vaddr, add_pointer(src_rw,head->addr));
+     }
++    else { // b.cond: link its stub (see link_cond_stub)
++      void *stub=link_cond_stub(src_rw,head->addr);
++      if(stub) {
++        intptr_t stub_rx=((intptr_t)stub-(intptr_t)base_addr)+(intptr_t)base_addr_rx;
++        cache_flush((void*)stub_rx,(void*)(stub_rx+4));
++        add_link(vaddr,stub);
++      }
++    }
+ #else
+     add_link(vaddr, add_pointer(src_rw,head->addr));
+ #endif
+@@ -2674,6 +2682,14 @@
+     if((*ptr&0xfc000000)==0x14000000) { //b
+       add_link(vaddr, add_pointer(src_rw,head->addr));
+     }
++    else { // b.cond: link its stub (see link_cond_stub)
++      void *stub=link_cond_stub(src_rw,head->addr);
++      if(stub) {
++        intptr_t stub_rx=((intptr_t)stub-(intptr_t)base_addr)+(intptr_t)base_addr_rx;
++        cache_flush((void*)stub_rx,(void*)(stub_rx+4));
++        add_link(vaddr,stub);
++      }
++    }
+ #else
+     add_link(vaddr, add_pointer(src_rw,head->addr));
+ #endif
+@@ -9132,7 +9148,7 @@
+   for(i=0;i<s->lit>>2&&same;i++) {
+     if(a[i]==b[i]) continue;
+     for(n=0;n<s->nlinks;n++)
+-      if(s->links[n].jump==i*4) break;
++      if(s->links[n].jump==i*4||(s->links[n].linkable==2&&s->links[n].stub==i*4)) break;
+     if(n<s->nlinks) continue;
+     same=0;
+   }
+@@ -10238,7 +10254,13 @@
+         out=(u_char *)stub; // where the compile stands when it looks this exit's target up
+         target=check_addr(l->target);
+ #ifndef DISABLE_BLOCK_LINKING
+-        if(target&&l->linkable) {
++        if(target&&l->linkable==2) {
++#if NEW_DYNAREC==NEW_DYNAREC_ARM64
++          link_cond_stub(warm_begin+l->jump,target); // the b.cond already jumps to its stub
++          add_link(l->target,stub);
++#endif
++        }
++        else if(target&&l->linkable) {
+           set_jump_target((intptr_t)(warm_begin+l->jump),(intptr_t)target);
+           add_link(l->target,stub);
+         }
+@@ -12657,16 +12679,21 @@
+         l->stub=(u_int)((u_char *)stub-warm_begin);
+         l->target=link_addr[i][1];
+ #if NEW_DYNAREC==NEW_DYNAREC_ARM64
+-        l->linkable=(((u_char *)link_addr[i][0])[3]&0xfc)==0x14;
++        l->linkable=(((u_char *)link_addr[i][0])[3]&0xfc)==0x14?1:(((u_char *)link_addr[i][0])[3]==0x54?2:0);
+ #else
+         l->linkable=1;
+ #endif
+       }
+ #ifndef DISABLE_BLOCK_LINKING
+ #if NEW_DYNAREC==NEW_DYNAREC_ARM64
+-      //TODO: Avoid disabling link between blocks for conditional branches
++      // Conditional branches are linked through their stub (see link_cond_stub)
+       u_char *ptr=(u_char *)link_addr[i][0];
+-      if(addr&&((ptr[3]&0xfc)==0x14)) {
++      if(addr&&ptr[3]==0x54) {
++        set_jump_target(link_addr[i][0],(intptr_t)stub);
++        link_cond_stub(ptr,addr);
++        add_link(link_addr[i][1],stub);
++      }
++      else if(addr&&((ptr[3]&0xfc)==0x14)) {
+ #else
+       if(addr) {
+ #endif

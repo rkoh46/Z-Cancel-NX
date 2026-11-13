@@ -822,3 +822,25 @@ about 65 % recompiled game code, 20 % RSP HLE audio, 8 % the recompiler's linker
 - The app closing during Remix stage 0xD7: that stage passes on its own (twice). It was the 145th emulator
   start in one session; 40 starts in one session keep the heap at 17.3-17.5 MB (about 5 KB per start), so
   it is not a memory leak in malloc. Not reproduced; a longer run (more than 145 starts) would be needed.
+
+### Faster re-run frames (patches 0016-0018), console, 2026-11-13
+
+Same run as above (rollback_stress=10,7, a save after every frame and re-run frame), every re-run frame
+identical:
+
+| | Re-run per frame, before / after | 7-frame rollback with its saves, before / after |
+|---|---|---|
+| Vanilla, Congo Jungle | 1.31 / 1.17 ms | 10.3 / 9.3 ms |
+| Remix 2.0.1, Poke Floats | 1.68 / 1.40 ms | 13.0 / 11.0 ms |
+| +EXTRA 0.6.0, Halberd | 1.50 / 1.27 ms | 11.7 / 10.1 ms |
+
+With a normal frame of 5-6 ms, a frame carrying a full 7-frame rollback now averages 14.5-16.5 ms. The
+worst rollbacks (21 ms) fall in the first 100 frames after power-on, while code is still being compiled.
+(The matrix's own frame times in stress mode also include comparing every re-run frame with the first
+run, which a real session does not do.)
+
+ARM64 against x86-64: a forced match set up by poking RDRAM (`--vs`) diverges between the two builds about
+30 frames after the poke, with the unpatched core too. The same kind of match reached through the menus
+(bench/inputs/vs-vanilla-hyrule-4cpu.txt, four level 9 CPUs, 9,000 frames) is identical on both builds at
+every check outside the saved-register slots, so the poke shortcut, not the recompilers, is what differs.
+Cross-architecture comparisons must use menu-driven input scripts.
