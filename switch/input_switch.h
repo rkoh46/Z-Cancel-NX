@@ -11,6 +11,9 @@ void znx_input_init(int stick_range);
  * C stick as smash attacks and aerials (c_mode 1 or 2) instead of the C buttons. */
 void znx_input_init_ex(int stick_range, int l_shield, int c_mode);   /* c_mode: 0 C buttons, 1 attacks on
                                                                        GameCube controllers, 2 attacks on all */
+/* 1 swaps what the Switch R and ZR buttons do: ZR grabs (the N64's R) and R shields (its Z). For GameCube-style
+ * controllers that send their Z button as ZR and their right shoulder as R. Call before znx_input_init_ex. */
+void znx_input_set_swap_r_zr(int swap);
 /* 1 when these held buttons are the quit combination (see znx_input_quit_requested). */
 int znx_input_is_quit_combo(uint64_t held);
 

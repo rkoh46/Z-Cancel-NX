@@ -6,6 +6,8 @@
  *   sound=0|1, stick_range=60..100        this console
  *   l_button=taunt|shield                 the Switch L button (a GameCube-style controller's left shoulder):
  *                                         the N64's L (taunt, the default) or Z (shield)
+ *   zr_button=shield|grab                 the Switch R and ZR buttons: default R grabs (the N64's R) and ZR shields
+ *                                         (Z); grab swaps them, for GameCube-style controllers whose Z arrives as ZR
  *   c_stick=buttons|gamecube|all          the C stick: the N64's C buttons (default), or smash attacks and
  *                                         aerials on GameCube controllers (adapter) or on every controller
  *   name=<text>                           online: the name the other player sees (n02 LOGN, 31 bytes)
@@ -41,6 +43,7 @@ struct znx_menu_settings {
     int sound;        /* 1 on */
     int stick_range;  /* what a full tilt reads on the N64 axis */
     int l_shield;     /* 1: Switch L is the N64's Z (shield); 0: its L (taunt) */
+    int swap_r_zr;    /* 1: Switch ZR grabs (N64 R) and R shields (N64 Z); zr_button=grab */
     int c_mode;       /* 0 C buttons, 1 attacks on GameCube controllers, 2 attacks on every controller */
     char name[32];
     int input_delay;  /* 0 auto, 1..9 */

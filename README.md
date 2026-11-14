@@ -60,6 +60,10 @@ Leave a game by holding Minus, or L + R + Z + Start on a GameCube controller, fo
 In Settings on the start screen:
 - **L button**: taunt (default) or shield. Smash Remix can put taunt on the d-pad (Dpad ctrl on the
   character screen).
+- **Z and R**: R grabs and ZR shields (default, right for the GameCube adapter, where Z is R), or
+  the other way round, for GameCube-style controllers that send their Z button as ZR. Either way the
+  shield button also Z-cancels and techs, and the grab button is the N64's R, which the game turns into
+  Z + A.
 - **C stick**: the N64's C buttons (default), or smash attacks on the ground and aerials in the air,
   as in Melee, on GameCube controllers or on every controller.
 - Stick range and sound.

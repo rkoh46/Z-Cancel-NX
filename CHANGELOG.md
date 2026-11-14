@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4
+
+- Settings: Z and R can be swapped, so ZR grabs and R shields, Z-cancels and techs. GameCube-style
+  controllers that send their Z button as ZR (and their right shoulder as R) grabbed with R and
+  shielded with Z; with ZR grabs, Z grabs and R shields as on a GameCube. The log says which way
+  round each controller is.
+
 ## 0.1.3
 
 - GameCube controllers: L + R + Z + Start leaves a match on GameCube-style controllers that report their

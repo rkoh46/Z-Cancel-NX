@@ -48,6 +48,7 @@ static int l_connected[PLAYERS];
 static int l_range = 84;
 static int l_quit_frames;
 static int l_l_shield;
+static int l_swap_r_zr;
 static int l_style_logged[PLAYERS];
 static int l_plus_frames[PLAYERS];
 static int l_c_mode;                 /* 0 C buttons, 1 attacks on GameCube controllers, 2 attacks on every controller */
@@ -105,6 +106,11 @@ static const char* style_name(u32 style)
     return "controller";
 }
 
+void znx_input_set_swap_r_zr(int swap)
+{
+    l_swap_r_zr = swap != 0;
+}
+
 void znx_input_init_ex(int stick_range, int l_shield, int c_mode)
 {
     l_l_shield = l_shield != 0;
@@ -144,8 +150,8 @@ void znx_input_poll(void)
         if (!l_style_logged[i]) {
             l_style_logged[i] = 1;
             const u32 style = padGetStyleSet(&l_pads[i]);
-            znx_log("input: player %d is %s; L is %s; C stick is %s", i + 1, style_name(style),
-                    l_l_shield ? "shield" : "taunt",
+            znx_log("input: player %d is %s; L is %s; R %s, ZR %s; C stick is %s", i + 1, style_name(style),
+                    l_l_shield ? "shield" : "taunt", l_swap_r_zr ? "shields" : "grabs", l_swap_r_zr ? "grabs" : "shields",
                     (l_c_mode == 2 || (l_c_mode == 1 && (style & HidNpadStyleTag_NpadGc))) ? "smash attacks and aerials"
                                                                                            : "the C buttons");
         }
@@ -161,8 +167,9 @@ void znx_input_poll(void)
         uint32_t b = 0;
         if (held & HidNpadButton_A) b |= N64_A;
         if (held & HidNpadButton_B) b |= N64_B;
-        if (held & (HidNpadButton_ZL | HidNpadButton_ZR)) b |= N64_Z;
-        if (held & HidNpadButton_R) b |= N64_R;
+        if (held & HidNpadButton_ZL) b |= N64_Z;
+        if (held & HidNpadButton_ZR) b |= l_swap_r_zr ? N64_R : N64_Z;
+        if (held & HidNpadButton_R) b |= l_swap_r_zr ? N64_Z : N64_R;
         if (held & HidNpadButton_L) b |= l_l_shield ? N64_Z : N64_L;
         if (held & HidNpadButton_X) b |= N64_D_C;
         if (held & HidNpadButton_Y) b |= N64_L_C;

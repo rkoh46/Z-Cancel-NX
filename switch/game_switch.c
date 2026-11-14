@@ -80,6 +80,7 @@ struct settings {
     int sound;                 /* 1: the audio plugin; 0: silent */
     int stick_range;           /* what a fully tilted stick reads on the N64 axis; 0 = 84 */
     int l_shield;              /* l_button=shield: the Switch L button shields (N64 Z) instead of taunting */
+    int swap_r_zr;             /* zr_button=grab: Switch ZR grabs (N64 R) and R shields (N64 Z) */
     int c_mode;                /* c_stick=buttons|gamecube|all: the C stick as C buttons, or as attacks */
     int menu;                  /* 1: the start screen */
     char matrix[256];          /* a stage matrix file on the SD card (docs/STAGE_MATRIX.md), or empty */
@@ -104,6 +105,7 @@ static bool ini_key(const char* key, const char* value, void* user)
     else if (!strcmp(key, "sound")) s->sound = atoi(value) != 0;
     else if (!strcmp(key, "stick_range")) s->stick_range = atoi(value);
     else if (!strcmp(key, "l_button")) s->l_shield = !strcmp(value, "shield");
+    else if (!strcmp(key, "zr_button")) s->swap_r_zr = !strcmp(value, "grab");
     else if (!strcmp(key, "c_stick")) s->c_mode = !strcmp(value, "all") ? 2 : !strcmp(value, "gamecube") ? 1 : 0;
     else if (!strcmp(key, "verbose")) s->options.verbose = atoi(value);
     else if (!strcmp(key, "menu")) s->menu = atoi(value) != 0;
@@ -592,6 +594,7 @@ static int play(const char* rom_path, bool have_romfs, bool online)
             set_source(net_input);
         else
             host.input = NULL;
+        znx_input_set_swap_r_zr(settings.swap_r_zr);
         znx_input_init_ex(settings.stick_range, settings.l_shield, settings.c_mode);
         l_core_lib = host.core;
         host.session_run = net_session_run;
@@ -600,6 +603,7 @@ static int play(const char* rom_path, bool have_romfs, bool online)
         znx_front_plus_stops(false);
     } else if (settings.options.inputs_path == NULL) {
         /* Played with controllers: Plus is the N64's Start, so it no longer stops the run. */
+        znx_input_set_swap_r_zr(settings.swap_r_zr);
         znx_input_init_ex(settings.stick_range, settings.l_shield, settings.c_mode);
         host.live_inputs = live_inputs;
         znx_front_plus_stops(false);

@@ -9,7 +9,7 @@
 
 #define INI_NAME "z-cancel-nx.ini"
 #define MAX_LINES 256
-#define KEY_COUNT 14
+#define KEY_COUNT 15
 
 static void ini_path(const char* base, char* out, size_t size)
 {
@@ -73,6 +73,7 @@ void znx_settings_load(const char* base, struct znx_menu_settings* s)
         if (!strcmp(key, "sound")) s->sound = atoi(value) != 0;
         else if (!strcmp(key, "stick_range")) s->stick_range = clamp_stick(atoi(value));
         else if (!strcmp(key, "l_button")) s->l_shield = !strncmp(value, "shield", 6);
+        else if (!strcmp(key, "zr_button")) s->swap_r_zr = !strncmp(value, "grab", 4);
         else if (!strcmp(key, "c_stick")) s->c_mode = !strncmp(value, "all", 3) ? 2 : !strncmp(value, "gamecube", 8) ? 1 : 0;
         else if (!strcmp(key, "name")) { copy_text(s->name, sizeof(s->name), value); if (!s->name[0]) snprintf(s->name, sizeof(s->name), "Switch"); }
         else if (!strcmp(key, "input_delay")) s->input_delay = clamp(atoi(value), 0, 9);
@@ -99,7 +100,7 @@ static void format_key(const struct znx_menu_settings* s, int index, char* key, 
 {
     static const char* const keys[KEY_COUNT] = { "sound", "stick_range", "name", "input_delay", "public_list",
                                                  "net_overlay", "p2p_port", "p2p_code", "p2p_token", "nat_server",
-                                                 "list_server", "net_vsync", "l_button", "c_stick" };
+                                                 "list_server", "net_vsync", "l_button", "c_stick", "zr_button" };
     snprintf(key, key_size, "%s", keys[index]);
     switch (index) {
     case 0: snprintf(line, size, "sound=%d\n", s->sound ? 1 : 0); break;
@@ -115,6 +116,7 @@ static void format_key(const struct znx_menu_settings* s, int index, char* key, 
     case 10: snprintf(line, size, "list_server=%s\n", s->list_server); break;
     case 11: snprintf(line, size, "net_vsync=%d\n", s->net_vsync ? 1 : 0); break;
     case 12: snprintf(line, size, "l_button=%s\n", s->l_shield ? "shield" : "taunt"); break;
+    case 14: snprintf(line, size, "zr_button=%s\n", s->swap_r_zr ? "grab" : "shield"); break;
     default: snprintf(line, size, "c_stick=%s\n", s->c_mode == 2 ? "all" : s->c_mode == 1 ? "gamecube" : "buttons"); break;
     }
 }
