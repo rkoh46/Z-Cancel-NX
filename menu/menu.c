@@ -29,7 +29,7 @@
 
 enum screen { SCREEN_SCAN, SCREEN_HOME, SCREEN_GAME, SCREEN_SETTINGS, SCREEN_BUILD, SCREEN_MESSAGE, SCREEN_ONLINE, SCREEN_GLYPHS };
 
-#define SETTINGS_ROWS 6   /* sound, stick range | name, input delay, public list, overlay */
+#define SETTINGS_ROWS 8   /* sound, stick range, L button, C stick | name, input delay, public list, overlay */
 
 #define HOME_ROWS (ZNX_GAME_COUNT + 1)   /* the games, then Settings */
 
@@ -379,9 +379,17 @@ enum znx_menu_action znx_menu_update(struct znx_menu* m, uint32_t held)
             if (m->settings.stick_range > ZNX_STICK_MAX) m->settings.stick_range = ZNX_STICK_MAX;
             break;
         case 2:
+            if (pressed & (ZNX_BTN_LEFT | ZNX_BTN_RIGHT | ZNX_BTN_A))
+                m->settings.l_shield = !m->settings.l_shield;
+            break;
+        case 3:
+            if (pressed & (ZNX_BTN_RIGHT | ZNX_BTN_A)) m->settings.c_mode = (m->settings.c_mode + 1) % 3;
+            if (pressed & ZNX_BTN_LEFT) m->settings.c_mode = (m->settings.c_mode + 2) % 3;
+            break;
+        case 4:
             if ((pressed & ZNX_BTN_A) && m->keyboard != NULL) {
                 char name[64];
-                if (m->keyboard(0, "Your name", "The name the other player sees", m->settings.name, name, sizeof(name))) {
+                if (m->keyboard(0, "Your name", "Lobby: up to 20 letters, numbers, _ - .", m->settings.name, name, sizeof(name))) {
                     size_t n = strlen(name);
                     while (n > 0 && name[n - 1] == ' ') name[--n] = '\0';
                     if (name[strspn(name, " ")] != '\0')
@@ -390,13 +398,13 @@ enum znx_menu_action znx_menu_update(struct znx_menu* m, uint32_t held)
                 m->wait_release = 1;
             }
             break;
-        case 3:
+        case 5:
             /* Auto, 1..9 (RMG-K allows 0 too; a frame of delay is the least that keeps rollbacks rare) */
             if (pressed & ZNX_BTN_LEFT) m->settings.input_delay = m->settings.input_delay > 0 ? m->settings.input_delay - 1 : 0;
             if (pressed & ZNX_BTN_RIGHT) m->settings.input_delay = m->settings.input_delay < 9 ? m->settings.input_delay + 1 : 9;
             if (pressed & ZNX_BTN_Y) m->settings.input_delay = 0;
             break;
-        case 4:
+        case 6:
             if (pressed & (ZNX_BTN_LEFT | ZNX_BTN_RIGHT | ZNX_BTN_A))
                 m->settings.public_list = !m->settings.public_list;
             break;
@@ -865,18 +873,32 @@ static void draw_settings(struct znx_menu* m)
     else snprintf(delay, sizeof(delay), "%d frame%s", s->input_delay, s->input_delay == 1 ? "" : "s");
 
     znx_ui_title("Settings");
-    switch_row(y, m->settings_row == 0, "Sound", s->sound);
+    /* Eight rows and a section are taller than the list: with an Online row selected the list is shown from
+     * the Online section, so this console's rows scroll out above (a row is drawn only if it fits whole). */
+    y -= m->settings_row >= 4 ? 4 * ROW_H + 16 : 0;
+#define SETTINGS_FITS(top, h) ((top) >= LIST_Y - 1 && (top) + (h) <= FOOTER_LINE + 1)
+    if (SETTINGS_FITS(y, ROW_H)) switch_row(y, m->settings_row == 0, "Sound", s->sound);
     y += ROW_H;
-    znx_ui_row(y, m->settings_row == 1, "Stick range", C_TEXT1, stick, C_ACCENT, 0);
+    if (SETTINGS_FITS(y, ROW_H)) znx_ui_row(y, m->settings_row == 1, "Stick range", C_TEXT1, stick, C_ACCENT, 0);
+    y += ROW_H;
+    if (SETTINGS_FITS(y, ROW_H))
+        znx_ui_row(y, m->settings_row == 2, "L button", C_TEXT1, s->l_shield ? "Shield" : "Taunt", C_ACCENT, 0);
+    y += ROW_H;
+    if (SETTINGS_FITS(y, ROW_H))
+        znx_ui_row(y, m->settings_row == 3, "C stick", C_TEXT1,
+                   s->c_mode == 2 ? "Attacks, every controller" : s->c_mode == 1 ? "Attacks, GameCube" : "C buttons",
+                   C_ACCENT, 0);
     y += ROW_H + 16;
-    y += znx_ui_section(y, "Online");
-    znx_ui_row(y, m->settings_row == 2, "Name", C_TEXT1, s->name, C_ACCENT, 0);
+    y += SETTINGS_FITS(y, 48) ? znx_ui_section(y, "Online") : 48;
+    if (SETTINGS_FITS(y, ROW_H)) znx_ui_row(y, m->settings_row == 4, "Name", C_TEXT1, s->name, C_ACCENT, 0);
     y += ROW_H;
-    znx_ui_row(y, m->settings_row == 3, "Input delay", C_TEXT1, delay, C_ACCENT, 0);
+    if (SETTINGS_FITS(y, ROW_H)) znx_ui_row(y, m->settings_row == 5, "Input delay", C_TEXT1, delay, C_ACCENT, 0);
     y += ROW_H;
-    switch_row(y, m->settings_row == 4, "Public list", s->public_list);
+    if (SETTINGS_FITS(y, ROW_H)) switch_row(y, m->settings_row == 6, "Public list", s->public_list);
     y += ROW_H;
-    switch_row(y, m->settings_row == 5, "Match overlay", s->net_overlay);
+    if (SETTINGS_FITS(y, ROW_H)) switch_row(y, m->settings_row == 7, "Match overlay", s->net_overlay);
+#undef SETTINGS_FITS
+    znx_ui_scrollbar(LIST_Y, 6, m->settings_row >= 4 ? 4 : 0, 10);
 
     switch (m->settings_row) {
     case 0:
@@ -894,18 +916,33 @@ static void draw_settings(struct znx_menu* m)
         break;
     }
     case 2:
-        znx_ui_panel(LIST_Y, NULL, 0, "The name the other player sees in RMG-K's Peer to Peer window, and on the "
-                     "public list when you host.", "Up to 31 letters.");
-        znx_ui_footer(hints_name, 2, NULL);
+        znx_ui_panel(LIST_Y, NULL, 0, "What the Switch L button does: the N64's L (taunt) or its Z (shield). On a "
+                     "GameCube-style controller whose left shoulder is the Switch L, Shield makes it shield like the "
+                     "right one. Smash Remix can put taunt on the d-pad (Dpad ctrl on the character screen).",
+                     "Only your own controllers change; it never matters for online play.");
+        znx_ui_footer(hints_toggle, 2, NULL);
         break;
     case 3:
+        znx_ui_panel(LIST_Y, NULL, 0, "C buttons: the C stick presses the N64's C buttons (jump). Attacks: a flick of "
+                     "the C stick is a smash attack on the ground and an aerial in the air, in that direction, as "
+                     "Melee's C stick. GameCube means controllers on the GameCube adapter.",
+                     "Only your own controllers change; it never matters for online play.");
+        znx_ui_footer(hints_toggle, 2, NULL);
+        break;
+    case 4:
+        znx_ui_panel(LIST_Y, NULL, 0, "The name the other player sees in RMG-K's Peer to Peer window, on the public "
+                     "list when you host, and in the lobby.",
+                     "Up to 31 letters. The lobby keeps only letters, numbers, _ - and . and the first 20 of them.");
+        znx_ui_footer(hints_name, 2, NULL);
+        break;
+    case 5:
         znx_ui_panel(LIST_Y, NULL, 0, "Frames between pressing a button and the game seeing it, when you host. Auto "
                      "picks it from the ping as RMG-K does: 1 up to 50 ms, 2 up to 100, 3 up to 150, 4 up to 220, "
                      "then 5. Lower feels sharper but rolls back more.",
                      "When you join, the host's delay is used.");
         znx_ui_footer(hints_delay, 3, NULL);
         break;
-    case 4:
+    case 6:
         znx_ui_panel(LIST_Y, NULL, 0, "When you host, the game appears on RMG-K's list of waiting games with your name "
                      "and code, and anyone with the same ROM can join. Off: only players you give the code to.", NULL);
         znx_ui_footer(hints_toggle, 2, NULL);

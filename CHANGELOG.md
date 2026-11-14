@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.3
+
+- GameCube controllers: L + R + Z + Start leaves a match on GameCube-style controllers that report their
+  left shoulder as the Switch L (it only worked when it arrived as ZL). The log names each controller.
+- Settings: L button can shield instead of taunting (Smash Remix can put taunt on the d-pad), and the
+  C stick can do smash attacks on the ground and aerials in the air, as in Melee, on GameCube
+  controllers or on every controller. Both change only your own controller, so they are safe online.
+- Settings: the name screen says what the lobby keeps (up to 20 letters, numbers, _ - .), and the list
+  scrolls now that it has more rows.
+
 ## 0.1.2
 
 - Lobby: the console can now connect to players outside your home. It advertised its public address

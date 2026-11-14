@@ -4,6 +4,10 @@
  * added at the end.
  *
  *   sound=0|1, stick_range=60..100        this console
+ *   l_button=taunt|shield                 the Switch L button (a GameCube-style controller's left shoulder):
+ *                                         the N64's L (taunt, the default) or Z (shield)
+ *   c_stick=buttons|gamecube|all          the C stick: the N64's C buttons (default), or smash attacks and
+ *                                         aerials on GameCube controllers (adapter) or on every controller
  *   name=<text>                           online: the name the other player sees (n02 LOGN, 31 bytes)
  *   input_delay=0..9                      online, as host: 0 = Auto (from the ping, as RMG-K), else frames
  *   public_list=0|1                       online, as host: list the game on RMG-K's public list
@@ -36,6 +40,8 @@
 struct znx_menu_settings {
     int sound;        /* 1 on */
     int stick_range;  /* what a full tilt reads on the N64 axis */
+    int l_shield;     /* 1: Switch L is the N64's Z (shield); 0: its L (taunt) */
+    int c_mode;       /* 0 C buttons, 1 attacks on GameCube controllers, 2 attacks on every controller */
     char name[32];
     int input_delay;  /* 0 auto, 1..9 */
     int public_list;

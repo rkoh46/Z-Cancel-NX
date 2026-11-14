@@ -55,8 +55,16 @@ put the `.xdelta` file in `switch/z-cancel-nx/patches/` yourself.
 | Plus | Start | Start |
 | Left stick | Control stick | Control stick |
 
-Leave a game with Minus, or by holding ZL + ZR + R + Plus for half a second. Stick range and sound
-are in Settings on the start screen.
+Leave a game by holding Minus, or L + R + Z + Start on a GameCube controller, for half a second.
+
+In Settings on the start screen:
+- **L button**: taunt (default) or shield. Smash Remix can put taunt on the d-pad (Dpad ctrl on the
+  character screen).
+- **C stick**: the N64's C buttons (default), or smash attacks on the ground and aerials in the air,
+  as in Melee, on GameCube controllers or on every controller.
+- Stick range and sound.
+
+These change only your own controller, never the game, so they are safe online.
 
 ## Online
 
