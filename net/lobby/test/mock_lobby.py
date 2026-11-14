@@ -262,13 +262,13 @@ class Server:
         elif t == "ROOM_JOIN":
             room = self.rooms.get(int(d.get("roomId", 0)))
             if not room:
-                await c.send("ROOM_JOIN_FAIL", {"reason": "room not found"})
+                await c.send("ROOM_JOIN_FAIL", {"reason": "room_not_found"})
             elif c.room:
-                await c.send("ROOM_JOIN_FAIL", {"reason": "already in a room"})
+                await c.send("ROOM_JOIN_FAIL", {"reason": "already_in_room"})
             elif room.password and d.get("password", "") != room.password:
-                await c.send("ROOM_JOIN_FAIL", {"reason": "wrong password"})
+                await c.send("ROOM_JOIN_FAIL", {"reason": "wrong_password"})
             elif len(room.seats) >= room.max_players or room.state != "waiting":
-                await c.send("ROOM_JOIN_FAIL", {"reason": "room is full"})
+                await c.send("ROOM_JOIN_FAIL", {"reason": "full"})
             else:
                 slot = min(s for s in range(1, 5) if s not in room.seats)
                 room.seats[slot] = c

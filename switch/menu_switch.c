@@ -138,8 +138,8 @@ int znx_switch_keyboard(int kind, const char* header, const char* guide, const c
     swkbdConfigSetHeaderText(&keyboard, header);
     swkbdConfigSetGuideText(&keyboard, guide);
     swkbdConfigSetInitialText(&keyboard, initial != NULL ? initial : "");
-    /* a name, a connect code, an address, a chat line, a room name (RMG-K's limit: 48) */
-    swkbdConfigSetStringLenMax(&keyboard, kind == 0 ? 31 : kind == 1 ? 12 : kind == 3 ? 120 : kind == 4 ? 48 : 21);
+    /* a name, a connect code, an address, a chat line, a room name (RMG-K's limit: 48), a room password */
+    swkbdConfigSetStringLenMax(&keyboard, kind == 0 ? 31 : kind == 1 ? 12 : kind == 3 ? 120 : kind == 4 ? 48 : kind == 5 ? 32 : 21);
     swkbdConfigSetBlurBackground(&keyboard, true);
     out[0] = '\0';
     rc = swkbdShow(&keyboard, out, out_size);

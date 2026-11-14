@@ -201,7 +201,7 @@ enum znx_online_result znx_lobby_after_game(char* title, size_t title_size, char
 
 static void open_room(void)
 {
-    char name[64], typed[64];
+    char name[64], typed[64], password[64];
     snprintf(name, sizeof(name), "%s's Room", l.username);   /* CreateRoomDialog's default */
     if (l.request.keyboard != NULL) {
         if (!l.request.keyboard(4, "Room name", "Players see it in the room list", name, typed, sizeof(typed)))
@@ -209,8 +209,28 @@ static void open_room(void)
         if (typed[strspn(typed, " ")] != '\0')
             snprintf(name, sizeof(name), "%s", typed);
     }
+    /* optional, like CreateRoomDialog's "Password-protect this room": nothing typed (or B) opens it to anyone */
+    password[0] = '\0';
+    if (l.request.keyboard != NULL)
+        l.request.keyboard(5, "Room password", "Leave it empty for a room anyone can join", "", password, sizeof(password));
     snprintf(l.entering, sizeof(l.entering), "%s", name);
-    znx_lobby_play_create_room(name, l.seats);
+    znx_lobby_play_create_room(name, l.seats, password);
+}
+
+/* A locked room asks for its password first (RollbackLobbyDialog's "Password required"); B on the
+ * keyboard stays on the list. */
+static void join_room(const struct znx_lobby_play_room* r)
+{
+    char password[64] = "", header[96];
+    if (r->has_password) {
+        if (l.request.keyboard == NULL)
+            return;
+        snprintf(header, sizeof(header), "Password for %s", r->name);
+        if (!l.request.keyboard(5, header, "The host gives it out", "", password, sizeof(password)))
+            return;
+    }
+    snprintf(l.entering, sizeof(l.entering), "%s", r->name);
+    znx_lobby_play_join_room(r->id, r->has_password ? password : NULL);
 }
 
 static void change_delay(int step)
@@ -286,8 +306,7 @@ enum znx_online_result znx_lobby_update(uint32_t pressed, uint32_t held, char* t
                                                   : "Every seat is taken. Pick another room, or open your own.");
                     return ZNX_ONLINE_MESSAGE;
                 }
-                snprintf(l.entering, sizeof(l.entering), "%s", r->name);
-                znx_lobby_play_join_room(r->id);
+                join_room(r);
             }
         }
         return ZNX_ONLINE_STAY;
@@ -399,7 +418,7 @@ static void draw_rooms(void)
             const int joinable = !r->in_game && r->players < r->max_players;
             if (r->in_game) snprintf(value, sizeof(value), "In a match");
             else if (!joinable) snprintf(value, sizeof(value), "Full");
-            else snprintf(value, sizeof(value), "%d of %d", r->players, r->max_players);
+            else snprintf(value, sizeof(value), "%s%d of %d", r->has_password ? "Password, " : "", r->players, r->max_players);
             znx_ui_row(y, l.row == i, r->name, joinable ? C_TEXT1 : C_TEXT2, value, joinable ? C_TEXT1 : C_TEXT2,
                        joinable ? C_READY : C_TEXT3);
         }
@@ -425,7 +444,7 @@ static void draw_rooms(void)
             znx_ui_panel(LIST_Y, fields, 3,
                          "You become the host and start the match once everyone is connected. RMG-K players with the "
                          "same ROM see the room in their lobby.",
-                         "A asks for the room's name; left and right change the seats.");
+                         "A asks for the room's name and an optional password; left and right change the seats.");
         }
         znx_ui_footer(hints_open, 3, left);
     } else {
@@ -447,10 +466,14 @@ static void draw_rooms(void)
                 { "Players", players, 0 },
                 { "Ping", ping_text, 0 },
                 { "State", r->in_game ? "In a match" : r->players >= r->max_players ? "Full" : "Waiting for players", 0 },
+                { "Password", r->has_password ? "Needed: ask the host" : "None", 0 },
             };
-            znx_ui_panel(LIST_Y, fields, 4,
-                         "A joins: you take the first free seat. The host starts the match once every player has a "
-                         "direct connection to every other.",
+            znx_ui_panel(LIST_Y, fields, 5,
+                         r->has_password
+                             ? "A asks for the password, then you take the first free seat. The host starts the match "
+                               "once every player has a direct connection to every other."
+                             : "A joins: you take the first free seat. The host starts the match once every player has a "
+                               "direct connection to every other.",
                          note[0] ? note : NULL);
         }
         znx_ui_footer(hints_join, 2, left);

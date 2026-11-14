@@ -143,8 +143,8 @@ int znx_lobby_play_room_view(struct znx_lobby_play_room_view* out);
 int znx_lobby_play_chat(struct znx_lobby_play_chat_line* out, int max);
 
 /* Actions; 0 when sent. */
-int znx_lobby_play_create_room(const char* name, int max_players);
-int znx_lobby_play_join_room(uint64_t room_id);
+int znx_lobby_play_create_room(const char* name, int max_players, const char* password);   /* password NULL or "": open room */
+int znx_lobby_play_join_room(uint64_t room_id, const char* password);   /* password NULL for an open room */
 int znx_lobby_play_leave_room(void);
 int znx_lobby_play_send_chat(const char* text);
 int znx_lobby_play_set_delay(int delay);        /* -1 Auto, else 0..9 frames */

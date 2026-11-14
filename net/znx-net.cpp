@@ -117,6 +117,7 @@ struct Options {
     std::string create_room;      /* host: open a room with this name */
     bool join_room = false;       /* join a room of this ROM (the first one, or the one named) */
     std::string join_room_name;
+    std::string room_password;    /* --room-password: for opening or joining a locked room */
     int max_players = 2;
     int start_players = 2;        /* host: start when this many are seated and RMG-K's rule allows it */
     std::string ice_bind;         /* the ICE agents' address; default 127.0.0.1 (every interface with --bind-any) */
@@ -607,7 +608,7 @@ bool run_lobby_room()
         }
         if (s.phase == ZNX_LP_ROOMS && !asked) {
             if (host) {
-                asked = znx_lobby_play_create_room(g_opt.create_room.c_str(), g_opt.max_players) == 0;
+                asked = znx_lobby_play_create_room(g_opt.create_room.c_str(), g_opt.max_players, g_opt.room_password.c_str()) == 0;
             } else {
                 struct znx_lobby_play_room rooms[16];
                 int all = 0;
@@ -617,7 +618,7 @@ bool run_lobby_room()
                         (g_opt.join_room_name.empty() || g_opt.join_room_name == rooms[i].name)) {
                         note("joining room \"%s\" of %s (%d of %d players, %d rooms in all)", rooms[i].name, rooms[i].host,
                              rooms[i].players, rooms[i].max_players, all);
-                        asked = znx_lobby_play_join_room(rooms[i].id) == 0;
+                        asked = znx_lobby_play_join_room(rooms[i].id, g_opt.room_password.c_str()) == 0;
                     }
             }
         }
@@ -716,6 +717,7 @@ void usage()
         "  --lobby URL          RMG-K's rollback lobby (ws://HOST:PORT/ws) instead of P2P; then:\n"
         "  --create-room NAME   open a room of this ROM (this side starts the match), or\n"
         "  --join-room [NAME]   join the first room of this ROM (or the one with that name)\n"
+        "  --room-password PW   the password for the room opened or joined (default: none)\n"
         "  --max-players N      the room's seats (2-4), --start-players N start once N are seated (default 2)\n"
         "  --ice-bind ADDR      the ICE agents' address (default 127.0.0.1; every interface with --bind-any)\n"
         "  --stun off|server|H:P   STUN for ICE (default off: nothing leaves the machine)\n"
@@ -815,6 +817,7 @@ int main(int argc, char** argv)
         else if (!std::strcmp(a, "--fetch-list")) return fetch_list(next());
         else if (!std::strcmp(a, "--lobby")) g_opt.lobby = next();
         else if (!std::strcmp(a, "--create-room")) g_opt.create_room = next();
+        else if (!std::strcmp(a, "--room-password")) g_opt.room_password = next();
         else if (!std::strcmp(a, "--join-room")) {
             g_opt.join_room = true;
             if (i + 1 < argc && argv[i + 1][0] != '-')

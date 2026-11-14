@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Lobby: rooms with a password show "Password" in the list and ask for it before joining, as RMG-K
+  does. Opening a room asks for an optional password. A failed join says why in words ("Wrong
+  password", "That room is gone") instead of the server's code.
+
 ## 0.1.1
 
 - Frames re-run after a rollback are 11-17 % cheaper on the console (the recompiler now links

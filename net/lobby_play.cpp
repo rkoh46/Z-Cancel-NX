@@ -219,6 +219,27 @@ void room_state_changed()
         set_phase(ZNX_LP_ROOM);
 }
 
+/* The server's ROOM_JOIN_FAIL reasons, in words (the ones RMG-K's RollbackLobbyDialog::onRoomJoinFailed
+ * names); anything else is shown as the server sent it. */
+std::string join_failure_text(const char* reason)
+{
+    static const struct { const char* code; const char* text; } k[] = {
+        { "wrong_password", "Wrong password. Ask the host for it and try again." },
+        { "full", "Every seat is taken. Pick another room, or open your own." },
+        { "already_started", "That room is playing a match. Join when it is over, or pick another room." },
+        { "already_in_room", "You are already in a room." },
+        { "room_not_found", "That room is gone. Pick another one from the list." },
+        { "kicked_from_room", "The host removed you from this room, so you cannot join it again." },
+        { "kicked_recently", "The host removed you from this room a moment ago. Try again shortly." },
+    };
+    if (reason == nullptr || reason[0] == '\0')
+        return "The server said no.";
+    for (const auto& e : k)
+        if (!std::strcmp(reason, e.code))
+            return e.text;
+    return reason;
+}
+
 void handle(const znx_lobby_event& ev)
 {
     switch (ev.type) {
@@ -262,7 +283,7 @@ void handle(const znx_lobby_event& ev)
         set_phase(ZNX_LP_ROOMS);
         break;
     case ZNX_LOBBY_EV_ROOM_JOIN_FAILED:
-        problem(ZNX_LPP_JOIN_FAILED, "Could not join the room", ev.text[0] ? ev.text : "The server said no.");
+        problem(ZNX_LPP_JOIN_FAILED, "Could not join the room", join_failure_text(ev.text));
         set_phase(ZNX_LP_ROOMS);
         break;
     case ZNX_LOBBY_EV_ROOM_STATE:
@@ -764,22 +785,22 @@ extern "C" int znx_lobby_play_chat(struct znx_lobby_play_chat_line* out, int max
     return n;
 }
 
-extern "C" int znx_lobby_play_create_room(const char* name, int max_players)
+extern "C" int znx_lobby_play_create_room(const char* name, int max_players, const char* password)
 {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (g_lb == nullptr || g_phase != ZNX_LP_ROOMS)
         return -1;
     /* CreateRoomDialog's defaults: delay 2, prediction 7; the ROM's GoodName and MD5, region "" */
-    if (znx_lobby_create_room(g_lb, name, g_rom_name.c_str(), g_md5.c_str(), "", max_players, 2, 7, nullptr) != 0)
+    if (znx_lobby_create_room(g_lb, name, g_rom_name.c_str(), g_md5.c_str(), "", max_players, 2, 7, password) != 0)
         return -1;
     set_phase(ZNX_LP_ENTERING);
     return 0;
 }
 
-extern "C" int znx_lobby_play_join_room(uint64_t room_id)
+extern "C" int znx_lobby_play_join_room(uint64_t room_id, const char* password)
 {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (g_lb == nullptr || g_phase != ZNX_LP_ROOMS || znx_lobby_join_room(g_lb, room_id, nullptr) != 0)
+    if (g_lb == nullptr || g_phase != ZNX_LP_ROOMS || znx_lobby_join_room(g_lb, room_id, password) != 0)
         return -1;
     set_phase(ZNX_LP_ENTERING);
     return 0;

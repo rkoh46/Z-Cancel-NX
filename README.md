@@ -68,9 +68,11 @@ Choose a game, then Online. Both players need the same game.
 | Join with a code | Type the host's code |
 | Join by IP address | Type the host's address and port |
 | Public games | Games hosted on the public list |
-| Lobby | RMG-K's lobby, for rooms of up to four players |
+| Lobby | RMG-K's lobby, for rooms of up to four players. A room can have a password, which the host gives out |
 
-A PC player on RMG-K v0.9.16 joins the same way from its Peer to Peer or lobby window.
+A PC player on RMG-K v0.9.16 joins the same way from its Peer to Peer or lobby window. Lobby rooms
+have no codes of their own: to play one particular person, use Host a game and give them the
+connect code, or open a lobby room with a password.
 
 ## Status
 
