@@ -1423,6 +1423,11 @@ znx_lobby* znx_lobby_create(const znx_lobby_config* config)
     return lb;
 }
 
+void znx_lobby_set_ice_test(const char* mode)
+{
+    ice_set_hide_host(mode != nullptr && std::string(mode) == "nohost");
+}
+
 void znx_lobby_set_ice_log(void (*fn)(const char* line), int verbose)
 {
     ice_log_to(fn, verbose != 0);

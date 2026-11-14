@@ -580,6 +580,7 @@ bool run_lobby_room()
         config.bind_address = g_opt.ice_bind.c_str();
     else if (!g_opt.bind_any)
         config.bind_address = "127.0.0.1";
+    config.ice_test = std::getenv("ZNX_ICE_TEST");   /* tests: ZNX_ICE_TEST=nohost */
     config.log = lobby_log;
     char error[256];
     if (znx_lobby_play_open(&config, error, sizeof(error)) != 0) {

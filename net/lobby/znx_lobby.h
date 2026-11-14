@@ -164,6 +164,9 @@ typedef struct znx_lobby_match_info {
 znx_lobby* znx_lobby_create(const znx_lobby_config* config);
 /* libjuice's own log lines (process-wide) to fn, INFO and up with verbose (WARN otherwise); NULL: stderr. */
 void znx_lobby_set_ice_log(void (*fn)(const char* line), int verbose);
+/* Tests only: "nohost" offers no local-network candidates (the connection has to go through the public
+ * address, as with a player outside the house); NULL or "" for normal. */
+void znx_lobby_set_ice_test(const char* mode);
 void znx_lobby_destroy(znx_lobby* lobby);
 
 /* rom_md5: the MD5 RMG-K reports for the game (hex, compared case-insensitively). It is

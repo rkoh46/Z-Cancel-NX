@@ -18,6 +18,8 @@
  *                                         release server ws://216.128.157.98:8080/ws
  *   lobby_stun=off|host:port              STUN for the lobby's ICE; empty = the server's (RMG-K's behaviour)
  *   lobby_bind=a.b.c.d                    the ICE agents' local address; empty = this console's own address
+ *   lobby_ice_test=nohost                 tests only: offer no local-network candidates, so a connection has to go
+ *                                         through the public address (as with a player outside the house)
  *   theme=auto|light|dark                 the start screen's theme; auto (default) follows the console's
  *                                         Basic White / Basic Black setting
  *   debug_glyphs=0|1                      1: the start screen opens on a page of the console's button glyphs
@@ -47,6 +49,7 @@ struct znx_menu_settings {
     char lobby_server[160];
     char lobby_stun[128];
     char lobby_bind[64];
+    char lobby_ice_test[16];
     char theme[8];    /* "auto", "light" or "dark" */
     int debug_glyphs;
 };

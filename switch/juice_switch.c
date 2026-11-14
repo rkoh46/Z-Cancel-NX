@@ -8,6 +8,8 @@
  * loopback address cannot be bound, the console's own address is tried. */
 
 #include <errno.h>
+#include <netdb.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
@@ -59,4 +61,40 @@ int znx_juice_pipe(int fds[2])
     znx_log("lobby: no socket pair for libjuice's wake-up pipe (errno %d)", errno);
     errno = EMFILE;
     return -1;
+}
+
+/* libnx's getnameinfo() looks the host up in DNS even when NI_NUMERICHOST asks for the number. libjuice
+ * writes its candidates with it (ice.c ice_create_local_candidate, addr.c addr_record_to_string), so on a
+ * connection whose public address has a reverse DNS name the console offered its server-reflexive
+ * candidate as that name ("a=candidate:2 1 UDP ... customer.example-isp.com 6857 typ srflx"). RMG-K's
+ * libjuice does not resolve hostnames in candidates and dropped it, so no player outside the house could
+ * reach the console. libjuice's sources are compiled with -Dgetnameinfo=znx_juice_getnameinfo
+ * (builder/build-switch.sh): the numeric flags are honoured here with inet_ntop, anything else goes to libnx. */
+int znx_juice_getnameinfo(const struct sockaddr* sa, socklen_t salen, char* host, socklen_t hostlen, char* serv,
+                          socklen_t servlen, int flags)
+{
+    const void* address = NULL;
+    unsigned port = 0;
+    if (sa == NULL)
+        return EAI_FAIL;
+    if (sa->sa_family == AF_INET && salen >= (socklen_t)sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in* in = (const struct sockaddr_in*)sa;
+        address = &in->sin_addr;
+        port = ntohs(in->sin_port);
+    } else if (sa->sa_family == AF_INET6 && salen >= (socklen_t)sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6* in6 = (const struct sockaddr_in6*)sa;
+        address = &in6->sin6_addr;
+        port = ntohs(in6->sin6_port);
+    }
+    if (address == NULL || ((host == NULL || hostlen == 0 || (flags & NI_NUMERICHOST)) &&
+                            (serv == NULL || servlen == 0 || (flags & NI_NUMERICSERV))) == 0)
+        return getnameinfo(sa, salen, host, hostlen, serv, servlen, flags);
+    if (host != NULL && hostlen > 0 && inet_ntop(sa->sa_family, address, host, hostlen) == NULL)
+        return EAI_OVERFLOW;
+    if (serv != NULL && servlen > 0) {
+        const int n = snprintf(serv, servlen, "%u", port);
+        if (n < 0 || n >= (int)servlen)
+            return EAI_OVERFLOW;
+    }
+    return 0;
 }

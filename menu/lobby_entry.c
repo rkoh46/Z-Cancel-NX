@@ -135,6 +135,7 @@ enum znx_online_result znx_lobby_enter(const struct znx_online_request* request,
     config.bind_address = s->lobby_bind[0] ? s->lobby_bind : NULL;
 #endif
     config.local_ip = l.local_ip[0] ? l.local_ip : NULL;
+    config.ice_test = s->lobby_ice_test[0] ? s->lobby_ice_test : NULL;
     config.log = lobby_log;
     if (znx_lobby_play_open(&config, error, sizeof(error)) != 0) {
         message(title, title_size, "The lobby could not open", text, text_size, error);

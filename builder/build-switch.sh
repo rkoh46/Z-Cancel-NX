@@ -351,7 +351,8 @@ if [ -n "$WITH_GAME" ] || [ "$TARGET" = selftest ]; then
         # The lobby client (net/lobby/) and libjuice 1.7.3 from RMG-K's tree (build/src/libjuice, unchanged, as
         # RMG-K builds it: NO_SERVER, no Nettle). On libnx: no getifaddrs (NO_IFADDRS, and an empty <ifaddrs.h>
         # for socket.h's include; the agents are bound to the console's own address instead, menu/lobby_entry.c),
-        # picohash's byte order given (no <endian.h>), and the poll thread's wake-up pipe from juice_switch.c.
+        # picohash's byte order given (no <endian.h>), and from juice_switch.c the poll thread's wake-up pipe and a
+        # getnameinfo that honours NI_NUMERICHOST (libnx's looks names up, so candidates carried hostnames).
         JUICE="$SRC/libjuice"   # copied from ref/ on the host, before the container starts
         [ -f "$JUICE/src/agent.c" ] || { echo "build/src/libjuice is missing: run builder/build-switch.sh on the host" >&2; exit 1; }
         mkdir -p "$OUT/include/juice-shim"
@@ -359,7 +360,7 @@ if [ -n "$WITH_GAME" ] || [ "$TARGET" = selftest ]; then
         cmp -s "$OUT/include/juice-shim/ifaddrs.h.new" "$OUT/include/juice-shim/ifaddrs.h" 2>/dev/null \
             || cp "$OUT/include/juice-shim/ifaddrs.h.new" "$OUT/include/juice-shim/ifaddrs.h"
         rm -f "$OUT/include/juice-shim/ifaddrs.h.new"
-        JUICE_FLAGS="$ARCH -O2 -g -std=gnu11 -w -ffunction-sections -D__SWITCH__ -D__LITTLE_ENDIAN__ -DNO_IFADDRS -DJUICE_STATIC -DUSE_NETTLE=0 -DNO_SERVER -DRELEASE=1 -I$JUICE/include -I$JUICE/include/juice -I$JUICE/src -I$OUT/include/juice-shim $FRONT_INC"
+        JUICE_FLAGS="$ARCH -O2 -g -std=gnu11 -w -ffunction-sections -D__SWITCH__ -D__LITTLE_ENDIAN__ -DNO_IFADDRS -DJUICE_STATIC -DUSE_NETTLE=0 -DNO_SERVER -DRELEASE=1 -Dgetnameinfo=znx_juice_getnameinfo -I$JUICE/include -I$JUICE/include/juice -I$JUICE/src -I$OUT/include/juice-shim $FRONT_INC"
         for f in addr agent crc32 const_time conn conn_poll conn_thread conn_mux base64 hash hmac ice juice log random server stun timestamp tcp turn udp; do
             extra=""
             [ "$f" = conn_poll ] && extra="-Dpipe=znx_juice_pipe"

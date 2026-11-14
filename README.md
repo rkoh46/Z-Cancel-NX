@@ -86,8 +86,8 @@ Tested on an Erista (first model) Switch:
   lag) can make one frame late.
 - The Switch produces the same emulated state as a Mac running the same core, checked every 600
   frames through full matches, also with added lag and packet loss.
-- Online: hosting and joining by address and through the lobby, against a Mac build of the same code
-  on a local network.
+- Online: hosting and joining by address and through the lobby against a Mac build of the same code,
+  on a local network and through the public internet path (a 60-second lobby match with no stalls).
 
 Known issues:
 - With vsync, a few moments in some matches show one frame about 10 ms late (the graphics driver

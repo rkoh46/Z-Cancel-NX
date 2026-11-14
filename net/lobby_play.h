@@ -36,6 +36,7 @@ struct znx_lobby_play_config {
     const char* stun;           /* NULL: the server's STUN (RMG-K's behaviour); "" or "off": none; "host:port" */
     int no_turn;                /* 1: ignore the TURN relays HELLO_OK offers */
     const char* bind_address;   /* the ICE agents' local address; NULL: every interface */
+    const char* ice_test;       /* tests only: "nohost" offers no local-network candidates; NULL: normal */
     const char* local_ip;       /* HELLO.localIp, NULL to leave it out */
     const char* connection;     /* HELLO.connection ("wifi", "lan"), NULL to leave it out */
     void (*log)(const char* line);

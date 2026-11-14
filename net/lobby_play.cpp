@@ -312,8 +312,9 @@ void handle(const znx_lobby_event& ev)
                         " attempts");
             if (g_phase == ZNX_LP_ROOM || g_phase == ZNX_LP_STARTING)
                 problem(ZNX_LPP_ICE_FAILED, "No connection to " + user_name(ev.user_id),
-                        "The two consoles could not reach each other directly, even after RMG-K's 20 attempts. "
-                        "Behind strict routers a TURN relay is needed; the lobby offers none for this room.");
+                        "You and this player could not connect directly, even after RMG-K's 20 attempts. One of "
+                        "the two routers blocks direct connections, and the lobby has no relay. Leave the room and "
+                        "try again; if it keeps happening, play someone else or use a connect code.");
         }
         if (ev.value != 0)
             g_ice_reported[ev.user_id] = ev.value;
@@ -545,6 +546,7 @@ extern "C" void znx_lobby_play_username(const char* name, char* out, size_t out_
 
 extern "C" int znx_lobby_play_open(const struct znx_lobby_play_config* c, char* error, size_t error_size)
 {
+    znx_lobby_set_ice_test(c != nullptr ? c->ice_test : nullptr);
     znx_lobby_play_close();   /* joins the lobby thread: not under the lock it takes */
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     char name[32];

@@ -76,6 +76,8 @@ struct IcePacket
 
 /* libjuice's own messages to fn ("juice warn: ..."), INFO and up when verbose; nullptr: back to stderr. */
 void ice_log_to(void (*fn)(const char*), bool verbose);
+/* Tests only: offer no host (local-network) candidates, so the connection must use the public address. */
+void ice_set_hide_host(bool hide);
 
 class IceMesh
 {

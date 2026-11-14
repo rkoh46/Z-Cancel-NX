@@ -65,6 +65,15 @@ bool known_channel(uint8_t c)
 }
 } // namespace
 
+namespace
+{
+std::atomic<bool> g_hideHost{false};   // lobby_ice_test=nohost
+void iceNote(const std::string& line);
+std::string candidateSummary(const std::string& sdp);
+bool isHostCandidate(const std::string& sdp);
+std::string filterDescription(const std::string& sdp, bool dropHost, std::vector<std::string>* summaries);
+} // namespace
+
 struct IceCallbacks
 {
     static void stateChanged(juice_agent_t*, juice_state_t state, void* user)
@@ -78,6 +87,12 @@ struct IceCallbacks
     {
         auto* peer = static_cast<IceMesh::Peer*>(user);
         if (!peer || !sdp || !peer->active.load(std::memory_order_relaxed))
+            return;
+        const std::string line(sdp);
+        const bool hidden = g_hideHost.load() && isHostCandidate(line);
+        iceNote("lobby: ICE peer " + std::to_string(peer->userId) + ": our candidate " + candidateSummary(line) +
+                (hidden ? " (not offered: lobby_ice_test=nohost)" : ""));
+        if (hidden)
             return;
         std::lock_guard<std::mutex> lock(peer->mesh->m_mutex);
         peer->mesh->m_localSignals.push_back({peer->userId, "candidate", sdp});
@@ -148,6 +163,65 @@ void juiceLog(juice_log_level_t level, const char* message)
     fn(line);
 }
 } // namespace
+
+namespace
+{
+void iceNote(const std::string& line)
+{
+    void (*fn)(const char*) = g_juiceLog.load();
+    if (fn)
+        fn(line.c_str());
+}
+
+/* "a=candidate:1 1 UDP 2122317823 192.168.1.2 51000 typ host" -> "host IPv4 port 51000" (no address: the
+ * log says which kinds of path each side offered without writing anyone's address down). */
+std::string candidateSummary(const std::string& sdp)
+{
+    std::vector<std::string> f;
+    size_t i = 0;
+    while (i < sdp.size()) {
+        while (i < sdp.size() && (sdp[i] == ' ' || sdp[i] == '\r' || sdp[i] == '\n')) ++i;
+        size_t j = i;
+        while (j < sdp.size() && sdp[j] != ' ' && sdp[j] != '\r' && sdp[j] != '\n') ++j;
+        if (j > i) f.push_back(sdp.substr(i, j - i));
+        i = j;
+    }
+    if (f.size() < 8)
+        return "unreadable candidate";
+    const std::string& addr = f[4];
+    const char* family = addr.find(':') != std::string::npos ? "IPv6"
+                         : addr.find(".local") != std::string::npos ? "mDNS" : "IPv4";
+    return f[7] + " " + family + " " + f[2] + " port " + f[5];
+}
+
+bool isHostCandidate(const std::string& sdp)
+{
+    return sdp.find(" typ host") != std::string::npos;
+}
+
+/* Every a=candidate line of an SDP description, summarized, with the host ones optionally dropped. */
+std::string filterDescription(const std::string& sdp, bool dropHost, std::vector<std::string>* summaries)
+{
+    std::string out;
+    size_t i = 0;
+    while (i < sdp.size()) {
+        size_t e = sdp.find('\n', i);
+        if (e == std::string::npos) e = sdp.size(); else ++e;
+        const std::string line = sdp.substr(i, e - i);
+        const bool cand = line.compare(0, 12, "a=candidate:") == 0;
+        if (cand && summaries) summaries->push_back(candidateSummary(line));
+        if (!(cand && dropHost && isHostCandidate(line)))
+            out += line;
+        i = e;
+    }
+    return out;
+}
+} // namespace
+
+void ice_set_hide_host(bool hide)
+{
+    g_hideHost.store(hide);
+}
 
 void ice_log_to(void (*fn)(const char*), bool verbose)
 {
@@ -270,8 +344,12 @@ bool IceMesh::addPeer(uint64_t peerUserId)
         return false;
     }
     {
+        std::vector<std::string> ours;
+        const std::string offered = filterDescription(description, g_hideHost.load(), &ours);
+        for (const std::string& c : ours)
+            iceNote("lobby: ICE peer " + std::to_string(peerUserId) + ": our description lists " + c);
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_localSignals.push_back({peerUserId, "description", description});
+        m_localSignals.push_back({peerUserId, "description", offered});
     }
     for (const PendingSignal& s : pending)
         applyRemoteSignal(peer, s.kind, s.value);
@@ -370,6 +448,16 @@ bool IceMesh::applyRemoteSignal(const std::shared_ptr<Peer>& peer, const std::st
     std::lock_guard<std::mutex> agentLock(peer->agentMutex);
     if (!peer->agent || !peer->active.load(std::memory_order_relaxed))
         return false;
+    if (kind == "description" || kind == "candidate")
+    {
+        std::vector<std::string> theirs;
+        if (kind == "description")
+            filterDescription(value, false, &theirs);
+        else
+            theirs.push_back(candidateSummary(value));
+        for (const std::string& c : theirs)
+            iceNote("lobby: ICE peer " + std::to_string(peer->userId) + ": their candidate " + c);
+    }
     if (kind == "description")
     {
         if (value.empty() || juice_set_remote_description(peer->agent, value.c_str()) != JUICE_ERR_SUCCESS)

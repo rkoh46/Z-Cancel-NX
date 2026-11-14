@@ -1,10 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.1.2
 
+- Lobby: the console can now connect to players outside your home. It advertised its public address
+  as the internet provider's hostname instead of the number (the Switch's system library ignores the
+  "numeric" flag), so RMG-K on PC dropped it and every lobby connection failed. Tested on a Switch
+  against a Mac over the public internet path only: a full 60-second match with no stalls.
 - Lobby: rooms with a password show "Password" in the list and ask for it before joining, as RMG-K
   does. Opening a room asks for an optional password. A failed join says why in words ("Wrong
   password", "That room is gone") instead of the server's code.
+- The message after a failed connection no longer blames a missing relay server.
 
 ## 0.1.1
 
