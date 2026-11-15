@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- Lobby: a third player in a room could not connect. The console ran out of network sockets (the
+  third ICE agent failed with "no buffer space") while the lobby connection and the other two
+  agents were open. The socket pool is twice as large now; measured on a Switch, it holds 48 UDP
+  sockets instead of 23. The log now says how many agents and sockets are open each time a
+  player's connection is set up.
+
 ## 0.1.4
 
 - Settings: Z and R can be swapped, so ZR grabs and R shields, Z-cancels and techs. GameCube-style

@@ -25,6 +25,23 @@
 
 using namespace znxlobby;
 
+#include <sys/socket.h>
+#include <unistd.h>
+#include <cerrno>
+
+namespace {
+/* For the log: the descriptor a new socket gets now (about how many are open, as both systems hand out the
+ * lowest free number), or minus errno when none can be made. */
+int nextSocketNumber()
+{
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return -errno;
+    ::close(fd);
+    return fd;
+}
+}
+
 namespace
 {
 constexpr uint64_t kHeartbeatMs = 15000;              // LobbyClient.cpp:65
@@ -701,11 +718,12 @@ struct znx_lobby
                 {
                     icePeers.insert(uid);
                     peerIceEvent(uid, 0);
-                    log("lobby: ICE agent for peer %llu (room %llu)", (unsigned long long)uid,
-                        (unsigned long long)id);
+                    log("lobby: ICE agent for peer %llu (room %llu); %zu agents, next socket %d", (unsigned long long)uid,
+                        (unsigned long long)id, icePeers.size(), nextSocketNumber());
                 }
                 else
-                    log("lobby: could not create an ICE agent for peer %llu", (unsigned long long)uid);
+                    log("lobby: could not create an ICE agent for peer %llu; %zu agents, next socket %d",
+                        (unsigned long long)uid, icePeers.size(), nextSocketNumber());
             }
         }
         std::vector<uint64_t> stale;

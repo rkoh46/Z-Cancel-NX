@@ -167,11 +167,16 @@ void znx_front_begin(const char* program, const char* log_name, bool text_screen
         /* The socket service as libnx sets it up by default, with more room for what the online modes keep
          * open at once: up to 8 threads can be inside a socket call together (the lobby thread, libjuice's
          * poll thread blocking in poll(), the n02 thread, the menu, the emulation thread sending GekkoNet's
-         * datagrams), and the UDP buffers per socket doubled for a burst of ICE and GekkoNet packets. */
+         * datagrams), and the UDP buffers per socket doubled for a burst of ICE and GekkoNet packets.
+         * sb_efficiency 8 doubles the pool every socket's buffers come from. Measured on a Switch (fresh
+         * start, one TCP socket open): the default pool held 23 of these UDP sockets, this one 48. With 4 it
+         * ran out in a lobby room with three players (socket() failed with ENOBUFS for the third player's
+         * ICE agent while the lobby's own TCP connection and the other agents held the rest). */
         SocketInitConfig config = *socketGetDefaultInitConfig();
         config.udp_tx_buf_size *= 2;
         config.udp_rx_buf_size *= 2;
         config.num_bsd_sessions = 8;
+        config.sb_efficiency = 8;
         if (R_FAILED(socketInitialize(&config)))
             socketInitializeDefault();
     }
