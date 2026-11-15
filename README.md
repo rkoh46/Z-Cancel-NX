@@ -45,23 +45,36 @@ put the `.xdelta` file in `switch/z-cancel-nx/patches/` yourself.
 
 ## Controls
 
-| Switch | GameCube controller | N64 |
+A GameCube controller on the adapter plays as on a GameCube:
+
+| GameCube controller | N64 | In the game |
 |---|---|---|
-| A, B | A, B | A, B |
-| ZL, ZR | L, R | Z (shield) |
-| R | Z | R (grab) |
-| L | | L (taunt) |
-| X, Y, right stick | X, Y, C-stick | C buttons |
-| Plus | Start | Start |
-| Left stick | Control stick | Control stick |
+| A, B | A, B | |
+| L, R | Z | Shield, Z-cancel, tech |
+| Z | R | Grab (the game turns it into Z + A) |
+| X, Y, C-stick | C buttons | Jump (or attacks, see C stick below) |
+| Start | Start | |
+| Control stick, d-pad | Control stick, d-pad | Smash Remix can put taunt on the d-pad |
+
+Other controllers (Pro Controller, Joy-Con, GameCube-style Switch controllers):
+
+| Switch | N64 |
+|---|---|
+| A, B | A, B |
+| ZL, ZR | Z (shield) |
+| R | R (grab) |
+| L | L (taunt) |
+| X, Y, right stick | C buttons |
+| Plus | Start |
+| Left stick | Control stick |
 
 Leave a game by holding Minus, or L + R + Z + Start on a GameCube controller, for half a second.
 
 In Settings on the start screen:
-- **L button**: taunt (default) or shield. Smash Remix can put taunt on the d-pad (Dpad ctrl on the
+- **L button** (not the adapter): taunt (default) or shield. Smash Remix can put taunt on the d-pad (Dpad ctrl on the
   character screen).
-- **Z and R**: R grabs and ZR shields (default, right for the GameCube adapter, where Z is R), or
-  the other way round, for GameCube-style controllers that send their Z button as ZR. Either way the
+- **Z and R** (not the adapter): R grabs and ZR shields (default), or the other way round, for
+  GameCube-style controllers that send their Z button as ZR. Either way the
   shield button also Z-cancels and techs, and the grab button is the N64's R, which the game turns into
   Z + A.
 - **C stick**: the N64's C buttons (default), or smash attacks on the ground and aerials in the air,

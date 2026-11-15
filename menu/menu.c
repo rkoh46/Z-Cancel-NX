@@ -924,16 +924,17 @@ static void draw_settings(struct znx_menu* m)
         break;
     }
     case 2:
-        znx_ui_panel(LIST_Y, NULL, 0, "What the Switch L button does: the N64's L (taunt) or its Z (shield). On a "
-                     "GameCube-style controller whose left shoulder is the Switch L, Shield makes it shield like the "
-                     "right one. Smash Remix can put taunt on the d-pad (Dpad ctrl on the character screen).",
+        znx_ui_panel(LIST_Y, NULL, 0, "What the Switch L button does on a Pro Controller, Joy-Con or GameCube-style "
+                     "controller: the N64's L (taunt) or its Z (shield). Controllers on the GameCube adapter always "
+                     "shield with L and R and grab with Z. Smash Remix can put taunt on the d-pad.",
                      "Only your own controllers change; it never matters for online play.");
         znx_ui_footer(hints_toggle, 2, NULL);
         break;
     case 3:
         znx_ui_panel(LIST_Y, NULL, 0, "Which of the Switch R and ZR buttons grabs (the N64's R, which the game turns "
-                     "into Z and A) and which shields, Z-cancels and techs (the N64's Z). On the GameCube adapter Z is "
-                     "R, so the default fits. A GameCube-style controller that sends its Z as ZR needs ZR grabs.",
+                     "into Z and A) and which shields, Z-cancels and techs (the N64's Z), on controllers other than the "
+                     "GameCube adapter's (those always grab with Z). A GameCube-style controller that sends its Z as "
+                     "ZR needs ZR grabs.",
                      "Only your own controllers change; it never matters for online play.");
         znx_ui_footer(hints_toggle, 2, NULL);
         break;

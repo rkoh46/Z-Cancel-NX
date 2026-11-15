@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.6
+
+- GameCube controllers on the adapter now play as on a GameCube without changing any setting:
+  L and R shield, Z-cancel and tech, Z grabs. The adapter sends the triggers as the Switch L and R
+  and Z as ZR, so before this L taunted, Z shielded and R grabbed unless both the L button and
+  Z and R settings were changed. Those two settings now apply to the other controllers only.
+
 ## 0.1.5
 
 - Lobby: a third player in a room could not connect. The console ran out of network sockets (the
