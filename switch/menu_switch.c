@@ -16,6 +16,8 @@
 #include <EGL/egl.h>
 
 #include "draw.h"
+#include "front_switch.h"
+#include "stall.h"
 #include "screen_switch.h"
 #include "sysfont_switch.h"
 #include "znx_switch.h"
@@ -27,6 +29,66 @@ static size_t l_font_size;
 static bool l_failed;
 
 bool znx_menu_switch_failed(void) { return l_failed; }
+
+/* ---- the watchdog: a menu or lobby screen that stops ----
+ * The game has its own (front_switch.c); this one covers the start screen and the online screens, which
+ * share this loop. The loop beats at every step of a frame; a thread on another core polls twice a second,
+ * logs where the loop is stuck after 5 s, and leaves the program if a buffer swap has not returned in 15 s
+ * (a stopped GPU, which otherwise leaves the console frozen and black until it is reset). */
+static volatile unsigned l_beat;
+static volatile int l_phase = ZNX_STALL_INPUT;
+static volatile bool l_watching;
+static Thread l_watch_thread;
+static bool l_watch_started;
+
+static void beat(enum znx_stall_phase phase)
+{
+    l_phase = phase;
+    l_beat = l_beat + 1;
+}
+
+static void watch_thread(void* arg)
+{
+    struct znx_stall stall = { 0, 0 };
+    (void)arg;
+    for (;;) {
+        svcSleepThread(500000000ll);
+        if (!l_watching) {
+            stall.polls = 0;
+            continue;
+        }
+        enum znx_stall_phase phase = (enum znx_stall_phase)l_phase;
+        switch (znx_stall_poll(&stall, l_beat, phase)) {
+        case ZNX_STALL_REPORT:
+            znx_log("menu: WATCHDOG: the screen has not moved for %d s, stuck in %s", stall.polls / 2,
+                    znx_stall_phase_name(phase));
+            break;
+        case ZNX_STALL_GIVE_UP:
+            znx_log("menu: WATCHDOG: %s for %d s; closing so the console can recover",
+                    znx_stall_phase_name(phase), stall.polls / 2);
+            znx_front_hard_exit();
+        default:
+            break;
+        }
+    }
+}
+
+static void watch_begin(void)
+{
+    if (!l_watch_started) {
+        /* core 1, just above the main thread's priority so a busy loop cannot starve it */
+        Result rc = threadCreate(&l_watch_thread, watch_thread, NULL, NULL, 0x4000, 0x2B, 1);
+        if (R_SUCCEEDED(rc) && R_FAILED(rc = threadStart(&l_watch_thread)))
+            threadClose(&l_watch_thread);
+        if (R_FAILED(rc)) {
+            znx_log("menu: the watchdog does not start: 0x%08x", rc);
+            return;
+        }
+        l_watch_started = true;
+    }
+    beat(ZNX_STALL_INPUT);
+    l_watching = true;
+}
 
 static void* getproc(const char* name)
 {
@@ -142,7 +204,9 @@ int znx_switch_keyboard(int kind, const char* header, const char* guide, const c
     swkbdConfigSetStringLenMax(&keyboard, kind == 0 ? 31 : kind == 1 ? 12 : kind == 3 ? 120 : kind == 4 ? 48 : kind == 5 ? 32 : 21);
     swkbdConfigSetBlurBackground(&keyboard, true);
     out[0] = '\0';
+    beat(ZNX_STALL_KEYBOARD);
     rc = swkbdShow(&keyboard, out, out_size);
+    beat(ZNX_STALL_UPDATE);
     swkbdClose(&keyboard);
     if (R_FAILED(rc)) {
         out[0] = '\0';
@@ -190,18 +254,25 @@ enum znx_menu_action znx_menu_switch_run(struct znx_menu* menu)
     znx_menu_resume(menu);
     znx_log("menu: shown");
     l_failed = false;
+    watch_begin();
 
     while (action == ZNX_MENU_NONE) {
+        beat(ZNX_STALL_APPLET);
         if (!appletMainLoop()) {
             znx_log("menu: the system asks the program to close");
             action = ZNX_MENU_QUIT;
             break;
         }
+        beat(ZNX_STALL_INPUT);
         padUpdate(&pad);
+        beat(ZNX_STALL_UPDATE);
         action = znx_menu_update(menu, buttons(padGetButtons(&pad)));
+        beat(ZNX_STALL_DRAW);
         znx_menu_draw(menu, 0, 1280, 720);
+        beat(ZNX_STALL_SWAP);
         eglSwapBuffers(display, surface);   /* swap interval 1: waits for the display */
     }
+    l_watching = false;
 
     /* A black frame, so the game's first frames do not show the menu behind its 4:3 picture. */
     {

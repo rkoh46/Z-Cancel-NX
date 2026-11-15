@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7
+
+- The start screen and the online screens have a watchdog, like the game. A console froze with a
+  black screen on the rooms list after a match, leaving nothing in the log. Now, if those screens
+  stop for 5 seconds, the log says where they are stuck (the lobby update, drawing, or showing the
+  frame on the GPU). If showing a frame has not finished in 15 seconds, the app closes itself so the
+  console can recover instead of needing a hard reset.
+
 ## 0.1.6
 
 - GameCube controllers on the adapter now play as on a GameCube without changing any setting:

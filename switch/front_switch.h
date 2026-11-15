@@ -53,6 +53,10 @@ size_t znx_front_tail(char* out, size_t size, unsigned lines);
  * that off and stops the run itself (znx_bench_stop). */
 void znx_front_plus_stops(bool on);
 
+/* Ends the whole program at once, the log closed first (the system's Exit for an application). For a
+ * thread that cannot be joined, or a screen that stopped. */
+void __attribute__((noreturn)) znx_front_hard_exit(void);
+
 int znx_front_run(const struct znx_host* host, const struct znx_options* options, void (*tick)(void));
 
 /* End of main(): puts the clock back, prints "<program>: done" or "finished with errors",

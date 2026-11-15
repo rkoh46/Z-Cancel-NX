@@ -133,6 +133,8 @@ static void __attribute__((noreturn)) hard_exit(void)
     __builtin_unreachable();
 }
 
+void znx_front_hard_exit(void) { hard_exit(); }
+
 /* abort() and a failed assert() in the core or a plugin: say so in the log, then leave.
  * Linked with -Wl,--wrap=abort -Wl,--wrap=__assert_func. */
 void __attribute__((noreturn)) __wrap_abort(void)
